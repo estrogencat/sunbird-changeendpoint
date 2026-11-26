@@ -44,6 +44,9 @@ pub struct Config {
    pub accounts: BTreeMap<String, String>,
    #[serde(default, skip_serializing_if = "Option::is_none")]
    pub login: Option<String>,
+   /// Servers whose activity switch was flipped from its default.
+   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+   pub activities: BTreeMap<String, bool>,
 }
 
 /// What the Spacebar plugin kept before the Servers page, read once to carry
@@ -102,6 +105,7 @@ pub struct Routes {
    login: Option<String>,
    login_discord: bool,
    enabled: bool,
+   activities: BTreeMap<String, bool>,
 }
 
 impl Routes {
@@ -154,6 +158,16 @@ impl Routes {
          self.login.clone().unwrap_or_default()
       };
       (choices, chosen)
+   }
+
+   /// Whether the server gets activities. Servers added by address start
+   /// without, since stricter ones like Harmony close the gateway over them.
+   pub fn shows_activity(&self, key: &str) -> bool {
+      self
+         .activities
+         .get(key)
+         .copied()
+         .unwrap_or_else(|| is_builtin(key))
    }
 
    pub fn of_user(&self, id: u64) -> Option<&Server> {
@@ -240,6 +254,7 @@ fn carried_over() -> Config {
          .collect(),
       accounts: stored.accounts,
       login: stored.login,
+      activities: BTreeMap::new(),
    }
 }
 
@@ -315,6 +330,7 @@ pub fn routes() -> Arc<Routes> {
       login_discord: config.login.as_deref() == Some("discord"),
       login: config.login.filter(|key| servers.contains_key(key)),
       enabled: config.enabled,
+      activities: config.activities,
       servers,
    });
    *cache = Some((stamp, routes.clone()));
@@ -542,15 +558,37 @@ pub fn route(method: &str, url: &str, authorization: Option<&str>) -> Route {
    }
 }
 
+pub struct Gateway {
+   pub url: String,
+   /// Spacebar servers get payloads trimmed to their schemas.
+   pub spacebar: bool,
+   pub activities: bool,
+}
+
 /// The gateway the account behind `token` connects to, or `None` when no
 /// known server holds it.
-pub fn gateway_for(token: &str) -> Option<String> {
+pub fn gateway_for(token: &str) -> Option<Gateway> {
    match identity(token) {
-      Identity::Discord => Some(DISCORD_GATEWAY.to_owned()),
-      Identity::Jwt(id) => routes()
-         .of_user(id)
-         .or_else(|| LEGACY.get())
-         .map(|server| server.gateway.clone()),
+      Identity::Discord => Some(Gateway {
+         url: DISCORD_GATEWAY.to_owned(),
+         spacebar: false,
+         activities: true,
+      }),
+      Identity::Jwt(id) => {
+         let routes = routes();
+         let key = routes
+            .accounts
+            .get(&id)
+            .filter(|key| routes.servers.contains_key(*key));
+         let server = key
+            .and_then(|key| routes.servers.get(key))
+            .or_else(|| LEGACY.get())?;
+         Some(Gateway {
+            url: server.gateway.clone(),
+            spacebar: true,
+            activities: key.is_none_or(|key| routes.shows_activity(key)),
+         })
+      },
       Identity::Unreadable => None,
    }
 }

@@ -1,8 +1,11 @@
 //! The gateway relay. Phoenix has one gateway URL for every account, so it
 //! points at this local socket, which reads the token from the first
 //! identify or resume and connects to that account's server. Frames pass
-//! through untouched after that, compressed or not.
+//! through untouched after that, except for Spacebar servers: identify and
+//! presence payloads are trimmed to their schemas, and their gateway is read
+//! uncompressed so READY can be fixed up for Phoenix.
 
+mod sanitise;
 mod upstream;
 mod wire;
 
@@ -139,13 +142,18 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
          break token;
       }
    };
-   let Some(target) = servers::gateway_for(&token) else {
+   let Some(gateway) = servers::gateway_for(&token) else {
       log::warn!("relay: the token belongs to no known server, refusing");
       wire::close(&writer, 4004, b"unknown account");
       return Ok(());
    };
-   let url = format!("{}/{}", target.trim_end_matches('/'), upgrade.query);
-   log::info!("relay: relaying to {}", host_of(&target));
+   let query = if gateway.spacebar {
+      uncompressed(&upgrade.query)
+   } else {
+      upgrade.query.clone()
+   };
+   let url = format!("{}/{}", gateway.url.trim_end_matches('/'), query);
+   log::info!("relay: relaying to {}", host_of(&gateway.url));
    let socket = match Socket::connect(&url, &upgrade.headers) {
       Ok(socket) => Arc::new(socket),
       Err(err) => {
@@ -153,15 +161,23 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
          return Err(err);
       },
    };
-   for message in &pending {
-      socket.send(message)?;
+   let send = |message: Message| {
+      socket.send(&if gateway.spacebar {
+         trimmed(message, gateway.activities)
+      } else {
+         message
+      })
+   };
+   for message in pending {
+      send(message)?;
    }
+   let spacebar = gateway.spacebar;
    let down = {
       let socket = socket.clone();
       let writer = writer.clone();
       thread::Builder::new()
          .name("sunbird-relay-down".to_owned())
-         .spawn(move || pump_down(&socket, &writer))?
+         .spawn(move || pump_down(&socket, &writer, spacebar))?
    };
    loop {
       match wire::read_message(&mut reader, &writer) {
@@ -170,7 +186,7 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
             break;
          },
          Ok(message) => {
-            if let Err(err) = socket.send(&message) {
+            if let Err(err) = send(message) {
                log::warn!("relay: send upstream: {err}");
                break;
             }
@@ -187,7 +203,7 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
 
 /// Server to Phoenix, until the server closes. A close outside the 4000s
 /// becomes 4000 so Phoenix resumes instead of dropping the session.
-fn pump_down(socket: &Socket, writer: &Writer) {
+fn pump_down(socket: &Socket, writer: &Writer, spacebar: bool) {
    loop {
       match socket.receive() {
          Ok(Message::Close(code, reason)) => {
@@ -201,6 +217,12 @@ fn pump_down(socket: &Socket, writer: &Writer) {
             break;
          },
          Ok(message) => {
+            let message = match message {
+               Message::Text(bytes) if spacebar => {
+                  Message::Text(sanitise::dispatch(&bytes).unwrap_or(bytes))
+               },
+               other => other,
+            };
             if wire::write_message(writer, &message).is_err() {
                socket.shutdown(4000, b"");
                break;
@@ -217,6 +239,29 @@ fn pump_down(socket: &Socket, writer: &Writer) {
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
       .shutdown(Shutdown::Both);
+}
+
+/// A Spacebar-safe copy of a text frame from Phoenix.
+fn trimmed(message: Message, activities: bool) -> Message {
+   match message {
+      Message::Text(bytes) => {
+         Message::Text(sanitise::sanitise(&bytes, activities).unwrap_or(bytes))
+      },
+      other => other,
+   }
+}
+
+/// The query without its compression, so the relay can read and fix what
+/// Spacebar servers send. Phoenix reads plain text frames either way.
+fn uncompressed(query: &str) -> String {
+   let Some(params) = query.strip_prefix('?') else {
+      return query.to_owned();
+   };
+   let kept: Vec<&str> = params
+      .split('&')
+      .filter(|param| !param.starts_with("compress="))
+      .collect();
+   format!("?{}", kept.join("&"))
 }
 
 fn host_of(url: &str) -> &str {

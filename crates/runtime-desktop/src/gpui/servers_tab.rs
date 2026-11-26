@@ -48,6 +48,27 @@ pub fn toggle(on: bool) {
    phoenix_ui_desktop::toast("Restart Discord to apply");
 }
 
+pub fn activity(key: String, on: bool) {
+   report(servers::update(|config| {
+      if on == servers::is_builtin(&key) {
+         config.activities.remove(&key);
+      } else {
+         config.activities.insert(key, on);
+      }
+   }));
+   phoenix_ui_desktop::toast("Restart Discord to apply");
+}
+
+fn activity_row(b: &Builder, key: &str, on: bool) -> RawDiv {
+   b.switch_row(
+      &format!("sunbird-servers-activity-{key}"),
+      "Show Activity",
+      Some("Shares your custom status and what you're playing. Turn it off if this server keeps disconnecting you."),
+      on,
+      Action::ServerActivity(key.to_owned()),
+   )
+}
+
 pub fn press(press: Press) {
    match press {
       Press::Login(key) => report(servers::update(|config| config.login = Some(key))),
@@ -259,14 +280,23 @@ fn logins(b: &Builder, root: RawDiv, routes: &servers::Routes) -> RawDiv {
    root
 }
 
-fn server_card(b: &Builder, key: &str, server: &Server, open: bool, confirm: bool) -> RawDiv {
+fn server_card(
+   b: &Builder,
+   key: &str,
+   server: &Server,
+   activity: bool,
+   open: bool,
+   confirm: bool,
+) -> RawDiv {
    let mut card = b.card(8.0, 14.0, 8.0, 0.18);
    let name = label(key, server);
    if servers::is_builtin(key) {
-      return b.push_div(
+      card = b.push_div(
          card,
          b.text_block(&name, &format!("{} · built in", host(&server.api))),
       );
+      card = b.push_div(card, b.divider());
+      return b.push_div(card, activity_row(b, key, activity));
    }
    card = b.push_div(
       card,
@@ -280,6 +310,8 @@ fn server_card(b: &Builder, key: &str, server: &Server, open: bool, confirm: boo
          Action::Servers(Press::Expand(key.to_owned())),
       ),
    );
+   card = b.push_div(card, b.divider());
+   card = b.push_div(card, activity_row(b, key, activity));
    if !open {
       return card;
    }
@@ -383,6 +415,7 @@ pub fn render(b: &Builder, mut root: RawDiv) -> RawDiv {
             b,
             key,
             server,
+            routes.shows_activity(key),
             open.as_deref() == Some(key),
             confirm.as_deref() == Some(key),
          ),

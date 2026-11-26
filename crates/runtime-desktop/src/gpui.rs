@@ -355,6 +355,7 @@ enum Action {
    },
    InstallCatalog(String),
    ServersToggle,
+   ServerActivity(String),
    Servers(servers_tab::Press),
 }
 
@@ -396,6 +397,7 @@ unsafe fn switch_callback(
       match action {
          Action::ToggleStaff => phoenix_runtime::set_staff_enabled(on),
          Action::ServersToggle => servers_tab::toggle(on),
+         Action::ServerActivity(key) => servers_tab::activity(key, on),
          Action::TogglePlugin(name) => phoenix_runtime::set_enabled(&name, on),
          Action::ToggleSetting { plugin, key } => {
             phoenix_runtime::set_setting(&plugin, &key, Chosen::Switch(on));
