@@ -7,6 +7,12 @@ const seen = new Set();
 const decorations = phoenix.storage.get("decorations") ?? {};
 const listIds = new Map();
 const colorRoles = new Map();
+const listOverwrites = new Map();
+const guildRoles = new Map();
+const guildOwners = new Map();
+const missingMembers = new Set();
+const fetchedMembers = new Set();
+let fetchingMembers = false;
 const COLOR_BIT = 1n << 62n;
 const FIXABLE = /avatar_decoration_data|is_spam_request|last_message_id|premium_progress_bar_enabled|self_mute|"version"|"roles"|"joined_at"/;
 
@@ -59,10 +65,80 @@ function listIdOf(channel) {
 function rememberList(guildId, channel) {
   if (!Array.isArray(channel.permission_overwrites)) return;
   if (!listIds.has(guildId)) listIds.set(guildId, new Set(["everyone"]));
-  listIds.get(guildId).add(listIdOf(channel));
+  const id = listIdOf(channel);
+  listIds.get(guildId).add(id);
+  listOverwrites.set(`${guildId}:${id}`, channel.permission_overwrites);
+}
+
+function canView(guildId, overwrites, userId, roles) {
+  if (guildOwners.get(guildId) === userId) return true;
+  const perms = guildRoles.get(guildId);
+  if (!perms) return true;
+  let bits = perms.get(guildId) ?? 0n;
+  for (const role of roles) bits |= perms.get(role) ?? 0n;
+  if (bits & 8n) return true;
+  const apply = (allow, deny) => {
+    bits = (bits & ~deny) | allow;
+  };
+  const everyone = overwrites.find(o => o.id === guildId);
+  if (everyone) apply(BigInt(everyone.allow ?? 0), BigInt(everyone.deny ?? 0));
+  let allow = 0n;
+  let deny = 0n;
+  for (const o of overwrites) {
+    if (o.id !== guildId && roles.includes(o.id)) {
+      allow |= BigInt(o.allow ?? 0);
+      deny |= BigInt(o.deny ?? 0);
+    }
+  }
+  apply(allow, deny);
+  const own = overwrites.find(o => o.id === userId);
+  if (own) apply(BigInt(own.allow ?? 0), BigInt(own.deny ?? 0));
+  return (bits & 1024n) !== 0n;
+}
+
+function listFor(payload, id) {
+  const overwrites = listOverwrites.get(`${payload.guild_id}:${id}`) ?? [];
+  const counts = new Map();
+  const ops = (payload.ops ?? []).map(op => {
+    if (op.op !== "SYNC" || !op.items || !op.range) return op;
+    let group = null;
+    const kept = op.items.filter(item => {
+      if (item.group) {
+        group = item.group.id;
+        counts.set(group, 0);
+        return true;
+      }
+      const member = item.member;
+      if (member && !canView(payload.guild_id, overwrites, member.user?.id, member.roles ?? [])) return false;
+      if (group) counts.set(group, (counts.get(group) ?? 0) + 1);
+      return true;
+    });
+    const items = kept.filter(item => !item.group || counts.get(item.group.id)).map(item => item.group ? { group: { ...item.group, count: counts.get(item.group.id) ?? 0 } } : item);
+    return { ...op, items, range: [op.range[0], op.range[0] + Math.max(items.length - 1, 0)] };
+  });
+  const groups = counts.size && payload.groups ? payload.groups.filter(g => counts.get(g.id)).map(g => ({ ...g, count: counts.get(g.id) ?? 0 })) : payload.groups;
+  return { ...payload, id, ops, groups };
+}
+
+async function fetchMissingMembers() {
+  if (fetchingMembers) return;
+  fetchingMembers = true;
+  for (const key of missingMembers) {
+    missingMembers.delete(key);
+    const [guildId, userId] = key.split(":");
+    const res = await phoenix.discord.get(`/guilds/${guildId}/members/${userId}`).catch(() => null);
+    const member = res?.ok ? res.json() : null;
+    if (!member) continue;
+    fixDeep(member);
+    phoenix.enqueue(phoenix.gateway.guildMembersChunk, { guild_id: guildId, members: [member], not_found: [], chunk_index: 0, chunk_count: 1 });
+  }
+  fetchingMembers = false;
 }
 
 function fixGuild(guild) {
+  guildRoles.set(guild.id, new Map(guild.roles.filter(Boolean).map(role => [role.id, BigInt(role.permissions ?? 0)])));
+  const owner = guild.owner_id ?? guild.properties?.owner_id;
+  if (owner) guildOwners.set(guild.id, owner);
   if (Array.isArray(guild.channels)) for (const channel of guild.channels) rememberList(guild.id, channel);
   const everyone = guild.roles.find(role => role?.id === guild.id);
   if (!everyone || !rememberColor(guild.id, everyone) || guild.roles.some(role => role?.id === colorRoles.get(guild.id))) return false;
@@ -158,8 +234,21 @@ for (const name of Object.keys(phoenix.gateway)) {
     before(payload) {
       const changed = fixDeep(payload);
       if (name === "guildMemberListUpdate") {
-        for (const id of listIds.get(payload.guild_id) ?? []) if (id !== payload.id) phoenix.dispatch(sig, { ...payload, id });
+        for (const id of listIds.get(payload.guild_id) ?? []) if (id !== payload.id) phoenix.dispatch(sig, listFor(payload, id));
         note("member_list.id");
+        return listFor(payload, payload.id);
+      }
+      if (name === "guildMembersChunk" && payload.not_found?.length) {
+        for (const userId of payload.not_found) {
+          const key = `${payload.guild_id}:${userId}`;
+          if (fetchedMembers.has(key)) continue;
+          fetchedMembers.add(key);
+          missingMembers.add(key);
+        }
+        payload.not_found = payload.not_found.filter(userId => !missingMembers.has(`${payload.guild_id}:${userId}`));
+        note("members_chunk.not_found");
+        fetchMissingMembers();
+        return payload;
       }
       if (name === "guildRoleUpdate" && payload.role?.id === payload.guild_id && rememberColor(payload.guild_id, payload.role)) phoenix.dispatch(phoenix.gateway.guildRoleCreate, { guild_id: payload.guild_id, role: colorRoleOf(payload.role) });
       if (changed) return payload;
