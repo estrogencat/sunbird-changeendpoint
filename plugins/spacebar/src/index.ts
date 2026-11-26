@@ -14,7 +14,7 @@ const missingMembers = new Set();
 const fetchedMembers = new Set();
 let fetchingMembers = false;
 const COLOR_BIT = 1n << 62n;
-const FIXABLE = /avatar_decoration_data|is_spam_request|last_message_id|premium_progress_bar_enabled|self_mute|"version"|"roles"|"joined_at"/;
+const FIXABLE = /avatar_decoration_data|is_spam_request|last_message_id|premium_progress_bar_enabled|self_mute|"version"|"roles"|"joined_at"|"video\//;
 
 function note(path) {
   if (seen.has(path)) return;
@@ -166,6 +166,12 @@ function fixObject(object) {
   if (colorRole && !object.roles.includes(colorRole)) {
     object.roles = [...object.roles.filter(id => id !== memberGuild), colorRole];
     note("member.everyone_color");
+    changed = true;
+  }
+  if (typeof object.content_type === "string" && object.content_type.startsWith("video/") && "filename" in object && (!object.width || !object.height)) {
+    object.width = 640;
+    object.height = 360;
+    note("attachment.video_size");
     changed = true;
   }
   const decoration = object.avatar_decoration_data;
