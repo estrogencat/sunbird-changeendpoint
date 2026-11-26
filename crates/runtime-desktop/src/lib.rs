@@ -8,6 +8,7 @@ mod badges;
 mod context_menu;
 mod discord;
 mod emoji;
+mod endpoints;
 mod fetch;
 mod gpui;
 mod js;
@@ -105,6 +106,7 @@ pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
    open_access_gate(&image);
+   endpoints::install(&image);
    staff::prepare(&image);
    settings::install(&image);
    modal::install(&image);

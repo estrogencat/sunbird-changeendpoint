@@ -165,6 +165,19 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
          report("settings layer", desktop::settings_layer(image).map(at));
          report("access gate", desktop::access_gate(image).map(at));
+         report(
+            "endpoints",
+            desktop::endpoints(image).and_then(|found| {
+               desktop::ENDPOINTS_PROLOGUE
+                  .at(image, found.func)
+                  .then(|| format!("{} (string_from {})", at(found.func), at(found.string_from)))
+                  .ok_or_else(|| "prologue changed".to_owned())
+            }),
+         );
+         report(
+            "preferred_regions skip",
+            desktop::preferred_regions_skip(image).map(at),
+         );
          if abi == x86::Abi::SysV {
             report(
                "wayland frame",

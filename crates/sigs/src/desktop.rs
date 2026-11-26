@@ -769,6 +769,75 @@ pub fn emoji_check(image: &Image<'_>) -> Found<EmojiCheck> {
    }
 }
 
+/// Win64 `Endpoints::for_stack` prologue: 3 pushes, `sub rsp, imm32` and
+/// `lea rbp, [rsp + imm32]`.
+pub const ENDPOINTS_PROLOGUE: Prologue = Prologue {
+   pattern: Pattern::new("55 56 57 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
+   len:     18,
+};
+
+/// `libdiscord`'s endpoint table builder, `fn(out, stack: u8) -> out`.
+#[derive(Clone, Copy, Debug)]
+pub struct Endpoints {
+   pub func:        usize,
+   /// Discord's `String::from(out, ptr, len)`, which allocates through its own
+   /// global allocator.
+   pub string_from: usize,
+}
+
+/// The one function that loads the remote auth gateway URL.
+///
+/// It copies the API origin for the stack, `{origin}/api/v9`, and the gateway,
+/// remote auth and RTC latency URLs into its output, each literal through
+/// `String::from`, whose call follows the load. Rust packs these literals
+/// without a NUL.
+pub fn endpoints(image: &Image<'_>) -> Found<Endpoints> {
+   let leas = lea_index(image);
+   let sites: Vec<usize> = image
+      .find_bytes(b"wss://remote-auth-gateway.discord.gg/?v=2")
+      .into_iter()
+      .flat_map(|target| leas.sites(target).collect::<Vec<_>>())
+      .collect();
+   let site = one("remote auth URL load", &sites)?;
+   let func = image
+      .function_containing(site)
+      .ok_or("remote auth URL load has no unwind entry")?;
+   let (_, string_from) = calls_in(image, site, 0x20)
+      .into_iter()
+      .next()
+      .ok_or("remote auth URL is never copied")?;
+   Ok(Endpoints { func, string_from })
+}
+
+/// The `je` that leaves `preferred_regions` out of the voice state update
+/// (op 4) when it is `None`: `cmp r64, -1; je past_the_field` just before the
+/// field name's load.
+pub fn preferred_regions_skip(image: &Image<'_>) -> Found<usize> {
+   let leas = lea_index(image);
+   let sites: Vec<usize> = image
+      .find_bytes(b"preferred_regions")
+      .into_iter()
+      .flat_map(|target| leas.sites(target).collect::<Vec<_>>())
+      .collect();
+   let site = one("preferred_regions load", &sites)?;
+   let start = site - 0x20;
+   let head = image
+      .read(start, 0x20)
+      .ok_or("preferred_regions load is unmapped")?;
+   let found = Pattern::new("48 83 ?? FF 74 ??").find_in(head);
+   let &cmp = found
+      .iter()
+      .rev()
+      .find(|&&at| head[at + 2] & 0xF8 == 0xF8)
+      .ok_or("preferred_regions has no skip branch")?;
+   let je = start + cmp + 4;
+   let target = (je + 2).wrapping_add_signed(isize::from(head[cmp + 5].cast_signed()));
+   if target <= site {
+      return Err(format!("preferred_regions skip at {je:#x} jumps back"));
+   }
+   Ok(je)
+}
+
 /// Settings page 24's sidebar name, `Phoenix`, and its id,
 /// `DESKTOP_PHOENIX`, both relabeled in place.
 #[derive(Clone, Copy, Debug)]

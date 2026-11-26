@@ -115,13 +115,13 @@ unsafe fn media_fetch_detour(
       .copied()
       .expect("media_fetch_detour only runs after install");
 
-   let rewritten = if !url_ptr.is_null() && url_len > MARKER.len() && url_len <= 8192 {
+   let rewritten = if !url_ptr.is_null() && url_len <= 8192 {
       panic::catch_unwind(AssertUnwindSafe(|| {
          // SAFETY: `url_ptr..url_ptr + url_len` is a valid `&str` passed by
          // `libdiscord_media`.
          let bytes = unsafe { slice::from_raw_parts(url_ptr, url_len) };
          let url = str::from_utf8(bytes).ok()?;
-         let decoded = unwrap_badge_url(url)?;
+         let decoded = unwrap_badge_url(url).or_else(|| crate::endpoints::media_url(url))?;
          // The returned future borrows `&str` across `.await` points, so intern
          // it to `'static` lifetime (bounded by distinct badge URLs seen).
          Some(gpui::intern_str(&decoded))
