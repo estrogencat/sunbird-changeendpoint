@@ -4,6 +4,7 @@
 #![cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
 
 mod accessories;
+mod account_switch;
 mod audio;
 mod badges;
 mod context_menu;
@@ -13,9 +14,11 @@ mod endpoints;
 mod fetch;
 mod gpui;
 mod js;
+mod login_form;
 mod message;
 mod modal;
 mod os;
+#[cfg(windows)] mod relay;
 mod servers;
 mod settings;
 mod staff;
@@ -112,6 +115,8 @@ pub fn prepare() -> Result<(), Error> {
    audio::install(&image);
    staff::prepare(&image);
    settings::install(&image);
+   login_form::install(&image);
+   account_switch::install(&image);
    modal::install(&image);
    accessories::install(&image);
    context_menu::install(&image);

@@ -9,6 +9,7 @@ use std::{
 pub const DISCORD_API: &str = "https://discord.com/api/v9";
 pub const DISCORD_ORIGIN: &str = "https://discord.com";
 pub const RELAY_GATEWAY: &str = "ws://127.0.0.1:8099/g";
+const DISCORD_GATEWAY: &str = "wss://gateway.discord.gg";
 const DISCORD_APIS: [&str; 6] = [
    "https://discord.com/api/v9",
    "https://discord.com/api/v10",
@@ -20,6 +21,8 @@ const DISCORD_APIS: [&str; 6] = [
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Server {
+   #[serde(default)]
+   pub name: Option<String>,
    pub api: String,
    pub gateway: String,
    pub origin: Option<String>,
@@ -51,6 +54,28 @@ impl Routes {
 
    pub fn login(&self) -> Option<&Server> {
       self.servers.get(self.login.as_deref()?)
+   }
+
+   /// The servers new logins can go to, as `(value, label)`, and the chosen one.
+   pub fn login_choices(&self) -> (Vec<(String, String)>, String) {
+      let mut choices: Vec<(String, String)> = self
+         .servers
+         .iter()
+         .map(|(key, server)| {
+            (
+               key.clone(),
+               server.name.clone().unwrap_or_else(|| key.clone()),
+            )
+         })
+         .collect();
+      choices.sort();
+      choices.push(("discord".to_owned(), "Discord".to_owned()));
+      let chosen = if self.login_discord {
+         "discord".to_owned()
+      } else {
+         self.login.clone().unwrap_or_default()
+      };
+      (choices, chosen)
    }
 
    pub fn of_user(&self, id: u64) -> Option<&Server> {
@@ -258,6 +283,28 @@ fn api_rest<'a>(url: &'a str, routes: &Routes) -> Option<&'a str> {
       .map(|base| &url[base.len()..])
 }
 
+/// Makes `viewer` the account whose server images come from.
+pub fn set_viewer(viewer: Identity) {
+   if viewer == Identity::Unreadable {
+      return;
+   }
+   let changed = VIEWER
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .replace(viewer)
+      != Some(viewer);
+   if changed {
+      let text = if let Identity::Jwt(id) = viewer {
+         log::info!("servers: viewing account {id}");
+         id.to_string()
+      } else {
+         log::info!("servers: viewing a Discord account");
+         "discord".to_owned()
+      };
+      let _ = fs::write(viewer_file(), text);
+   }
+}
+
 /// Only the account on screen loads message history, so its token names
 /// the account whose server the images come from.
 fn loads_history(method: &str, rest: &str) -> bool {
@@ -282,19 +329,8 @@ pub fn route(method: &str, url: &str, authorization: Option<&str>) -> Route {
    if let Some(viewer @ (Identity::Discord | Identity::Jwt(_))) = who
       && loads_history(method, rest)
    {
-      let mut current = VIEWER.lock().unwrap_or_else(PoisonError::into_inner);
-      if *current != Some(viewer) {
-         match viewer {
-            Identity::Jwt(id) => log::info!("servers: viewing account {id}"),
-            _ => log::info!("servers: viewing a Discord account"),
-         }
-         *current = Some(viewer);
-         let text = match viewer {
-            Identity::Jwt(id) => id.to_string(),
-            _ => "discord".to_owned(),
-         };
-         let _ = fs::write(viewer_file(), text);
-      }
+      crate::account_switch::history_loaded(viewer);
+      set_viewer(viewer);
    }
    let base = match who {
       None if routes.login_discord => DISCORD_API,
@@ -320,6 +356,19 @@ pub fn route(method: &str, url: &str, authorization: Option<&str>) -> Route {
       Route::Keep
    } else {
       Route::Rewrite(next)
+   }
+}
+
+/// The gateway the account behind `token` connects to, or `None` when no
+/// known server holds it.
+pub fn gateway_for(token: &str) -> Option<String> {
+   match identity(token) {
+      Identity::Discord => Some(DISCORD_GATEWAY.to_owned()),
+      Identity::Jwt(id) => routes()
+         .of_user(id)
+         .or_else(|| LEGACY.get())
+         .map(|server| server.gateway.clone()),
+      Identity::Unreadable => None,
    }
 }
 

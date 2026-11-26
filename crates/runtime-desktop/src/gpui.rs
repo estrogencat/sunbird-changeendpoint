@@ -1186,6 +1186,64 @@ pub fn wrap_with_accessories(
    true
 }
 
+/// Wraps a rendered element in place under a row of option buttons that set
+/// a plugin's select setting, the chosen one highlighted.
+pub fn wrap_with_choices(
+   sret: *mut RawAnyElement,
+   label: &str,
+   choices: &[(String, String)],
+   chosen: &str,
+   plugin: &str,
+   key: &str,
+) -> bool {
+   const LABEL: [f32; 4] = [0.0, 0.0, 0.95, 1.0];
+
+   let Some(sym) = SYMBOLS.get() else {
+      return false;
+   };
+   if sym.div_push_any.is_none() || sym.str_into_any.is_none() {
+      return false;
+   }
+   let b = Builder { sym };
+   let mut field = b.v_stack(8.0);
+   if let Some(text) = b.text_line(label, LABEL, 16.0) {
+      field = b.push_div(field, text);
+   }
+   let mut row = b.h_row(8.0, false);
+   for (value, text) in choices {
+      row = b.push_button(
+         row,
+         &format!("sunbird-{plugin}-{key}-{value}"),
+         text,
+         if value == chosen {
+            BtnVariant::Primary
+         } else {
+            BtnVariant::Secondary
+         },
+         BtnSize::Small,
+         Action::PickSelectOption {
+            plugin: plugin.to_owned(),
+            key:    key.to_owned(),
+            value:  value.clone(),
+         },
+      );
+   }
+
+   // SAFETY: takes ownership of the original rendered `AnyElement` out of
+   // `sret`; the replacement is written back before returning.
+   let mut orig = unsafe { ptr::read(sret) };
+   field = b.push_div(field, row);
+   let mut outer = b.v_stack(20.0);
+   outer = b.push_div(outer, field);
+   if !b.push_any(&mut outer, &mut orig) {
+      // SAFETY: restore original element if push failed.
+      unsafe { ptr::write(sret, orig) };
+      return false;
+   }
+   b.write_any(outer, sret);
+   true
+}
+
 // ---------------------------------------------------------------------------
 // Sunbird Categorized Native GPUI Settings Page
 // ---------------------------------------------------------------------------

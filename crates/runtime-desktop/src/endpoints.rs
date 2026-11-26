@@ -243,16 +243,14 @@ fn backend() -> Option<Config> {
 }
 
 /// Accounts can sit on different servers, so the gateway goes through the
-/// local relay, which picks the server from the token in IDENTIFY.
+/// local relay, which picks the server from the token in IDENTIFY. The origin
+/// stays Discord's: Discord refuses logins from any other (50067) and Spacebar
+/// never checks it.
 fn relayed(legacy: Option<Target>) -> Target {
    let routes = servers::routes();
    let login = routes.login().map(|server| Target {
       api: server.api.clone(),
-      origin: server
-         .origin
-         .clone()
-         .or_else(|| origin_of(&server.api))
-         .unwrap_or_else(|| servers::DISCORD_ORIGIN.to_owned()),
+      origin: String::new(),
       gateway: String::new(),
       cdn: server.cdn.clone(),
       media: server.media.clone(),
@@ -264,9 +262,18 @@ fn relayed(legacy: Option<Target>) -> Target {
       cdn: None,
       media: None,
    });
+   #[cfg(windows)]
+   let relay = crate::relay::gateway();
+   #[cfg(not(windows))]
+   let relay = None;
+   let gateway = relay.unwrap_or_else(|| {
+      log::warn!("endpoints: no built-in relay, expecting one at {}", servers::RELAY_GATEWAY);
+      servers::RELAY_GATEWAY.to_owned()
+   });
    log::info!("endpoints: several servers, the gateway goes through the local relay");
    Target {
-      gateway: servers::RELAY_GATEWAY.to_owned(),
+      origin: servers::DISCORD_ORIGIN.to_owned(),
+      gateway,
       ..base
    }
 }
@@ -279,6 +286,7 @@ pub fn install(image: &Image<'static>) {
    });
    if let Some(legacy) = &legacy {
       servers::set_legacy(servers::Server {
+         name: None,
          api: legacy.api.clone(),
          gateway: legacy.gateway.clone(),
          origin: Some(legacy.origin.clone()),

@@ -854,6 +854,59 @@ pub fn high_pass_coefficients(image: &Image<'_>) -> Found<usize> {
    one("high-pass coefficients", &image.find_bytes(&bytes))
 }
 
+/// The switch to another account, `fn(_, account: &Account, u8, _, _, _, _)`.
+///
+/// The single caller of the function that logs "switched accounts in place".
+/// `Account` is 48 bytes and holds the account's token.
+pub fn account_switch(image: &Image<'_>) -> Found<usize> {
+   let leas = lea_index(image);
+   let site = one(
+      "switched accounts log",
+      &image
+         .find_bytes(b"switched accounts in place")
+         .into_iter()
+         .flat_map(|target| leas.sites(target).collect::<Vec<_>>())
+         .collect::<Vec<_>>(),
+   )?;
+   let logger = image
+      .function_containing(site)
+      .ok_or("switched accounts log has no unwind entry")?;
+   one(
+      "account switch",
+      &callers(image, logger).into_iter().collect::<Vec<_>>(),
+   )
+}
+
+/// The login form's body, in the login page and the Add Account modal.
+///
+/// `fn(sret: *mut AnyElement, _, step: &u64, u8, _, _)`. Its entry jumps on
+/// the step, which is 0 while it asks for the email and password.
+pub fn login_form(image: &Image<'_>) -> Found<usize> {
+   let entry = match Abi::of(image) {
+      Abi::Win64 => Pattern::new(
+         "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ?? \
+          48 C7 85 ?? ?? ?? ?? FE FF FF FF 49 89 D5 48 89 CB 4C 8B B5 ?? ?? ?? ?? 49 8B 00 \
+          48 8D 0D ?? ?? ?? ?? 48 63 04 81 48 01 C8 FF E0",
+      ),
+      Abi::SysV => return Err("the login form is only located on Windows".into()),
+   };
+   let leas = lea_index(image);
+   let mut funcs: Vec<usize> = image
+      .find_bytes(b"Forgot your password?")
+      .into_iter()
+      .flat_map(|target| leas.sites(target).collect::<Vec<_>>())
+      .filter_map(|site| image.function_containing(site))
+      .filter(|&func| {
+         image
+            .read(func, 72)
+            .is_some_and(|head| entry.find_in(head).first() == Some(&0))
+      })
+      .collect();
+   funcs.sort_unstable();
+   funcs.dedup();
+   one("login form", &funcs)
+}
+
 /// `libdiscord`'s token to user ID parser, `fn(&&Token) -> Option<u64>`, and
 /// where the token's string data and length sit in `Token`.
 #[derive(Clone, Copy, Debug)]

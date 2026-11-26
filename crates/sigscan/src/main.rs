@@ -181,6 +181,8 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          if abi == x86::Abi::Win64 {
             report("DAVE downgrade allow", desktop::dave_downgrade_allow(image).map(at));
       report("token user ID", desktop::token_user_id(image).map(|found| at(found.func)));
+      report("login form", desktop::login_form(image).map(at));
+      report("account switch", desktop::account_switch(image).map(at));
             report("high-pass coefficients", desktop::high_pass_coefficients(image).map(at));
          }
          if abi == x86::Abi::SysV {
@@ -223,10 +225,11 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                match (gpui.div_push_any, gpui.str_into_any) {
                   (Some(push), Some(text)) => {
                      Ok(format!(
-                        "{} (push_any {}, str_into_any {})",
+                        "{} (push_any {}, str_into_any {}, div_into_any {})",
                         at(gpui.div_new),
                         at(push),
-                        at(text)
+                        at(text),
+                        at(gpui.div_into_any)
                      ))
                   },
                   (push, text) => Err(format!("push_any {push:x?}, str_into_any {text:x?}")),
