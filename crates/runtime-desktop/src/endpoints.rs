@@ -6,6 +6,8 @@ use phoenix_hook::{
 };
 use phoenix_sigs::desktop;
 
+use crate::servers;
+
 type ForStackFn = unsafe extern "C" fn(*mut u8, u8) -> *mut u8;
 type StringFromFn = unsafe extern "C" fn(*mut [usize; 3], *const u8, usize) -> *mut [usize; 3];
 
@@ -48,7 +50,7 @@ struct Installed {
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 static ORIGINAL: OnceLock<ForStackFn> = OnceLock::new();
 
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
    env::var_os("LIBDISCORD_DATA_DIR").map_or_else(
       || {
          env::var_os("LOCALAPPDATA")
@@ -104,8 +106,17 @@ pub fn media_url(url: &str) -> Option<String> {
    ORIGINAL.get()?;
    {
       static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-      let key: String = url.split(['?', '#']).next().unwrap_or(url).splitn(5, '/').take(4).collect::<Vec<_>>().join("/");
-      let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      let key: String = url
+         .split(['?', '#'])
+         .next()
+         .unwrap_or(url)
+         .splitn(5, '/')
+         .take(4)
+         .collect::<Vec<_>>()
+         .join("/");
+      let mut seen = SEEN
+         .lock()
+         .unwrap_or_else(std::sync::PoisonError::into_inner);
       if !seen.contains(&key) {
          log::info!("endpoints: media fetch {key}");
          seen.push(key);
@@ -114,17 +125,26 @@ pub fn media_url(url: &str) -> Option<String> {
    if let Some(external) = external_url(url) {
       return Some(external);
    }
-   if DISCORD_APP_ASSETS.iter().any(|prefix| url.starts_with(prefix)) {
+   if DISCORD_APP_ASSETS
+      .iter()
+      .any(|prefix| url.starts_with(prefix))
+   {
       return None;
    }
-   let target = &INSTALLED.get()?.target;
-   let cdn = target.cdn.as_deref();
+   let installed = INSTALLED.get()?;
+   let (cdn, media) = if servers::routes().active() {
+      let server = servers::media_server()?;
+      (server.cdn, server.media)
+   } else {
+      (installed.target.cdn.clone(), installed.target.media.clone())
+   };
+   let cdn = cdn.as_deref();
    if let Some(decoration) = decoration_url(url, cdn?) {
       return Some(decoration);
    }
    [
       ("https://cdn.discordapp.com/", cdn),
-      ("https://media.discordapp.net/", target.media.as_deref().or(cdn)),
+      ("https://media.discordapp.net/", media.as_deref().or(cdn)),
    ]
    .into_iter()
    .find_map(|(from, to)| Some(format!("{}/{}", to?, url.strip_prefix(from)?)))
@@ -135,8 +155,10 @@ pub fn media_url(url: &str) -> Option<String> {
    })
 }
 
-const DISCORD_APP_ASSETS: [&str; 2] =
-   ["https://cdn.discordapp.com/app-assets/", "https://cdn.discordapp.com/app-icons/"];
+const DISCORD_APP_ASSETS: [&str; 2] = [
+   "https://cdn.discordapp.com/app-assets/",
+   "https://cdn.discordapp.com/app-icons/",
+];
 
 fn external_url(url: &str) -> Option<String> {
    let rest = url.strip_prefix("https://media.discordapp.net/external/")?;
@@ -220,16 +242,57 @@ fn backend() -> Option<Config> {
    Some(config)
 }
 
+/// Accounts can sit on different servers, so the gateway goes through the
+/// local relay, which picks the server from the token in IDENTIFY.
+fn relayed(legacy: Option<Target>) -> Target {
+   let routes = servers::routes();
+   let login = routes.login().map(|server| Target {
+      api: server.api.clone(),
+      origin: server
+         .origin
+         .clone()
+         .or_else(|| origin_of(&server.api))
+         .unwrap_or_else(|| servers::DISCORD_ORIGIN.to_owned()),
+      gateway: String::new(),
+      cdn: server.cdn.clone(),
+      media: server.media.clone(),
+   });
+   let base = login.or(legacy).unwrap_or_else(|| Target {
+      api: servers::DISCORD_API.to_owned(),
+      origin: servers::DISCORD_ORIGIN.to_owned(),
+      gateway: String::new(),
+      cdn: None,
+      media: None,
+   });
+   log::info!("endpoints: several servers, the gateway goes through the local relay");
+   Target {
+      gateway: servers::RELAY_GATEWAY.to_owned(),
+      ..base
+   }
+}
+
 pub fn install(image: &Image<'static>) {
-   let Some(config) = backend() else {
-      return;
-   };
-   let target = match target(config) {
-      Ok(target) => target,
-      Err(err) => {
-         log::error!("endpoints: {err}, staying on Discord");
+   let legacy = backend().and_then(|config| {
+      target(config)
+         .map_err(|err| log::error!("endpoints: {err}, staying on Discord"))
+         .ok()
+   });
+   if let Some(legacy) = &legacy {
+      servers::set_legacy(servers::Server {
+         api: legacy.api.clone(),
+         gateway: legacy.gateway.clone(),
+         origin: Some(legacy.origin.clone()),
+         cdn: legacy.cdn.clone(),
+         media: legacy.media.clone(),
+      });
+   }
+   let target = if servers::routes().active() {
+      relayed(legacy)
+   } else {
+      let Some(legacy) = legacy else {
          return;
-      },
+      };
+      legacy
    };
    if Abi::of(image) != Abi::Win64 {
       log::warn!("endpoints: only Windows builds are supported, staying on Discord");
@@ -293,15 +356,15 @@ pub fn install(image: &Image<'static>) {
 #[derive(Clone, Copy)]
 struct UserId {
    tag: u64,
-   id:  u64,
+   id: u64,
 }
 
 type TokenUserIdFn = unsafe fn(*const *const u8) -> UserId;
 
 struct TokenParser {
    original: TokenUserIdFn,
-   data:     usize,
-   len:      usize,
+   data: usize,
+   len: usize,
 }
 
 static TOKEN_PARSER: OnceLock<TokenParser> = OnceLock::new();
@@ -322,8 +385,8 @@ fn install_token_user_id(image: &Image<'static>) -> Result<(), String> {
    .map_err(|err| err.to_string())?;
    let _ = TOKEN_PARSER.set(TokenParser {
       original: unsafe { std::mem::transmute::<usize, TokenUserIdFn>(trampoline) },
-      data:     found.data,
-      len:      found.len,
+      data: found.data,
+      len: found.len,
    });
    Ok(())
 }
@@ -335,56 +398,23 @@ unsafe fn token_user_id(token: *const *const u8) -> UserId {
       return parsed;
    }
    let jwt = std::panic::catch_unwind(|| {
-      let word = |at: usize| Some(usize::from_le_bytes(x86::read_memory(at, 8)?.try_into().ok()?));
+      let word = |at: usize| {
+         Some(usize::from_le_bytes(
+            x86::read_memory(at, 8)?.try_into().ok()?,
+         ))
+      };
       let inner = word(token as usize)?;
       let data = word(inner + parser.data)?;
       let len = word(inner + parser.len)?;
       if len == 0 || len > MAX_URL {
          return None;
       }
-      jwt_user_id(&x86::read_memory(data, len)?)
+      servers::jwt_user_id(&x86::read_memory(data, len)?)
    });
    match jwt {
       Ok(Some(id)) => UserId { tag: 1, id },
       _ => parsed,
    }
-}
-
-fn jwt_user_id(token: &[u8]) -> Option<u64> {
-   let mut parts = token.split(|&byte| byte == b'.');
-   let (_, payload, _) = (parts.next()?, parts.next()?, parts.next()?);
-   if parts.next().is_some() {
-      return None;
-   }
-   let claims: serde_json::Value = serde_json::from_slice(&base64url(payload)?).ok()?;
-   match claims.get("id")? {
-      serde_json::Value::String(id) => id.parse().ok(),
-      serde_json::Value::Number(id) => id.as_u64(),
-      _ => None,
-   }
-}
-
-fn base64url(text: &[u8]) -> Option<Vec<u8>> {
-   let value = |byte: u8| match byte {
-      b'A'..=b'Z' => Some(byte - b'A'),
-      b'a'..=b'z' => Some(byte - b'a' + 26),
-      b'0'..=b'9' => Some(byte - b'0' + 52),
-      b'-' | b'+' => Some(62),
-      b'_' | b'/' => Some(63),
-      _ => None,
-   };
-   let mut out = Vec::with_capacity(text.len() * 3 / 4);
-   let mut acc = 0u32;
-   let mut bits = 0;
-   for &byte in text.iter().take_while(|&&byte| byte != b'=') {
-      acc = ((acc << 6) | u32::from(value(byte)?)) & 0xFF_FFFF;
-      bits += 6;
-      if bits >= 8 {
-         bits -= 8;
-         out.push((acc >> bits).to_le_bytes()[0]);
-      }
-   }
-   Some(out)
 }
 
 fn read_string(slot: usize) -> Option<Vec<u8>> {
@@ -444,9 +474,10 @@ fn rewrite(out: *mut u8, installed: &Installed) {
          .map(|index| {
             let at = out as usize + index * SLOT_SIZE;
             let words = x86::read_memory(at, SLOT_SIZE).unwrap_or_default();
-            let text = slots[index]
-               .as_deref()
-               .map_or_else(|| "?".to_owned(), |text| String::from_utf8_lossy(text).into_owned());
+            let text = slots[index].as_deref().map_or_else(
+               || "?".to_owned(),
+               |text| String::from_utf8_lossy(text).into_owned(),
+            );
             format!("{index}: {words:02x?} {text}")
          })
          .collect();

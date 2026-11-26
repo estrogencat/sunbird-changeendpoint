@@ -580,6 +580,28 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
             .to_owned();
          let method = unsafe { read_method(req_ref.method) }.into_owned();
          let headers = unsafe { read_headers(req_ref.headers) };
+         let authorization = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str());
+         let url = match crate::servers::route(&method, &url, authorization) {
+            crate::servers::Route::Keep => url,
+            crate::servers::Route::Block => {
+               req_ref.url.len = 0;
+               return;
+            },
+            crate::servers::Route::Rewrite(routed) => {
+               let len = req_ref.url.len;
+               // SAFETY: `req_ref.url` is the request's owned host `String`.
+               unsafe { replace_host_vec(req_ref.url, len, routed.as_bytes(), installed) };
+               if unsafe { read_str(req_ref.url) } != Some(routed.as_str()) {
+                  log::warn!("servers: could not reroute a request, blocked");
+                  req_ref.url.len = 0;
+                  return;
+               }
+               routed
+            },
+         };
          let body = if req_ref.body.tag == 1 {
             // SAFETY: `tag == 1` is `Body::Bytes(RawBytes)`.
             unsafe { read_bytes(&req_ref.body.bytes) }

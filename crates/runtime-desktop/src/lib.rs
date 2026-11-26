@@ -16,6 +16,7 @@ mod js;
 mod message;
 mod modal;
 mod os;
+mod servers;
 mod settings;
 mod staff;
 
