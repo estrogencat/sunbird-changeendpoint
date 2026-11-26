@@ -111,6 +111,12 @@ pub fn media_url(url: &str) -> Option<String> {
          seen.push(key);
       }
    }
+   if let Some(external) = external_url(url) {
+      return Some(external);
+   }
+   if DISCORD_APP_ASSETS.iter().any(|prefix| url.starts_with(prefix)) {
+      return None;
+   }
    let target = &INSTALLED.get()?.target;
    let cdn = target.cdn.as_deref();
    if let Some(decoration) = decoration_url(url, cdn?) {
@@ -127,6 +133,16 @@ pub fn media_url(url: &str) -> Option<String> {
          log::info!("endpoints: first media fetch rewritten to {rewritten}");
       }
    })
+}
+
+const DISCORD_APP_ASSETS: [&str; 2] =
+   ["https://cdn.discordapp.com/app-assets/", "https://cdn.discordapp.com/app-icons/"];
+
+fn external_url(url: &str) -> Option<String> {
+   let rest = url.strip_prefix("https://media.discordapp.net/external/")?;
+   let (_, rest) = rest.split_once('/')?;
+   let (scheme, rest) = rest.split_once('/')?;
+   matches!(scheme, "http" | "https").then(|| format!("{scheme}://{rest}"))
 }
 
 #[derive(serde::Deserialize)]

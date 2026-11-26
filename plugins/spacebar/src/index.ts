@@ -159,6 +159,16 @@ function rememberColor(guildId, everyone) {
 
 function fixObject(object) {
   let changed = false;
+  if (Array.isArray(object.activities)) {
+    for (const activity of object.activities) {
+      if (!activity || typeof activity !== "object" || activity.content_classification) continue;
+      activity.content_classification = { data: null, loaded: true };
+      if (typeof activity.flags === "string") activity.flags = Number(activity.flags) || 0;
+      activity.created_at ??= Date.now();
+      note("activity.content_classification");
+      changed = true;
+    }
+  }
   if (typeof object.id === "string" && Array.isArray(object.roles) && typeof object.roles[0] === "object") changed = fixGuild(object) || changed;
   if (typeof object.guild_id === "string" && typeof object.id === "string") rememberList(object.guild_id, object);
   const memberGuild = "joined_at" in object && Array.isArray(object.roles) && (typeof object.guild_id === "string" ? object.guild_id : object.roles.find(id => colorRoles.has(id)));
@@ -270,6 +280,53 @@ phoenix.discord.onResponse({ pathIncludes: "/profile" }, async res => {
     fixDeep(body);
     return { status: 200, body };
   }
+});
+
+const DISCORD_API = "https://discord.com/api/v9";
+const externalRequests = new Map();
+
+async function discordJson(path) {
+  const res = await phoenix.fetch(`${DISCORD_API}${path}`).catch(() => null);
+  return res?.ok ? res.json() : null;
+}
+
+phoenix.discord.onResponse({ pathPrefix: "/applications/public" }, async res => {
+  if (res.status < 300) return;
+  const ids = (/application_ids=([\d,%C]+)/.exec(res.path)?.[1] ?? "").split(/,|%2C/i).filter(id => /^\d+$/.test(id));
+  const apps = await Promise.all(ids.map(id => discordJson(`/oauth2/applications/${id}/rpc`)));
+  note("applications.public");
+  return { status: 200, body: apps.filter(Boolean) };
+});
+
+phoenix.discord.onResponse({ pathPrefix: "/oauth2/applications/", pathSuffix: "/assets" }, async res => {
+  if (res.status !== 404) return;
+  const id = /^\/oauth2\/applications\/(\d+)\/assets/.exec(res.path)?.[1];
+  note("applications.assets");
+  return { status: 200, body: (id && await discordJson(`/oauth2/applications/${id}/assets`)) ?? [] };
+});
+
+phoenix.discord.onResponse({ pathIncludes: "/application-identities" }, res => {
+  if (res.status !== 404) return;
+  note("users.application_identities");
+  return { status: 200, body: [] };
+});
+
+phoenix.discord.onRequest({ method: "POST", pathSuffix: "/external-assets" }, req => {
+  externalRequests.set(req.path, req.json()?.urls ?? []);
+});
+
+phoenix.discord.onResponse({ method: "POST", pathSuffix: "/external-assets" }, res => {
+  if (res.status < 300) return;
+  const urls = externalRequests.get(res.path) ?? [];
+  externalRequests.delete(res.path);
+  note("applications.external_assets");
+  return {
+    status: 200,
+    body: urls.flatMap(url => {
+      const match = /^(https?):\/\/([^/?#]+)(.*)$/.exec(url);
+      return match ? [{ url, external_asset_path: `external/spacebar/${match[1]}/${match[2]}${match[3]}` }] : [];
+    }),
+  };
 });
 
 phoenix.discord.onResponse({ pathIncludes: "/" }, res => {
