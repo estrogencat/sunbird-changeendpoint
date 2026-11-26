@@ -272,6 +272,17 @@ for (const name of Object.keys(phoenix.gateway)) {
   });
 }
 
+const VOICE_BRIDGE = "ws://127.0.0.1:8099/r/";
+
+phoenix.hook(phoenix.gateway.voiceServerUpdate, {
+  before(payload) {
+    if (typeof payload.endpoint !== "string" || payload.endpoint.startsWith(VOICE_BRIDGE)) return;
+    payload.endpoint = VOICE_BRIDGE + payload.endpoint.replace(/^wss?:\/\//, "").replace(/:443$/, "");
+    note("voice.bridge");
+    return payload;
+  },
+});
+
 phoenix.discord.onResponse({ pathIncludes: "/profile" }, async res => {
   if (res.status !== 304) return;
   const fresh = await phoenix.discord.get(res.path);

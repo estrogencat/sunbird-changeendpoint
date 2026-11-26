@@ -838,6 +838,33 @@ pub fn preferred_regions_skip(image: &Image<'_>) -> Found<usize> {
    Ok(je)
 }
 
+/// The capture high-pass filter's biquad coefficients, `a1, a2, b0, b1, b2`
+/// for 16, 32 and 48 kHz in order, as WebRTC's audio processing ships them.
+pub const HIGH_PASS_COEFFICIENTS: [f32; 15] = [
+   -1.94448, 0.94598, 0.97261, -1.94523, 0.97261, -1.97223, 0.97261, 0.98621, -1.97242, 0.98621,
+   -1.98149, 0.98166, 0.99079, -1.98157, 0.99079,
+];
+
+/// The capture high-pass filter's coefficient table in `.rdata`.
+pub fn high_pass_coefficients(image: &Image<'_>) -> Found<usize> {
+   let bytes: Vec<u8> = HIGH_PASS_COEFFICIENTS
+      .iter()
+      .flat_map(|value| value.to_le_bytes())
+      .collect();
+   one("high-pass coefficients", &image.find_bytes(&bytes))
+}
+
+/// The `jne` in the voice connection's DAVE version check that lets any
+/// version but 0 through. Spacebar's voice servers never speak DAVE, so with
+/// it made a `jmp` version 0 is accepted at session start and in transitions.
+pub fn dave_downgrade_allow(image: &Image<'_>) -> Found<usize> {
+   let check = match Abi::of(image) {
+      Abi::Win64 => Pattern::new("66 45 85 C9 75 ?? 44 89 C3 48 89 D7 45 84 C0 75 ?? 80 BF ?? ?? 00 00 00 74 ?? C6 06 FF"),
+      Abi::SysV => return Err("the DAVE version check is only located on Windows".into()),
+   };
+   Ok(one("DAVE version check", &image.scan(check))? + 4)
+}
+
 /// Settings page 24's sidebar name, `Phoenix`, and its id,
 /// `DESKTOP_PHOENIX`, both relabeled in place.
 #[derive(Clone, Copy, Debug)]

@@ -4,6 +4,7 @@
 #![cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
 
 mod accessories;
+mod audio;
 mod badges;
 mod context_menu;
 mod discord;
@@ -107,6 +108,7 @@ pub fn prepare() -> Result<(), Error> {
    let image = phoenix_runtime::target()?;
    open_access_gate(&image);
    endpoints::install(&image);
+   audio::install(&image);
    staff::prepare(&image);
    settings::install(&image);
    modal::install(&image);

@@ -276,6 +276,12 @@ pub fn install(image: &Image<'static>) {
       Ok(()) => log::info!("endpoints: voice state updates leave out preferred_regions"),
       Err(err) => log::warn!("endpoints: preferred_regions stays in voice state updates: {err}"),
    }
+   match desktop::dave_downgrade_allow(image)
+      .and_then(|jne| unsafe { image.write_code(jne, &[0xEB]) }.map_err(|err| err.to_string()))
+   {
+      Ok(()) => log::info!("endpoints: voice accepts DAVE protocol version 0"),
+      Err(err) => log::warn!("endpoints: voice still refuses DAVE version 0: {err}"),
+   }
    log::info!("endpoints: hooked @ {:#x} for {api}", found.func);
 }
 

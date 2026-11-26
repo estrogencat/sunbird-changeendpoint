@@ -178,6 +178,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "preferred_regions skip",
             desktop::preferred_regions_skip(image).map(at),
          );
+         if abi == x86::Abi::Win64 {
+            report("DAVE downgrade allow", desktop::dave_downgrade_allow(image).map(at));
+            report("high-pass coefficients", desktop::high_pass_coefficients(image).map(at));
+         }
          if abi == x86::Abi::SysV {
             report(
                "wayland frame",
