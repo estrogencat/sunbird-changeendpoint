@@ -854,9 +854,42 @@ pub fn high_pass_coefficients(image: &Image<'_>) -> Found<usize> {
    one("high-pass coefficients", &image.find_bytes(&bytes))
 }
 
-/// The `jne` in the voice connection's DAVE version check that lets any
-/// version but 0 through. Spacebar's voice servers never speak DAVE, so with
-/// it made a `jmp` version 0 is accepted at session start and in transitions.
+/// `libdiscord`'s token to user ID parser, `fn(&&Token) -> Option<u64>`, and
+/// where the token's string data and length sit in `Token`.
+#[derive(Clone, Copy, Debug)]
+pub struct TokenUserId {
+   pub func: usize,
+   pub data: usize,
+   pub len:  usize,
+}
+
+/// It splits the token on `.` and base64-decodes the first part as the ID,
+/// which only Discord's token format satisfies.
+pub fn token_user_id(image: &Image<'_>) -> Found<TokenUserId> {
+   let parser = match Abi::of(image) {
+      Abi::Win64 => Pattern::new(
+         "55 56 57 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ?? 48 C7 45 ?? FE FF FF FF 48 8B 01 \
+          48 8B 70 ?? 48 8B 40 ?? 48 C7 45 ?? 00 00 00 00 48 89 45 ?? 48 8D 55 ?? 48 89 75 ?? \
+          48 89 45 ?? 48 C7 45 ?? 00 00 00 00 48 89 45 ?? 48 B8 2E 00 00 00 2E 00 00 00",
+      ),
+      Abi::SysV => return Err("the token parser is only located on Windows".into()),
+   };
+   let func = one("token user ID parser", &image.scan(parser))?;
+   let head = image
+      .read(func + 32, 8)
+      .ok_or("token user ID parser is unreadable")?;
+   Ok(TokenUserId {
+      func,
+      data: usize::from(head[0]),
+      len: usize::from(head[4]),
+   })
+}
+
+/// The `jne` in the voice connection's DAVE version check.
+///
+/// It lets any version but 0 through. Spacebar's voice servers never speak
+/// DAVE, so with it made a `jmp` version 0 is accepted at session start and
+/// in transitions.
 pub fn dave_downgrade_allow(image: &Image<'_>) -> Found<usize> {
    let check = match Abi::of(image) {
       Abi::Win64 => Pattern::new("66 45 85 C9 75 ?? 44 89 C3 48 89 D7 45 84 C0 75 ?? 80 BF ?? ?? 00 00 00 74 ?? C6 06 FF"),

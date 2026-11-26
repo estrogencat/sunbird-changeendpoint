@@ -282,7 +282,109 @@ pub fn install(image: &Image<'static>) {
       Ok(()) => log::info!("endpoints: voice accepts DAVE protocol version 0"),
       Err(err) => log::warn!("endpoints: voice still refuses DAVE version 0: {err}"),
    }
+   match install_token_user_id(image) {
+      Ok(()) => log::info!("endpoints: user IDs are read from JWT tokens too"),
+      Err(err) => log::warn!("endpoints: JWT tokens name no user: {err}"),
+   }
    log::info!("endpoints: hooked @ {:#x} for {api}", found.func);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserId {
+   tag: u64,
+   id:  u64,
+}
+
+type TokenUserIdFn = unsafe fn(*const *const u8) -> UserId;
+
+struct TokenParser {
+   original: TokenUserIdFn,
+   data:     usize,
+   len:      usize,
+}
+
+static TOKEN_PARSER: OnceLock<TokenParser> = OnceLock::new();
+
+fn install_token_user_id(image: &Image<'static>) -> Result<(), String> {
+   let found = desktop::token_user_id(image)?;
+   if !desktop::ENDPOINTS_PROLOGUE.at(image, found.func) {
+      return Err(format!("prologue changed @ {:#x}", found.func));
+   }
+   let trampoline = unsafe {
+      image.hook_entry(
+         found.func,
+         desktop::ENDPOINTS_PROLOGUE.pattern,
+         desktop::ENDPOINTS_PROLOGUE.len,
+         token_user_id as *const () as usize,
+      )
+   }
+   .map_err(|err| err.to_string())?;
+   let _ = TOKEN_PARSER.set(TokenParser {
+      original: unsafe { std::mem::transmute::<usize, TokenUserIdFn>(trampoline) },
+      data:     found.data,
+      len:      found.len,
+   });
+   Ok(())
+}
+
+unsafe fn token_user_id(token: *const *const u8) -> UserId {
+   let parser = TOKEN_PARSER.wait();
+   let parsed = unsafe { (parser.original)(token) };
+   if parsed.tag == 1 || token.is_null() {
+      return parsed;
+   }
+   let jwt = std::panic::catch_unwind(|| {
+      let word = |at: usize| Some(usize::from_le_bytes(x86::read_memory(at, 8)?.try_into().ok()?));
+      let inner = word(token as usize)?;
+      let data = word(inner + parser.data)?;
+      let len = word(inner + parser.len)?;
+      if len == 0 || len > MAX_URL {
+         return None;
+      }
+      jwt_user_id(&x86::read_memory(data, len)?)
+   });
+   match jwt {
+      Ok(Some(id)) => UserId { tag: 1, id },
+      _ => parsed,
+   }
+}
+
+fn jwt_user_id(token: &[u8]) -> Option<u64> {
+   let mut parts = token.split(|&byte| byte == b'.');
+   let (_, payload, _) = (parts.next()?, parts.next()?, parts.next()?);
+   if parts.next().is_some() {
+      return None;
+   }
+   let claims: serde_json::Value = serde_json::from_slice(&base64url(payload)?).ok()?;
+   match claims.get("id")? {
+      serde_json::Value::String(id) => id.parse().ok(),
+      serde_json::Value::Number(id) => id.as_u64(),
+      _ => None,
+   }
+}
+
+fn base64url(text: &[u8]) -> Option<Vec<u8>> {
+   let value = |byte: u8| match byte {
+      b'A'..=b'Z' => Some(byte - b'A'),
+      b'a'..=b'z' => Some(byte - b'a' + 26),
+      b'0'..=b'9' => Some(byte - b'0' + 52),
+      b'-' | b'+' => Some(62),
+      b'_' | b'/' => Some(63),
+      _ => None,
+   };
+   let mut out = Vec::with_capacity(text.len() * 3 / 4);
+   let mut acc = 0u32;
+   let mut bits = 0;
+   for &byte in text.iter().take_while(|&&byte| byte != b'=') {
+      acc = ((acc << 6) | u32::from(value(byte)?)) & 0xFF_FFFF;
+      bits += 6;
+      if bits >= 8 {
+         bits -= 8;
+         out.push((acc >> bits).to_le_bytes()[0]);
+      }
+   }
+   Some(out)
 }
 
 fn read_string(slot: usize) -> Option<Vec<u8>> {

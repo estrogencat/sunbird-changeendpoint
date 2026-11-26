@@ -14,7 +14,7 @@ const missingMembers = new Set();
 const fetchedMembers = new Set();
 let fetchingMembers = false;
 const COLOR_BIT = 1n << 62n;
-const FIXABLE = /avatar_decoration_data|is_spam_request|last_message_id|premium_progress_bar_enabled|self_mute|"version"|"roles"|"joined_at"|"video\//;
+const FIXABLE = /avatar_decoration_data|is_spam_request|last_message_id|premium_progress_bar_enabled|self_mute|"version"|"roles"|"joined_at"|"video\/|"components":null/;
 
 function note(path) {
   if (seen.has(path)) return;
@@ -222,6 +222,11 @@ function fixObject(object) {
         changed = true;
       }
     }
+  }
+  if (object.components === null && "channel_id" in object && "content" in object) {
+    object.components = [];
+    note("message.components");
+    changed = true;
   }
   if ("premium_progress_bar_enabled" in object && typeof object.premium_progress_bar_enabled !== "boolean") {
     object.premium_progress_bar_enabled = false;
