@@ -1,5 +1,5 @@
 use std::{
-   collections::HashMap,
+   collections::{BTreeMap, HashMap},
    fs,
    path::{Path, PathBuf},
    sync::{Arc, Mutex, OnceLock, PoisonError},
@@ -19,37 +19,115 @@ const DISCORD_APIS: [&str; 6] = [
    "https://discord.com/api",
 ];
 
-#[derive(serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct Server {
-   #[serde(default)]
+   #[serde(default, skip_serializing_if = "Option::is_none")]
    pub name: Option<String>,
    pub api: String,
    pub gateway: String,
+   #[serde(default, skip_serializing_if = "Option::is_none")]
    pub origin: Option<String>,
+   #[serde(default, skip_serializing_if = "Option::is_none")]
    pub cdn: Option<String>,
+   #[serde(default, skip_serializing_if = "Option::is_none")]
    pub media: Option<String>,
 }
 
+/// What the Servers page edits, kept in `sunbird/servers.json`.
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
+pub struct Config {
+   #[serde(default)]
+   pub enabled: bool,
+   #[serde(default)]
+   pub custom: BTreeMap<String, Server>,
+   #[serde(default)]
+   pub accounts: BTreeMap<String, String>,
+   #[serde(default, skip_serializing_if = "Option::is_none")]
+   pub login: Option<String>,
+}
+
+/// What the Spacebar plugin kept before the Servers page, read once to carry
+/// it over.
 #[derive(serde::Deserialize, Default)]
-struct Stored {
+struct PluginStored {
    #[serde(default)]
    servers: HashMap<String, Server>,
    #[serde(default)]
-   accounts: HashMap<String, String>,
+   accounts: BTreeMap<String, String>,
    login: Option<String>,
+}
+
+fn builtin() -> BTreeMap<String, Server> {
+   let server = |name: &str, api: &str, gateway: &str, cdn: &str, origin: &str| Server {
+      name: Some(name.to_owned()),
+      api: api.to_owned(),
+      gateway: gateway.to_owned(),
+      origin: Some(origin.to_owned()),
+      cdn: Some(cdn.to_owned()),
+      media: None,
+   };
+   BTreeMap::from([
+      (
+         "spacebar".to_owned(),
+         server(
+            "Spacebar",
+            "https://api.rory.server.spacebar.chat/api/v9",
+            "wss://gateway.rory.server.spacebar.chat",
+            "https://cdn.rory.server.spacebar.chat",
+            "https://rory.server.spacebar.chat",
+         ),
+      ),
+      (
+         "hazletbar".to_owned(),
+         server(
+            "Hazletbar",
+            "https://api.softgaypaws.com/api/v9",
+            "wss://gateway.softgaypaws.com",
+            "https://cdn.softgaypaws.com",
+            "https://api.softgaypaws.com",
+         ),
+      ),
+   ])
+}
+
+pub fn is_builtin(key: &str) -> bool {
+   builtin().contains_key(key)
 }
 
 #[derive(Default)]
 pub struct Routes {
-   servers: HashMap<String, Server>,
+   servers: BTreeMap<String, Server>,
    accounts: HashMap<u64, String>,
+   linked: Vec<(u64, String)>,
    login: Option<String>,
    login_discord: bool,
+   enabled: bool,
 }
 
 impl Routes {
-   pub fn active(&self) -> bool {
-      !self.servers.is_empty()
+   pub const fn active(&self) -> bool {
+      self.enabled
+   }
+
+   pub fn servers(&self) -> impl Iterator<Item = (&str, &Server)> {
+      self
+         .servers
+         .iter()
+         .map(|(key, server)| (key.as_str(), server))
+   }
+
+   pub fn server(&self, key: &str) -> Option<&Server> {
+      self.servers.get(key)
+   }
+
+   /// Accounts and the server each one is on, by user ID.
+   pub fn linked(&self) -> &[(u64, String)] {
+      &self.linked
+   }
+
+   /// The server key new logins go to, `discord` included.
+   pub fn login_key(&self) -> String {
+      self.login_choices().1
    }
 
    pub fn login(&self) -> Option<&Server> {
@@ -139,8 +217,78 @@ fn modified(path: &Path) -> Option<SystemTime> {
    fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
+fn config_file() -> PathBuf {
+   crate::endpoints::data_dir()
+      .join("sunbird")
+      .join("servers.json")
+}
+
+/// The plugin's servers, links and login choice, the first time Sunbird runs
+/// with the Servers page.
+fn carried_over() -> Config {
+   let stored = fs::read(storage_file(&crate::endpoints::data_dir()))
+      .ok()
+      .and_then(|bytes| serde_json::from_slice::<PluginStored>(&bytes).ok())
+      .unwrap_or_default();
+   let builtin = builtin();
+   Config {
+      enabled: !stored.servers.is_empty(),
+      custom: stored
+         .servers
+         .into_iter()
+         .filter(|(key, _)| !builtin.contains_key(key))
+         .collect(),
+      accounts: stored.accounts,
+      login: stored.login,
+   }
+}
+
+pub fn config() -> Config {
+   fs::read(config_file()).map_or_else(
+      |_| carried_over(),
+      |bytes| {
+         serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            log::warn!("servers: servers.json is unreadable ({err}), starting empty");
+            Config::default()
+         })
+      },
+   )
+}
+
+static WRITING: Mutex<()> = Mutex::new(());
+
+/// Changes the saved config. Routing picks the change up on its next request.
+pub fn update(change: impl FnOnce(&mut Config)) -> std::io::Result<()> {
+   let _writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
+   let mut config = config();
+   change(&mut config);
+   let path = config_file();
+   if let Some(dir) = path.parent() {
+      fs::create_dir_all(dir)?;
+   }
+   let staged = path.with_extension("json.tmp");
+   fs::write(
+      &staged,
+      serde_json::to_vec_pretty(&config).map_err(std::io::Error::other)?,
+   )?;
+   fs::rename(&staged, &path)?;
+   *ROUTES.lock().unwrap_or_else(PoisonError::into_inner) = None;
+   Ok(())
+}
+
+fn usable(mut server: Server) -> Option<Server> {
+   let web = |url: &str| url.starts_with("https://") || url.starts_with("http://");
+   let socket = |url: &str| url.starts_with("wss://") || url.starts_with("ws://");
+   if !web(&server.api) || !socket(&server.gateway) {
+      return None;
+   }
+   server.api = server.api.trim_end_matches('/').to_owned();
+   server.gateway = server.gateway.trim_end_matches('/').to_owned();
+   Some(server)
+}
+
 pub fn routes() -> Arc<Routes> {
-   let path = storage_file(&crate::endpoints::data_dir());
+   let path = config_file();
    let stamp = modified(&path);
    let mut cache = ROUTES.lock().unwrap_or_else(PoisonError::into_inner);
    if let Some((seen, routes)) = cache.as_ref()
@@ -148,33 +296,68 @@ pub fn routes() -> Arc<Routes> {
    {
       return routes.clone();
    }
-   let stored = fs::read(&path)
-      .ok()
-      .and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok())
-      .unwrap_or_default();
-   let servers: HashMap<String, Server> = stored
-      .servers
+   let config = config();
+   let mut servers = builtin();
+   for (key, server) in config.custom {
+      if let (false, Some(server)) = (servers.contains_key(&key), usable(server)) {
+         servers.insert(key, server);
+      }
+   }
+   let linked: Vec<(u64, String)> = config
+      .accounts
       .into_iter()
-      .filter(|(_, server)| server.api.starts_with("https://") || server.api.starts_with("http://"))
-      .map(|(name, mut server)| {
-         server.api = server.api.trim_end_matches('/').to_owned();
-         server.gateway = server.gateway.trim_end_matches('/').to_owned();
-         (name, server)
-      })
+      .filter(|(_, key)| servers.contains_key(key))
+      .filter_map(|(id, key)| Some((id.parse().ok()?, key)))
       .collect();
    let routes = Arc::new(Routes {
-      accounts: stored
-         .accounts
-         .into_iter()
-         .filter(|(_, name)| servers.contains_key(name))
-         .filter_map(|(id, name)| Some((id.parse().ok()?, name)))
-         .collect(),
-      login_discord: stored.login.as_deref() == Some("discord"),
-      login: stored.login.filter(|name| servers.contains_key(name)),
+      accounts: linked.iter().cloned().collect(),
+      linked,
+      login_discord: config.login.as_deref() == Some("discord"),
+      login: config.login.filter(|key| servers.contains_key(key)),
+      enabled: config.enabled,
       servers,
    });
    *cache = Some((stamp, routes.clone()));
    routes
+}
+
+/// Links the account a login answered with to the server it logged in to.
+pub fn record_login(token: &str, server: &str) {
+   let Identity::Jwt(id) = identity(token) else {
+      return;
+   };
+   match update(|config| {
+      config.accounts.insert(id.to_string(), server.to_owned());
+   }) {
+      Ok(()) => log::info!("servers: account {id} is on {server}"),
+      Err(err) => log::warn!("servers: could not link account {id}: {err}"),
+   }
+}
+
+/// The server key a login request goes to, when `url` is one. `None` for
+/// requests that carry a token.
+pub fn login_target(method: &str, url: &str, authorization: Option<&str>) -> Option<String> {
+   let routes = routes();
+   if !routes.active() || authorization.is_some() || !method.eq_ignore_ascii_case("POST") {
+      return None;
+   }
+   let rest = api_rest(url, &routes)?;
+   if !rest.starts_with("/auth/") {
+      return None;
+   }
+   let key = routes.login_key();
+   (key != "discord" && routes.server(&key).is_some()).then_some(key)
+}
+
+/// The account on screen.
+pub fn viewing() -> Option<Identity> {
+   viewer()
+}
+
+/// The legacy single server from `endpoints.json`, used for accounts no
+/// server claims.
+pub fn legacy() -> Option<&'static Server> {
+   LEGACY.get()
 }
 
 fn active_user() -> Option<u64> {

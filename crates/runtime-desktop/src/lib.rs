@@ -9,6 +9,7 @@ mod audio;
 mod badges;
 mod context_menu;
 mod discord;
+mod discover;
 mod emoji;
 mod endpoints;
 mod fetch;

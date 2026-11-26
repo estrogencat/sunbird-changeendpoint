@@ -13,6 +13,7 @@
 
 use std::{
    borrow::Cow,
+   collections::HashMap,
    ffi::c_void,
    panic::{
       self,
@@ -23,7 +24,10 @@ use std::{
    str,
    sync::{
       Arc,
+      LazyLock,
+      Mutex,
       OnceLock,
+      PoisonError,
       atomic::{
          AtomicPtr,
          Ordering,
@@ -568,6 +572,7 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
       .expect("send_detour only runs after INSTALLED is set");
 
    let mut watched = None;
+   let mut login = None;
 
    if !req.is_null()
       && panic::catch_unwind(AssertUnwindSafe(|| {
@@ -584,6 +589,7 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
             .map(|(_, value)| value.as_str());
+         login = crate::servers::login_target(&method, &url, authorization);
          let url = match crate::servers::route(&method, &url, authorization) {
             crate::servers::Route::Keep => url,
             crate::servers::Route::Block => {
@@ -651,8 +657,31 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
    {
       track_response(future.data.addr() as u64, in_flight);
    }
+   if let Some(server) = login
+      && !future.data.is_null()
+   {
+      LOGINS
+         .lock()
+         .unwrap_or_else(PoisonError::into_inner)
+         .insert(future.data.addr() as u64, server);
+   }
 
    future
+}
+
+/// Login requests in flight, by future, and the server each one went to.
+static LOGINS: LazyLock<Mutex<HashMap<u64, String>>> = LazyLock::new(Mutex::default);
+
+/// Links the account in a login answer to its server. The token is never
+/// logged.
+fn record_login(body: &[u8], server: &str) {
+   #[derive(serde::Deserialize)]
+   struct Answer {
+      token: Option<String>,
+   }
+   if let Ok(Answer { token: Some(token) }) = serde_json::from_slice::<Answer>(body) {
+      crate::servers::record_login(&token, server);
+   }
 }
 
 unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
@@ -664,6 +693,20 @@ unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
 
    if result.is_pending() {
       return result;
+   }
+
+   let login = LOGINS
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .remove(&(future.addr() as u64));
+   if let Some(server) = login
+      && result.is_ok()
+      && (200..300).contains(&result.status)
+      && !result.body.ptr.is_null()
+   {
+      // SAFETY: `Poll::Ready(Ok(resp)).body` is a live `Vec<u8>`.
+      let body = unsafe { slice::from_raw_parts(result.body.ptr, result.body.len) };
+      record_login(body, &server);
    }
 
    if let Some(in_flight) = take_response(future.addr() as u64)

@@ -178,6 +178,8 @@ pub enum FieldKind {
    Number,
    /// Starts empty rather than showing the stored value.
    Secret,
+   /// A Servers tab field, saved there instead of to a plugin.
+   Server,
 }
 
 /// A plugin setting edited in the one-line field.
@@ -879,6 +881,10 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
       return;
    };
    let text = raw.trim();
+   if field.kind == FieldKind::Server {
+      save_server_field(&field.key, text);
+      return;
+   }
    let value = if field.kind == FieldKind::Number {
       match text.parse::<f64>() {
          Ok(number) if number.is_finite() => phoenix_runtime::Chosen::Number(number),
@@ -892,6 +898,32 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
    };
    phoenix_runtime::set_setting(&field.plugin, &field.key, value);
    close_active();
+}
+
+/// Adding looks the server up first, off the UI thread.
+fn save_server_field(key: &str, text: &str) {
+   if key != "add" {
+      match crate::gpui::edit_server(key, text) {
+         Ok(()) => close_active(),
+         Err(err) => set_install_status(&err, true, false),
+      }
+      return;
+   }
+   if text.is_empty() {
+      set_install_status("Enter the server's address", true, false);
+      return;
+   }
+   set_install_status("Looking for the server...", false, true);
+   let address = text.to_owned();
+   std::thread::spawn(move || {
+      match crate::gpui::add_server(&address) {
+         Ok(name) => {
+            close_active();
+            phoenix_ui_desktop::toast(&format!("Added {name}"));
+         },
+         Err(err) => set_install_status(&err, true, false),
+      }
+   });
 }
 
 fn close_active() {
@@ -1789,6 +1821,9 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                      match &inst.setting {
                         None => "https://example.com/plugin.js",
                         Some(field) if field.kind == FieldKind::Secret => "Leave empty to clear",
+                        Some(field) if field.key == "add" && field.kind == FieldKind::Server => {
+                           "rory.server.spacebar.chat"
+                        },
                         Some(_) => "",
                      },
                   )

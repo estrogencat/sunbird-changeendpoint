@@ -1,5 +1,5 @@
 // @description Fixes Spacebar payloads that Phoenix cannot decode
-// @version 0.3.0
+// @version 0.4.0
 // @author softgaypaws
 // @unlisted
 
@@ -20,58 +20,6 @@ function note(path) {
   if (seen.has(path)) return;
   seen.add(path);
   phoenix.log.info(`spacebar: fixing ${path}`);
-}
-
-const SERVERS = {
-  spacebar: {
-    name: "Spacebar",
-    api: "https://api.rory.server.spacebar.chat/api/v9",
-    gateway: "wss://gateway.rory.server.spacebar.chat",
-    cdn: "https://cdn.rory.server.spacebar.chat",
-    origin: "https://rory.server.spacebar.chat",
-  },
-  hazletbar: {
-    name: "Hazletbar",
-    api: "https://api.softgaypaws.com/api/v9",
-    gateway: "wss://gateway.softgaypaws.com",
-    cdn: "https://cdn.softgaypaws.com",
-    origin: "https://api.softgaypaws.com",
-  },
-};
-const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-if (JSON.stringify(phoenix.storage.get("servers")) !== JSON.stringify(SERVERS)) phoenix.storage.set("servers", SERVERS);
-
-function base64url(text) {
-  let out = "";
-  let acc = 0;
-  let bits = 0;
-  for (const char of text.replace(/=+$/, "")) {
-    const value = B64.indexOf(char === "+" ? "-" : char === "/" ? "_" : char);
-    if (value < 0) return null;
-    acc = ((acc << 6) | value) & 0xffffff;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out += String.fromCharCode((acc >> bits) & 0xff);
-    }
-  }
-  return out;
-}
-
-function tokenUserId(token) {
-  const [header, payload] = String(token).split(".");
-  try {
-    if (!JSON.parse(base64url(header) ?? "")?.alg) return null;
-    const id = JSON.parse(base64url(payload) ?? "")?.id;
-    return id === undefined ? null : String(id);
-  } catch {
-    return null;
-  }
-}
-
-function serverLabel(key) {
-  return key === "discord" ? "Discord" : SERVERS[key]?.name ?? key;
 }
 
 function murmur(key) {
@@ -396,31 +344,6 @@ phoenix.discord.onResponse({ method: "POST", pathSuffix: "/external-assets" }, r
     }),
   };
 });
-
-phoenix.discord.onResponse({ pathPrefix: "/auth/" }, res => {
-  if (res.status >= 300) return;
-  const login = phoenix.storage.get("login");
-  if (!SERVERS[login]) return;
-  const id = tokenUserId(res.json()?.token ?? "");
-  if (!id) return;
-  const accounts = phoenix.storage.get("accounts") ?? {};
-  accounts[id] = login;
-  phoenix.storage.set("accounts", accounts);
-  phoenix.log.info(`spacebar: account ${id} is on ${serverLabel(login)}`);
-});
-
-const settings = phoenix.settings.define({
-  login: {
-    type: "select",
-    title: "Server for new logins",
-    description: "Where Add Account and logging in go. Accounts already added stay on their own server.",
-    options: [...Object.keys(SERVERS), "discord"].map(value => ({ value, label: serverLabel(value) })),
-    default: "spacebar",
-    onChange: value => phoenix.storage.set("login", value),
-  },
-});
-
-if (phoenix.storage.get("login") !== settings.login) phoenix.storage.set("login", settings.login);
 
 phoenix.discord.onResponse({ pathIncludes: "/" }, res => {
   if (res.status >= 300 || !FIXABLE.test(res.body)) return;

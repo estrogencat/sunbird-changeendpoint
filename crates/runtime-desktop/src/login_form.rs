@@ -77,7 +77,7 @@ unsafe extern "C" fn detour(
          return;
       }
       let (choices, chosen) = routes.login_choices();
-      gpui::wrap_with_choices(out, "Server", &choices, &chosen, "spacebar", "login");
+      gpui::wrap_with_login_servers(out, "Server", &choices, &chosen);
    });
    out
 }

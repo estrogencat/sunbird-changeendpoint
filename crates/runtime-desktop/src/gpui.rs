@@ -7,6 +7,13 @@
 //! inside Discord's GPUI render tree with category tabs, rounded bordered
 //! cards, collapsible plugin settings dropdowns, and native select dropdowns.
 
+mod servers_tab;
+
+pub use servers_tab::{
+   add_server,
+   edit_server,
+};
+
 use std::{
    collections::HashSet,
    ffi::c_void,
@@ -269,6 +276,7 @@ static SYMBOLS: OnceLock<GpuiSymbols> = OnceLock::new();
 enum Tab {
    Plugins,
    Catalog,
+   Servers,
    General,
 }
 
@@ -287,6 +295,8 @@ struct UiState {
    cat_desktop_open: bool,
    cat_partial_open: bool,
    cat_mobile_open:  bool,
+   servers_open:     Option<String>,
+   servers_confirm:  Option<String>,
 }
 
 impl Default for UiState {
@@ -299,6 +309,8 @@ impl Default for UiState {
          cat_desktop_open: true,
          cat_partial_open: false,
          cat_mobile_open:  false,
+         servers_open:     None,
+         servers_confirm:  None,
       }
    }
 }
@@ -342,6 +354,8 @@ enum Action {
       key:    String,
    },
    InstallCatalog(String),
+   ServersToggle,
+   Servers(servers_tab::Press),
 }
 
 static ACTIONS: LazyLock<Mutex<Vec<Action>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -381,6 +395,7 @@ unsafe fn switch_callback(
       };
       match action {
          Action::ToggleStaff => phoenix_runtime::set_staff_enabled(on),
+         Action::ServersToggle => servers_tab::toggle(on),
          Action::TogglePlugin(name) => phoenix_runtime::set_enabled(&name, on),
          Action::ToggleSetting { plugin, key } => {
             phoenix_runtime::set_setting(&plugin, &key, Chosen::Switch(on));
@@ -493,6 +508,7 @@ unsafe extern "C" fn button_callback(
             }
          },
          Action::PressButton { plugin, key } => phoenix_runtime::press(&plugin, &key),
+         Action::Servers(press) => servers_tab::press(press),
          Action::InstallCatalog(name) => {
             std::thread::spawn(move || {
                match update::install_listed(&name) {
@@ -1186,15 +1202,13 @@ pub fn wrap_with_accessories(
    true
 }
 
-/// Wraps a rendered element in place under a row of option buttons that set
-/// a plugin's select setting, the chosen one highlighted.
-pub fn wrap_with_choices(
+/// Wraps a rendered element in place under a row of buttons picking the
+/// server new logins go to, the chosen one highlighted.
+pub fn wrap_with_login_servers(
    sret: *mut RawAnyElement,
    label: &str,
    choices: &[(String, String)],
    chosen: &str,
-   plugin: &str,
-   key: &str,
 ) -> bool {
    const LABEL: [f32; 4] = [0.0, 0.0, 0.95, 1.0];
 
@@ -1213,7 +1227,7 @@ pub fn wrap_with_choices(
    for (value, text) in choices {
       row = b.push_button(
          row,
-         &format!("sunbird-{plugin}-{key}-{value}"),
+         &format!("sunbird-login-server-{value}"),
          text,
          if value == chosen {
             BtnVariant::Primary
@@ -1221,11 +1235,7 @@ pub fn wrap_with_choices(
             BtnVariant::Secondary
          },
          BtnSize::Small,
-         Action::PickSelectOption {
-            plugin: plugin.to_owned(),
-            key:    key.to_owned(),
-            value:  value.clone(),
-         },
+         Action::Servers(servers_tab::Press::Login(value.clone())),
       );
    }
 
@@ -1377,6 +1387,14 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    );
    tab_bar = b.push_button(
       tab_bar,
+      "sunbird-tab-servers",
+      "Servers",
+      variant_for(Tab::Servers),
+      BtnSize::Small,
+      Action::SetTab(Tab::Servers),
+   );
+   tab_bar = b.push_button(
+      tab_bar,
       "sunbird-tab-general",
       "General & Updates",
       variant_for(Tab::General),
@@ -1403,6 +1421,9 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       Tab::Catalog => {
          let installed: HashSet<String> = plugins.iter().map(|p| p.name.clone()).collect();
          root = render_catalog_tab(&b, root, &installed, cat_desktop, cat_partial, cat_mobile);
+      },
+      Tab::Servers => {
+         root = servers_tab::render(&b, root);
       },
       Tab::General => {
          root = render_general_tab(&b, root);
