@@ -352,12 +352,9 @@ impl Platform for Desktop {
       };
       let _ = std::fs::create_dir_all(state.plugins_dir());
       // Any local process could reach the shell's `/eval` and the session, so
-      // it only listens once DevTools is opened, and only for holders of this
-      // start's token. `SUNBIRD_DEVTOOLS` starts it at launch, for `dev.ps1`.
+      // only holders of this start's token get in.
       remote::require_token(&state.plugins_dir().with_file_name("debug-shell-token"));
-      if std::env::var_os("SUNBIRD_DEVTOOLS").is_some() {
-         start_shell();
-      }
+      start_shell();
       phoenix_ui_desktop::start_tray(phoenix_ui_desktop::TrayConfig {
          devtools_url:     Arc::new(start_shell),
          plugins_dir:      state.plugins_dir(),

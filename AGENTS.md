@@ -25,7 +25,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `crates/runtime/src/gateway.rs` | Gateway event hooks by swapping handler pointers in Phoenix's event registry. |
 | `crates/runtime/src/discord.rs` | `phoenix.discord`, Discord's API with Phoenix's own session (platforms carry the requests). |
 | `crates/runtime/src/update.rs` | Update checks against the site and one-tap plugin updates. |
-| `crates/runtime/src/remote.rs` | Debug shell on `127.0.0.1:4242` (off by default on Android, toggled in Settings -> Phoenix Unlocker -> Debug; on desktop starts when DevTools first opens or at launch with `SUNBIRD_DEVTOOLS` set, which `dev.ps1 -Desktop` does). Platforms add their own endpoints. |
+| `crates/runtime/src/remote.rs` | Debug shell on `127.0.0.1:4242` (off by default on Android, toggled in Settings -> Phoenix Unlocker -> Debug; on desktop starts at launch). Platforms add their own endpoints. |
 | `crates/runtime-mobile` | Mobile runtime for Android and iOS. iOS has no installer or staff hook, and uses Foundation HTTP plus a bundled SQLite. |
 | `crates/runtime-mobile/src/bridge/` | Sinks every guest/host frame passes, returning `Action::{Pass, Drop, Replace}`. `jni.rs` patches the JNI table on `GuestHost.invoke`/`applyOps` and rebinds `nativeDispatch`; `ios.rs` swaps the dispatch slot in the guest's vtable and the call slot in the host callbacks' vtable. |
 | `crates/runtime-mobile/src/settings/` | Mobile Phoenix Unlock settings pages built from UI ops. |

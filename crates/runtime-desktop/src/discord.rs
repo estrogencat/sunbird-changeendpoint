@@ -13,10 +13,7 @@
 
 use std::{
    borrow::Cow,
-   collections::{
-      HashMap,
-      HashSet,
-   },
+   collections::HashMap,
    ffi::c_void,
    panic::{
       self,
@@ -655,7 +652,7 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
 
    let mut watched = None;
    let mut login = None;
-   let mut messages = false;
+   let mut fix = None;
 
    if !req.is_null()
       && panic::catch_unwind(AssertUnwindSafe(|| {
@@ -691,13 +688,13 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
                routed
             },
          };
-         messages = spacebar_messages(&method, &url);
          let body = if req_ref.body.tag == 1 {
             // SAFETY: `tag == 1` is `Body::Bytes(RawBytes)`.
             unsafe { read_bytes(&req_ref.body.bytes) }
          } else {
             &[]
          };
+         fix = crate::attachments::Fix::of(&method, &url, body);
 
          match observe(&method, &url, &headers, body) {
             RequestAction::Pass => {},
@@ -741,11 +738,13 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
    {
       track_response(future.data.addr() as u64, in_flight);
    }
-   if messages && !future.data.is_null() {
-      MESSAGES
+   if let Some(fix) = fix
+      && !future.data.is_null()
+   {
+      FIXES
          .lock()
          .unwrap_or_else(PoisonError::into_inner)
-         .insert(future.data.addr() as u64);
+         .insert(future.data.addr() as u64, fix);
    }
    if let Some(server) = login
       && !future.data.is_null()
@@ -759,18 +758,9 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
    future
 }
 
-/// Message requests to Spacebar servers in flight, by future.
-static MESSAGES: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(Mutex::default);
-
-/// Message lists and sends answered by a Spacebar server, whose attachments
-/// need Discord's flags.
-fn spacebar_messages(method: &str, url: &str) -> bool {
-   let path = url.split(['?', '#']).next().unwrap_or(url);
-   matches!(method, "GET" | "POST" | "PATCH")
-      && !path.contains("discord.com/")
-      && !path.contains("discordapp.com/")
-      && (path.contains("/messages") || path.ends_with("/pins"))
-}
+/// Spacebar requests in flight, by future, whose answers need reshaping.
+static FIXES: LazyLock<Mutex<HashMap<u64, crate::attachments::Fix>>> =
+   LazyLock::new(Mutex::default);
 
 /// Login requests in flight, by future, and the server each one went to.
 static LOGINS: LazyLock<Mutex<HashMap<u64, String>>> = LazyLock::new(Mutex::default);
@@ -815,17 +805,18 @@ unsafe fn buffered_poll_detour(future: *mut c_void, cx: *mut c_void) -> Buffered
       record_login(body, &server);
    }
 
-   if MESSAGES
+   let fix = FIXES
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
-      .remove(&(future.addr() as u64))
+      .remove(&(future.addr() as u64));
+   if let Some(fix) = fix
       && result.is_ok()
       && (200..300).contains(&result.status)
       && !result.body.ptr.is_null()
    {
       // SAFETY: `Poll::Ready(Ok(resp)).body` is a live `Vec<u8>`.
       let body = unsafe { slice::from_raw_parts(result.body.ptr, result.body.len) };
-      if let Some(flagged) = crate::attachments::flag_response(body) {
+      if let Some(flagged) = fix.apply(body) {
          let len = result.body.len;
          // SAFETY: `result.body` is owned by the Ready response being returned.
          unsafe { replace_host_vec(&mut result.body, len, &flagged, installed) };
