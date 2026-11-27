@@ -18,6 +18,8 @@ pub enum Fix {
    Messages,
    /// An attachment link refresh, with the links asked for in order.
    RefreshUrls(Vec<String>),
+   /// GIF picker results, whose links need to be the GIF files.
+   Gifs,
 }
 
 impl Fix {
@@ -27,9 +29,9 @@ impl Fix {
       struct Refresh {
          attachment_urls: Vec<String>,
       }
-      let path = url.split(['?', '#']).next().unwrap_or(url);
-      if path.contains("discord.com/") || path.contains("discordapp.com/") {
-         return None;
+      let path = spacebar_path(url)?;
+      if method == "GET" && crate::gifs::is_picker(path) {
+         return Some(Self::Gifs);
       }
       if method == "POST" && path.ends_with("/attachments/refresh-urls") {
          let refresh = serde_json::from_slice::<Refresh>(body).ok()?;
@@ -45,8 +47,31 @@ impl Fix {
       match self {
          Self::Messages => flag_response(body),
          Self::RefreshUrls(asked) => paired_refresh(body, asked),
+         Self::Gifs => crate::gifs::direct_links(body),
       }
    }
+}
+
+/// The path of a request to a Spacebar server, without its query.
+fn spacebar_path(url: &str) -> Option<&str> {
+   let path = url.split(['?', '#']).next().unwrap_or(url);
+   (!path.contains("discord.com/") && !path.contains("discordapp.com/")).then_some(path)
+}
+
+/// A request body to send in place of the one Phoenix built, for message
+/// sends and edits to a Spacebar server.
+pub fn rewrite_request(method: &str, url: &str, body: &[u8]) -> Option<Vec<u8>> {
+   let path = spacebar_path(url)?;
+   let sends = matches!(method, "POST" | "PATCH")
+      && path
+         .rsplit_once("/messages")
+         .is_some_and(|(_, rest)| {
+            rest.is_empty()
+               || rest
+                  .strip_prefix('/')
+                  .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+         });
+   if sends { crate::gifs::outgoing(body) } else { None }
 }
 
 #[derive(serde::Serialize)]

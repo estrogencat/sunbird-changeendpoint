@@ -24,6 +24,7 @@ mod emoji;
 mod endpoints;
 mod fetch;
 mod gateway_send;
+mod gifs;
 mod gpui;
 mod headers;
 mod icons;

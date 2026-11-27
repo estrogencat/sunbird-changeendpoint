@@ -1145,7 +1145,7 @@ fn observe(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -
          crate::js::ui::intercept_send_body(&engine, channel, body)
       })
    });
-   match sent {
+   let action = match sent {
       RequestAction::Pass => observe_request(method, url, headers, body),
       RequestAction::Drop => RequestAction::Drop,
       RequestAction::Replace(sent) => {
@@ -1154,6 +1154,14 @@ fn observe(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -
             hooked => hooked,
          }
       },
+   };
+   match action {
+      RequestAction::Pass => crate::attachments::rewrite_request(method, url, body)
+         .map_or(RequestAction::Pass, RequestAction::Replace),
+      RequestAction::Replace(sent) => RequestAction::Replace(
+         crate::attachments::rewrite_request(method, url, &sent).unwrap_or(sent),
+      ),
+      RequestAction::Drop => RequestAction::Drop,
    }
 }
 
