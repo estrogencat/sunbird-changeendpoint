@@ -1501,6 +1501,40 @@ pub fn upload_limit(image: &Image<'_>) -> Found<UploadLimit> {
    Ok(UploadLimit { func: outer, field })
 }
 
+/// The sidebar's channel row picture, which only group DM and user rows use.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelRowPicture {
+   /// `(sret, channel_id, kind: u16, ...)`, an `Option` of the row's picture,
+   /// a group DM's own for kind 3.
+   pub lookup: usize,
+   /// The 6-byte `jne` after it that drops the picture unless the row's kind
+   /// is 1 or 3.
+   pub kind_check: usize,
+}
+
+pub fn channel_row_picture(image: &Image<'_>) -> Found<ChannelRowPicture> {
+   /// `cmp r8w, 1; je ...; movzx eax, r8w; cmp eax, 3; jne ...`
+   const KINDS: Pattern = Pattern::new("66 41 83 F8 01 74 ?? 41 0F B7 C0 83 F8 03 0F 85");
+   /// `or ecx, 2; cmp ecx, 3; jne ...`
+   const CHECK: Pattern = Pattern::new("83 C9 02 83 F9 03 0F 85");
+   let sites: Vec<usize> = image
+      .scan(KINDS)
+      .into_iter()
+      .filter_map(|site| Some(image.function_bounds(site)?.0))
+      .collect();
+   let lookup = one("channel row picture lookup", &sites)?;
+   let checks: Vec<usize> = call_index(image)
+      .sites(lookup)
+      .filter_map(|call| {
+         let after = image.read(call, 0x60)?;
+         let at = *CHECK.find_in(after).first()?;
+         Some(call + at + 6)
+      })
+      .collect();
+   let kind_check = one("channel row picture kind check", &checks)?;
+   Ok(ChannelRowPicture { lookup, kind_check })
+}
+
 /// Discord's own GPUI and Mana builders the settings page calls.
 #[derive(Debug, Clone)]
 pub struct Gpui {

@@ -278,6 +278,11 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|limit| format!("{} (field +{:#x})", at(limit.func), limit.field)),
          );
          report(
+            "channel row picture",
+            desktop::channel_row_picture(image)
+               .map(|found| format!("{} (kind check {})", at(found.lookup), at(found.kind_check))),
+         );
+         report(
             "settings section",
             desktop::settings_section(image)
                .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),

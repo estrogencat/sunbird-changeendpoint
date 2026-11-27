@@ -13,6 +13,7 @@ mod account_switch;
 mod attachments;
 mod audio;
 mod badges;
+mod channel_icons;
 mod channel_order;
 mod composer;
 mod context_menu;
@@ -186,6 +187,7 @@ pub fn prepare() -> Result<(), Error> {
    if X86_CODE {
       modal::install(&image);
       upload_limit::install(&image);
+      channel_icons::install(&image);
    }
    context_menu::install(&image);
    // Before accessories hooks `MessageRow::render`, whose prologue the header

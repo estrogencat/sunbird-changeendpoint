@@ -60,6 +60,7 @@ pub fn remember_guild(guild: &Value) {
    let Some(Value::Array(channels)) = guild.get("channels") else {
       return;
    };
+   channels.iter().for_each(crate::channel_icons::note);
    let channels = channels.iter().filter_map(parse).collect();
    with_guilds(|guilds| guilds.insert(id.to_owned(), channels));
 }
@@ -73,6 +74,9 @@ pub fn follow(event: &str, data: &Value) {
          }
       },
       "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
+         if event != "CHANNEL_DELETE" {
+            crate::channel_icons::note(data);
+         }
          let Some(guild) = data.get("guild_id").and_then(Value::as_str) else {
             return;
          };
