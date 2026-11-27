@@ -27,12 +27,15 @@ use phoenix_runtime::{
          Settlement,
          in_background,
       },
+      checked_icon,
+      restart_budget,
    },
    store::{
       self,
       Cell,
    },
 };
+use phoenix_ui_desktop::Shortcut;
 use rquickjs::{
    Array,
    CatchResultExt,
@@ -74,6 +77,13 @@ use crate::{
       PageModalSpec,
       Prompt,
    },
+   notices::{
+      self,
+      Notice,
+   },
+   shortcuts,
+   sidebar,
+   toolbar,
 };
 
 #[derive(Clone)]
@@ -604,7 +614,7 @@ fn add_message_action<'js>(
    options: &Object<'js>,
 ) -> rquickjs::Result<Function<'js>> {
    let label = options.get::<_, String>("label")?;
-   let icon = options.get::<_, Option<String>>("icon")?;
+   let icon = checked_icon(ctx, plugin, options.get::<_, Option<String>>("icon")?)?;
    let danger = options.get::<_, Option<bool>>("danger")?.unwrap_or(false);
    let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
    let visible = options.get::<_, Option<Function<'js>>>("visible")?;
@@ -687,6 +697,7 @@ fn open_page<'js>(
                      buttons.push(ModalButton {
                         label,
                         danger,
+                        primary: false,
                         on_press: Arc::new(move || invoke_page_button(btn_id, None)),
                      });
                   }
@@ -922,6 +933,7 @@ fn page_button<'js>(
    ModalButton {
       label,
       danger,
+      primary: false,
       on_press: Arc::new(move || invoke_page_button(btn_id, None)),
    }
 }
@@ -1044,6 +1056,7 @@ fn profile_sections<'js>(
                buttons: vec![ModalButton {
                   label,
                   danger: false,
+                  primary: false,
                   on_press: Arc::new(move || {
                      modal::open_prompt(Prompt {
                         title:     title.clone(),
@@ -1103,6 +1116,202 @@ fn hide<'js>(ctx: &Ctx<'js>, plugin: &str, id: &str) -> rquickjs::Result<Functio
          composer::hide_gift(false);
       }
    })
+}
+
+/// `phoenix.ui.collapseChannels`: the channel sidebar stays collapsed while
+/// any plugin holds it.
+fn collapse_channels<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT_COLLAPSE: AtomicU64 = AtomicU64::new(1);
+
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   if !sidebar::collapse(true) {
+      return noop_handle(ctx);
+   }
+   let hold = NEXT_COLLAPSE.fetch_add(1, Ordering::Relaxed);
+   registry
+      .collapses
+      .borrow_mut()
+      .push((hold, plugin.to_owned()));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut collapses = registry.collapses.borrow_mut();
+      let before = collapses.len();
+      collapses.retain(|(held, _)| *held != hold);
+      if collapses.len() != before {
+         sidebar::collapse(false);
+      }
+   })
+}
+
+/// `phoenix.ui.addHeaderButton`: a button after the member list toggle in the
+/// channel header toolbar. `update` changes its icon or label.
+fn add_header_button<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_BUTTON: AtomicU64 = AtomicU64::new(1);
+
+   let icon = options.get::<_, Option<String>>("icon")?;
+   let label = options
+      .get::<_, Option<String>>("label")?
+      .unwrap_or_default();
+   let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let Some(icon) = context_menu::map_icon(icon.as_deref()).filter(|_| toolbar::ready()) else {
+      return noop_handle(ctx);
+   };
+   let id = NEXT_BUTTON.fetch_add(1, Ordering::Relaxed);
+   registry
+      .header_buttons
+      .borrow_mut()
+      .push((id, plugin.to_owned(), on_press));
+   drop(registry);
+   toolbar::set(id, icon, label, priority);
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      registry
+         .header_buttons
+         .borrow_mut()
+         .retain(|(held, ..)| *held != id);
+      toolbar::remove(id);
+   })?;
+   remove.set(
+      "update",
+      Function::new(
+         ctx.clone(),
+         move |patch: Object<'js>| -> rquickjs::Result<()> {
+            let Some(mut button) = toolbar::get(id) else {
+               return Ok(());
+            };
+            if let Some(icon) = patch.get::<_, Option<String>>("icon")? {
+               button.icon = context_menu::map_icon(Some(&icon)).unwrap_or(button.icon);
+            }
+            if let Some(label) = patch.get::<_, Option<String>>("label")? {
+               button.label = label;
+            }
+            toolbar::set(id, button.icon, button.label, button.priority);
+            Ok(())
+         },
+      )?,
+   )?;
+   Ok(remove)
+}
+
+/// Runs the `onPress` of header button `id`.
+pub fn press_header_button(engine: &Engine, id: u64) {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return;
+      };
+      let found = registry
+         .header_buttons
+         .borrow()
+         .iter()
+         .find(|(held, ..)| *held == id)
+         .map(|(_, plugin, press)| (plugin.clone(), press.clone()));
+      drop(registry);
+      let Some((plugin, press)) = found else {
+         return;
+      };
+      let Ok(arg) = build_message_context(&ctx, 0, 0, false) else {
+         return;
+      };
+      if let Err(err) = press.call::<_, Value<'_>>((arg,)).catch(&ctx) {
+         log::error!("[{plugin}] addHeaderButton onPress: {err}");
+      }
+   });
+}
+
+/// `phoenix.ui.addShortcut`: `run` for a letter or digit pressed with Ctrl or
+/// Alt while Discord is focused, which Discord then never sees.
+fn add_shortcut<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_SHORTCUT: AtomicU64 = AtomicU64::new(1);
+
+   let key = options.get::<_, String>("key")?;
+   let flag = |name: &str| -> rquickjs::Result<bool> {
+      Ok(options.get::<_, Option<bool>>(name)?.unwrap_or(false))
+   };
+   let shortcut = Shortcut {
+      key:   match key.as_bytes() {
+         [key] if key.is_ascii_alphanumeric() => key.to_ascii_uppercase(),
+         _ => {
+            return Err(Exception::throw_type(
+               ctx,
+               &format!("shortcut key {key:?} is not one letter or digit"),
+            ));
+         },
+      },
+      ctrl:  flag("ctrl")?,
+      shift: flag("shift")?,
+      alt:   flag("alt")?,
+   };
+   if !shortcut.ctrl && !shortcut.alt {
+      return Err(Exception::throw_type(
+         ctx,
+         "a shortcut needs ctrl or alt, or it would take typed text",
+      ));
+   }
+   let run = options.get::<_, Function<'js>>("run")?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   if !phoenix_ui_desktop::SHORTCUTS {
+      return noop_handle(ctx);
+   }
+   let id = NEXT_SHORTCUT.fetch_add(1, Ordering::Relaxed);
+   registry
+      .shortcuts
+      .borrow_mut()
+      .push((id, plugin.to_owned(), shortcut, run));
+   shortcuts::hold(shortcut);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut held = registry.shortcuts.borrow_mut();
+      let before = held.len();
+      held.retain(|(existing, ..)| *existing != id);
+      if held.len() != before {
+         shortcuts::release(shortcut);
+      }
+   })
+}
+
+/// Runs the `phoenix.ui.addShortcut` handlers for `shortcut`.
+pub fn run_shortcut(engine: &Engine, shortcut: Shortcut) {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return;
+      };
+      let handlers = registry
+         .shortcuts
+         .borrow()
+         .iter()
+         .filter(|(_, _, key, _)| *key == shortcut)
+         .map(|(_, plugin, _, run)| (plugin.clone(), run.clone()))
+         .collect::<Vec<_>>();
+      drop(registry);
+      for (plugin, run) in handlers {
+         if let Err(err) = run.call::<_, Value<'_>>(()).catch(&ctx) {
+            log::error!("[{plugin}] shortcut: {err}");
+         }
+      }
+   });
 }
 
 /// `phoenix.ui.onEvent`. Desktop sends `rowDoubleTap`, on message rows.
@@ -1175,6 +1384,80 @@ fn drop_page_buttons(ctx: &Ctx<'_>, owner: u64) {
    }
 }
 
+/// `phoenix.ui.toast`, as a banner named after the plugin.
+fn toast(plugin: &str, message: &str) {
+   if notices::show(Notice::plain(plugin, message, None)).is_some() {
+      log::info!("[toast] {plugin}: {message}");
+   } else {
+      phoenix_ui_desktop::toast(message);
+   }
+}
+
+/// `phoenix.ui.notify`, as a banner named after the plugin. Returns a function
+/// that dismisses it.
+fn notify<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   let title = options
+      .get::<_, Option<String>>("title")?
+      .unwrap_or_default();
+   let body = options.get::<_, Option<String>>("body")?;
+   let accent = options
+      .get::<_, Option<f64>>("accent")?
+      .map_or(notices::ACCENT, to_argb);
+   let duration = match options.get::<_, Option<f64>>("durationMs")? {
+      Some(ms) if ms <= 0.0 => None,
+      Some(ms) => Some(Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(notices::DURATION)),
+      None => Some(notices::DURATION),
+   };
+   let on_press = options.get::<_, Option<Function<'js>>>("onPress")?;
+   let Some(id) = notices::show(Notice {
+      source: plugin.to_owned(),
+      title: title.clone(),
+      body: body.clone(),
+      accent,
+      duration,
+      pressable: on_press.is_some(),
+   }) else {
+      phoenix_ui_desktop::notify(&title, body.as_deref());
+      return noop_handle(ctx);
+   };
+   log::info!("[notify] {plugin}: {title}");
+   if let Some(on_press) = on_press
+      && let Some(registry) = ctx.userdata::<Desktop<'js>>()
+   {
+      let mut presses = registry.notices.borrow_mut();
+      presses.retain(|shown, _| notices::is_shown(*shown));
+      presses.insert(id, (plugin.to_owned(), on_press));
+   }
+   let dismiss = Function::new(ctx.clone(), move || notices::dismiss(id))?;
+   dismiss.set(
+      "close",
+      Function::new(ctx.clone(), move || notices::dismiss(id))?,
+   )?;
+   Ok(dismiss)
+}
+
+/// Runs the `onPress` of banner `id`, whose Open button was pressed.
+pub fn press_notice(id: u64) {
+   let Some(engine) = phoenix_runtime::engine() else {
+      return;
+   };
+   engine.with(|ctx| {
+      let Some((plugin, on_press)) = ctx
+         .userdata::<Desktop<'_>>()
+         .and_then(|registry| registry.notices.borrow_mut().remove(&id))
+      else {
+         return;
+      };
+      if let Err(err) = on_press.call::<_, Value<'_>>(()).catch(&ctx) {
+         log::error!("[{plugin}] notify onPress: {err}");
+      }
+   });
+}
+
 /// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick`, and
 /// `phoenix.commands` onto the plugin's API objects.
 pub fn desktop_patch_api<'js>(
@@ -1211,6 +1494,7 @@ pub fn desktop_patch_api<'js>(
       Function::new(ctx.clone(), |ctx: Ctx<'js>| rquickjs::Array::new(ctx))?,
    )?;
    api.set("commands", commands)?;
+   api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
    api.set("ui", desktop_ui_object(ctx, plugin)?)
 }
 
@@ -1220,10 +1504,11 @@ pub fn desktop_patch_api<'js>(
 )]
 pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    let ui = Object::new(ctx.clone())?;
+   let toast_owner = plugin.to_owned();
    ui.set(
       "toast",
-      Function::new(ctx.clone(), |message: String| {
-         phoenix_ui_desktop::toast(&message);
+      Function::new(ctx.clone(), move |message: String| {
+         toast(&toast_owner, &message);
       })?,
    )?;
    ui.set(
@@ -1233,15 +1518,11 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
             .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
       })?,
    )?;
+   let notify_owner = plugin.to_owned();
    ui.set(
       "notify",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         let title = options
-            .get::<_, Option<String>>("title")?
-            .unwrap_or_default();
-         let body = options.get::<_, Option<String>>("body")?;
-         phoenix_ui_desktop::notify(&title, body.as_deref());
-         noop_handle(&ctx)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         notify(&ctx, &notify_owner, &options)
       })?,
    )?;
 
@@ -1302,6 +1583,22 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          hide(&ctx, &hide_owner, &id)
       })?,
    )?;
+   if sidebar::ready() {
+      let collapse_owner = plugin.to_owned();
+      ui.set(
+         "collapseChannels",
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+            collapse_channels(&ctx, &collapse_owner)
+         })?,
+      )?;
+   }
+   let shortcut_owner = plugin.to_owned();
+   ui.set(
+      "addShortcut",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_shortcut(&ctx, &shortcut_owner, &options)
+      })?,
+   )?;
    let event_owner = plugin.to_owned();
    ui.set(
       "onEvent",
@@ -1315,8 +1612,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
 
    // Graceful no-op shims for remaining mobile UI-op surfaces so cross-platform
    // plugins load without throwing on desktop.
-   for slot_fn in [
+   let header_owner = plugin.to_owned();
+   ui.set(
       "addHeaderButton",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_header_button(&ctx, &header_owner, &options)
+      })?,
+   )?;
+   for slot_fn in [
       "addComposerButton",
       "addProfileSection",
       "patchProps",
@@ -1471,6 +1774,7 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
 
       let mut value = original.clone();
       for (plugin, function) in interceptors {
+         restart_budget(&ctx);
          match function
             .call::<_, Value<'_>>((value.clone(), argument.clone()))
             .catch(&ctx)

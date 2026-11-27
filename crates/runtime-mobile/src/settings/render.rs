@@ -1,13 +1,12 @@
 //! Builds, rerenders and closes phoenix's pages on the navigator.
 
+use std::collections::HashMap;
+
 use phoenix_ui_mobile::{
    Op,
    Prop,
    Props,
-   motion::{
-      self,
-      Spring,
-   },
+   motion,
    prop,
    templates,
 };
@@ -52,7 +51,7 @@ const PAGE_TITLE: u32 = 0x56A;
 impl Settings {
    pub fn page_index(&self) -> usize {
       self.screen.as_ref().map_or(0, |screen| {
-         (screen.rust_pages.as_ref().map_or(0, Vec::len) + screen.stack.len()).saturating_sub(1)
+         (screen.rust_pages().map_or(0, <[i32]>::len) + screen.stack.len()).saturating_sub(1)
       })
    }
 
@@ -80,10 +79,10 @@ impl Settings {
          };
          let mut commands = bound.rest(start);
          if reused {
-            commands.extend(bound.pin(start, Spring::SWITCH));
+            commands.extend(bound.pin(start, animate.spring));
          }
          if animate.flipped {
-            commands.extend(bound.spring(start, &tree.props, Spring::SWITCH));
+            commands.extend(bound.spring(start, &tree.props, animate.spring));
          }
          commands
       });
@@ -116,10 +115,10 @@ impl Settings {
       let Some(screen) = &self.screen else {
          return Vec::new();
       };
-      let Some(navigator) = screen.navigator else {
+      let Some(navigator) = screen.navigator_id() else {
          return Vec::new();
       };
-      let mut ids = screen.rust_pages.clone().unwrap_or_default();
+      let mut ids = screen.rust_pages().unwrap_or_default().to_vec();
       ids.extend(screen.stack.iter().map(|page| page.root));
       vec![Op::Children { id: navigator, ids }, Op::Update {
          id:    navigator,
@@ -235,15 +234,21 @@ impl Settings {
             ops
          },
          Job::Log => self.log_ops(),
+         Job::ThemeChanged => self.theme_changed(),
          Job::Submit(Field::Eval) => {
             let mut ops = self.log_ops();
             ops.extend(self.clear_ops(Field::Eval));
             ops
          },
-         Job::Submit(Field::Code(_)) | Job::Press(Press::PickFile | Press::OpenSite) => Vec::new(),
+         Job::Submit(Field::Code(_))
+         | Job::Press(Press::PickFile | Press::OpenSite | Press::Measure) => Vec::new(),
          Job::Refresh
          | Job::Press(
-            Press::SaveCode(_) | Press::Reload(_) | Press::ApplyUpdate | Press::Listed(_),
+            Press::SaveCode(_)
+            | Press::Reload(_)
+            | Press::ApplyUpdate
+            | Press::Listed(_)
+            | Press::StartDiscordUpdate,
          )
          | Job::Picked(_)
          | Job::Submit(Field::Install | Field::Setting(..)) => self.rerender_all(None),
@@ -259,6 +264,7 @@ impl Settings {
             self.open_page(PageKind::Install)
          },
          Job::Press(Press::EditCode(index)) => self.open_page(PageKind::Code(index)),
+         Job::Press(Press::OpenDiscordUpdate) => self.open_page(PageKind::DiscordUpdate),
          Job::Press(
             press @ (Press::Toggle(_)
             | Press::Setting(..)
@@ -311,6 +317,13 @@ impl Settings {
                |plugin| (plugin.name.clone(), plugin_sections(index, plugin)),
             )
          },
+         PageKind::DiscordUpdate => {
+            #[cfg(target_os = "android")]
+            let sections = super::updater::sections();
+            #[cfg(not(target_os = "android"))]
+            let sections = Vec::new();
+            ("Discord update".to_owned(), sections)
+         },
       }
    }
 
@@ -340,6 +353,7 @@ impl Settings {
             continue;
          }
          let (_, mut sections) = self.render(kind);
+         self.apply_drafts(&mut sections);
          // Same layout: update the changed nodes and spring the flipped switch,
          // so the other rows are not rebuilt (and do not flicker).
          let old = self
@@ -400,7 +414,7 @@ impl Settings {
                animate
                   .worklet
                   .bind(first)
-                  .spring(&old.props, &new.props, Spring::SWITCH);
+                  .spring(&old.props, &new.props, animate.spring);
             self.motion.extend(motion::words(&commands));
          }
       } else {
@@ -422,16 +436,38 @@ impl Settings {
       }
    }
 
+   /// Restores unsubmitted text when a page with inputs is rebuilt.
+   fn apply_drafts(&self, trees: &mut [Tree]) {
+      fn apply(tree: &mut Tree, drafts: &HashMap<Field, String>) {
+         if let Some(Slot::Input(field)) = tree.slot
+            && let Some(draft) = drafts.get(&field)
+         {
+            tree.set(Prop::VALUE, Some(text(draft)));
+            if matches!(field, Field::Code(_)) {
+               tree.set(prop!("valueSpans"), Some(code_spans(draft)));
+            }
+         }
+         for kid in &mut tree.kids {
+            apply(kid, drafts);
+         }
+      }
+
+      for tree in trees {
+         apply(tree, &self.drafts);
+      }
+   }
+
    fn open_page(&mut self, kind: PageKind) -> Vec<Op> {
       let Some(screen) = &self.screen else {
          return Vec::new();
       };
-      if screen.rust_pages.is_none() {
+      if screen.rust_pages().is_none() {
          log::warn!("settings: no navigator pages known yet");
          return Vec::new();
       }
       let header = screen.header.clone();
-      let (title, sections) = self.render(kind);
+      let (title, mut sections) = self.render(kind);
+      self.apply_drafts(&mut sections);
       let title = title.as_str();
 
       let mut page = Tree::from_template(&templates().page);
@@ -489,6 +525,58 @@ impl Settings {
          });
       }
       ops.extend(self.navigator_ops());
+      ops
+   }
+
+   /// Rebuilds the injected row and open pages after Phoenix redraws Settings
+   /// in another theme.
+   fn theme_changed(&mut self) -> Vec<Op> {
+      let mut ops = self.replace_entry();
+      let kinds = self.screen.as_ref().map_or_default(|screen| {
+         screen
+            .stack
+            .iter()
+            .map(|page| page.kind)
+            .collect::<Vec<PageKind>>()
+      });
+      while self
+         .screen
+         .as_ref()
+         .is_some_and(|screen| !screen.stack.is_empty())
+      {
+         ops.extend(self.close_top());
+      }
+      let console_open = kinds.contains(&PageKind::Console);
+      for kind in kinds {
+         ops.extend(self.open_page(kind));
+      }
+      if console_open {
+         ops.extend(self.log_ops());
+      }
+      ops
+   }
+
+   fn replace_entry(&mut self) -> Vec<Op> {
+      let Some((list, mut ids, search, old)) = self.screen.as_ref().and_then(|screen| {
+         let rows = screen.rows.as_ref()?;
+         Some((
+            screen.list,
+            rows.rust.clone(),
+            rows.search,
+            rows.entry.ids.clone(),
+         ))
+      }) else {
+         return Vec::new();
+      };
+      let (entry, mut ops) = self.entry_ops();
+      let at = usize::from(search.is_some() && ids.first() == search.as_ref());
+      ids.insert(at, entry.root);
+      if let Some(rows) = self.screen.as_mut().and_then(|screen| screen.rows.as_mut()) {
+         rows.entry = entry;
+      }
+      ops.push(Op::Children { id: list, ids });
+      self.forget(&old);
+      ops.push(Op::Delete { ids: old });
       ops
    }
 

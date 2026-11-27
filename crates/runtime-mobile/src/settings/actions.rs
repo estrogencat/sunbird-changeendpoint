@@ -11,14 +11,13 @@ use phoenix_runtime::{
 };
 
 use crate::settings::{
-   COLOR_ERROR,
-   COLOR_STRING,
    Field,
    Job,
    LOG_QUEUED,
    Press,
    TITLE,
    settings,
+   theme::Color,
 };
 
 fn plugin(index: usize) -> Option<PluginInfo> {
@@ -31,7 +30,11 @@ pub fn act(job: &Job) {
    match *job {
       Job::Log => LOG_QUEUED.store(false, Ordering::Relaxed),
       // The editor is multiline: Enter is a newline there, and Save saves.
-      Job::Submit(Field::Code(_)) | Job::NavigateTo(_) | Job::Draft(..) | Job::Refresh => {},
+      Job::Submit(Field::Code(_))
+      | Job::NavigateTo(_)
+      | Job::Draft(..)
+      | Job::Refresh
+      | Job::ThemeChanged => {},
       Job::Submit(field) => submit(field),
       Job::Picked(ref picked) => {
          match picked {
@@ -41,8 +44,10 @@ pub fn act(job: &Job) {
             Ok(None) => {},
             Err(err) => {
                log::error!("file picker: {err}");
-               settings().install_status =
-                  Some((format!("The file picker failed: {err}"), COLOR_ERROR));
+               settings().install_status = Some((
+                  format!("The file picker failed: {err}"),
+                  Color::Error.argb(),
+               ));
             },
          }
       },
@@ -110,7 +115,7 @@ fn press(pressed: Press) {
       },
       Press::Toggle(index) => {
          if let Some(plugin) = plugin(index) {
-            phoenix_runtime::set_enabled(&plugin.name, !plugin.enabled);
+            phoenix_runtime::set_enabled(&plugin.name, !plugin.state.is_on());
          }
       },
       Press::Reload(index) => {
@@ -173,7 +178,16 @@ fn press(pressed: Press) {
          phoenix_runtime::set_remote_shell_enabled(!phoenix_runtime::remote_shell_enabled());
       },
       Press::OpenInstall => phoenix_runtime::update::fetch_catalog(),
-      Press::OpenMain | Press::OpenConsole | Press::OpenPlugin(_) | Press::Back => {},
+      Press::StartDiscordUpdate => {
+         #[cfg(target_os = "android")]
+         crate::discord_update::start();
+      },
+      Press::OpenMain
+      | Press::OpenConsole
+      | Press::OpenPlugin(_)
+      | Press::OpenDiscordUpdate
+      | Press::Measure
+      | Press::Back => {},
    }
 }
 
@@ -198,16 +212,18 @@ fn listed(index: usize) {
             &plugin.name,
          );
       },
-      Some(info) if !info.installed => phoenix_runtime::set_enabled(&info.name, !info.enabled),
+      Some(info) if !info.installed => {
+         phoenix_runtime::set_enabled(&info.name, !info.state.is_on());
+      },
       Some(info) => {
          settings().install_status = Some(match phoenix_runtime::uninstall(&info.name) {
             Ok(outcome) => {
                (
                   format!("{}.", uninstalled(&info.name, outcome)),
-                  COLOR_STRING,
+                  Color::String.argb(),
                )
             },
-            Err(err) => (format!("Uninstall failed: {err}"), COLOR_ERROR),
+            Err(err) => (format!("Uninstall failed: {err}"), Color::Error.argb()),
          });
       },
    }
@@ -227,12 +243,12 @@ fn installed(result: Result<Installed, phoenix_runtime::Error>, from: &str) {
          log::info!("{installed} from {from}");
          (
             format!("{installed}. It is on the {TITLE} page now."),
-            COLOR_STRING,
+            Color::String.argb(),
          )
       },
       Err(err) => {
          log::error!("install failed: {err}");
-         (format!("Install failed: {err}"), COLOR_ERROR)
+         (format!("Install failed: {err}"), Color::Error.argb())
       },
    };
    settings().install_status = Some(status);

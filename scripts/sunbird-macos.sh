@@ -8,6 +8,9 @@
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-macos.sh | sh -s -- "/path/to/Discord Phoenix.app"
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-macos.sh | sh -s -- --uninstall
 #
+# The launcher runs a newer copy of this with --launcher-only, which rewrites
+# Sunbird.app where it is and keeps the loader it has.
+#
 # SUNBIRD_SITE points it at a local server for testing.
 #
 # Phoenix is signed with the hardened runtime, which ignores
@@ -18,8 +21,18 @@ set -eu
 
 site=${SUNBIRD_SITE:-https://assets.sunbird.tools}
 home="$HOME/Library/Application Support/Sunbird"
-# /Applications is writable by admin accounts only.
-if [ -w /Applications ]; then
+launcher_only=
+if [ "${1:-}" = --launcher-only ]; then
+   launcher_only=1
+   shift
+fi
+# /Applications is writable by admin accounts only. A refresh keeps Sunbird.app
+# where it is.
+if [ -n "$launcher_only" ] && [ -d /Applications/Sunbird.app ]; then
+   app=/Applications/Sunbird.app
+elif [ -n "$launcher_only" ] && [ -d "$HOME/Applications/Sunbird.app" ]; then
+   app="$HOME/Applications/Sunbird.app"
+elif [ -w /Applications ]; then
    app=/Applications/Sunbird.app
 else
    app="$HOME/Applications/Sunbird.app"
@@ -27,7 +40,9 @@ fi
 bundle_id=com.discord.DesktopGpui
 
 if [ "${1:-}" = --uninstall ]; then
-   rm -rf "$home" /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"
+   # The login item Sunbird's settings add (`crates/ui-desktop/src/macos.rs`).
+   rm -rf "$home" /Applications/Sunbird.app "$HOME/Applications/Sunbird.app" \
+      "$HOME/Library/LaunchAgents/tools.sunbird.launcher.plist"
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
@@ -106,23 +121,27 @@ q() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 
 # An earlier install may have used the other folder.
 for other in /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"; do
-   [ "$other" = "$app" ] || rm -rf "$other"
+   [ -n "$launcher_only" ] || [ "$other" = "$app" ] || rm -rf "$other"
 done
 mkdir -p "$home" "$app/Contents/MacOS" "$app/Contents/Resources"
 
 # The launcher brings the loader up to the site's version and the copy up to
 # Discord's before each start, and keeps what it has when offline. Each run
 # downloads and copies to its own name, so two starts at once never use a
-# half-written file.
-cat >"$app/Contents/MacOS/sunbird" <<EOF
+# half-written file. It is written beside and renamed into place, since a
+# running launcher may be what rewrites it.
+cat >"$app/Contents/MacOS/sunbird.new" <<EOF
 #!/bin/sh
 home=$(q "$home")
 site=$(q "$site")
 discord=$(q "$discord")
+app=$(q "$app")
 copy="\$home/Sunbird.app"
 # Bumped when the copy's branding changes, so existing copies are rebuilt.
-brand=3
+brand=4
 fetch() { /usr/bin/curl -fsSL --proto $proto --proto-redir =https "\$@" 2>/dev/null; }
+# CRC-32 as version.json lists it: gzip's trailer holds it, little-endian.
+crc32() { gzip -c <"\$1" | tail -c8 | od -An -N4 -tu4 | tr -d ' \\n'; }
 fail() {
    /usr/bin/osascript -e 'on run argv' -e 'display alert "Sunbird" message (item 1 of argv)' \\
       -e 'end run' -- "\$1" >/dev/null 2>&1
@@ -130,9 +149,33 @@ fail() {
    exit 1
 }
 
-version=\$(fetch --max-time 5 "\$site/version.json" |
-   sed -n 's/.*"loader": *"\([^"]*\)".*/\1/p')
-if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)" ]; then
+# Sunbird's settings write this into the runtime's home; a loader that is
+# already here is kept when they turn updates off. --update always checks.
+conf="\${LIBDISCORD_DATA_DIR:-\$HOME/Library/Application Support/libdiscord}/sunbird/launcher.conf"
+manifest= version=
+if [ "\${1:-}" = --update ] || [ ! -f "\$home/libphoenix.dylib" ] ||
+   ! grep -qx 'auto_update=false' "\$conf" 2>/dev/null; then
+   manifest=\$(fetch --max-time 5 "\$site/version.json")
+   version=\$(printf '%s\\n' "\$manifest" | sed -n 's/.*"loader": *"\([^"]*\)".*/\1/p')
+fi
+# A changed installer on the site rewrites this launcher, and the new one
+# carries on with this start. Any failure keeps this one.
+crc=\$(printf '%s\\n' "\$manifest" | sed -n 's/.*"sunbird-macos.sh": *\([0-9]*\).*/\1/p')
+if [ -n "\$crc" ] && [ "\${1:-}" != --update ] && [ -z "\${SUNBIRD_SELF_UPDATED:-}" ] &&
+   ! grep -qx 'auto_update=false' "\$conf" 2>/dev/null &&
+   [ -w "\$app/Contents" ] && [ -w "\$app/Contents/MacOS" ] &&
+   [ "\$crc" != "\$(cat "\$home/installer.crc" 2>/dev/null)" ]; then
+   tmp=\$(mktemp "\$home/installer.XXXXXX")
+   if fetch --max-time 30 -o "\$tmp" "\$site/plugins/sunbird-macos.sh" &&
+      [ "\$(head -c 9 "\$tmp")" = '#!/bin/sh' ] && [ "\$(crc32 "\$tmp")" = "\$crc" ] &&
+      SUNBIRD_SITE=\$site sh "\$tmp" --launcher-only "\$discord" >/dev/null 2>&1; then
+      rm -f "\$tmp"
+      exec env SUNBIRD_SELF_UPDATED=1 "\$app/Contents/MacOS/sunbird" "\$@"
+   fi
+   rm -f "\$tmp"
+fi
+unset SUNBIRD_SELF_UPDATED
+if [ -n "\$version" ] && { [ ! -f "\$home/libphoenix.dylib" ] || [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)" ]; }; then
    tmp=\$(mktemp "\$home/libphoenix.dylib.XXXXXX")
    if fetch --max-time 60 -o "\$tmp" "\$site/plugins/libphoenix-macos-arm64.dylib"; then
       mv "\$tmp" "\$home/libphoenix.dylib"
@@ -147,50 +190,85 @@ fi
 # Rebuilt when Discord's executable changed, or when the copy lost its ad hoc
 # signature, which Discord's updater would put back. An update the updater
 # installed into the copy is newer than Discord Phoenix, so it is kept.
-version() { /usr/bin/plutil -extract CFBundleVersion raw "\$1/Contents/Info.plist" 2>/dev/null; }
+bundle_version() { /usr/bin/plutil -extract CFBundleVersion raw "\$1/Contents/Info.plist" 2>/dev/null; }
+version_gt() {
+   [ -n "\$1" ] && [ -n "\$2" ] && /usr/bin/awk -v a="\$1" -v b="\$2" 'BEGIN {
+      na = split(a, pa, "."); nb = split(b, pb, ".");
+      n = (na > nb) ? na : nb;
+      for (i = 1; i <= n; i++) {
+         va = pa[i] + 0; vb = pb[i] + 0;
+         if (va != vb) exit (va > vb) ? 0 : 1;
+      }
+      exit 1;
+   }'
+}
+needs_rebuild() {
+   [ "\$stamp" != "\$(cat "\$home/stamp" 2>/dev/null)" ] ||
+      ! /usr/bin/codesign -dv "\$copy" 2>&1 | grep -q 'Signature=adhoc'
+}
 stamp="\$(/usr/bin/stat -f '%m %z' "\$discord/Contents/MacOS/Discord") brand \$brand"
-if [ "\$stamp" != "\$(cat "\$home/stamp" 2>/dev/null)" ] ||
-   ! /usr/bin/codesign -dv "\$copy" 2>&1 | grep -q 'Signature=adhoc'; then
-   source=\$discord
-   if [ -d "\$copy" ] && [ "\$(version "\$copy")" -gt "\$(version "\$discord")" ] 2>/dev/null; then
-      source=\$copy
+if needs_rebuild; then
+   lock="\$home/rebuild.lock"
+   locked=
+   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      if mkdir "\$lock" 2>/dev/null; then
+         locked=1
+         trap 'rm -rf "\$lock"' EXIT INT TERM
+         break
+      fi
+      # A launcher killed mid-rebuild never removes its lock.
+      if [ -n "\$(/usr/bin/find "\$lock" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then
+         rm -rf "\$lock"
+         continue
+      fi
+      sleep 0.5
+   done
+   if [ -n "\$locked" ] && needs_rebuild; then
+      source=\$discord
+      if [ -d "\$copy" ] && version_gt "\$(bundle_version "\$copy")" "\$(bundle_version "\$discord")"; then
+         source=\$copy
+      fi
+      tmp=\$(mktemp -d "\$home/Sunbird.XXXXXX")
+      new="\$tmp/Sunbird.app"
+      # A clone on APFS, so the copy takes no space until Discord updates.
+      if ! /bin/cp -cR "\$source" "\$new" 2>/dev/null; then
+         rm -rf "\$new"
+         /usr/bin/ditto "\$source" "\$new" || { rm -rf "\$tmp"; fail "Couldn't copy Discord Phoenix."; }
+      fi
+      /usr/bin/xattr -cr "\$new"
+      # Named and drawn as Sunbird in the Dock, the app switcher and the menu
+      # bar. The bundle id stays Discord's, which its data and login go by. The
+      # asset catalog's icon outranks CFBundleIconFile, so its name goes.
+      plist="\$new/Contents/Info.plist"
+      /usr/bin/plutil -replace CFBundleName -string Sunbird "\$plist" &&
+         /usr/bin/plutil -replace CFBundleDisplayName -string Sunbird "\$plist" &&
+         { /usr/bin/plutil -extract LSEnvironment xml1 -o - "\$plist" >/dev/null 2>&1 ||
+            /usr/bin/plutil -insert LSEnvironment -xml '<dict/>' "\$plist"; } &&
+         /usr/bin/plutil -replace LSEnvironment.DYLD_INSERT_LIBRARIES -string "\$home/libphoenix.dylib" "\$plist" &&
+         /usr/bin/plutil -replace LSEnvironment.SUNBIRD -string $(q "$app") "\$plist" ||
+         { rm -rf "\$tmp"; fail "Couldn't configure Sunbird's Info.plist."; }
+      if [ -f "\$home/Sunbird.icns" ]; then
+         cp "\$home/Sunbird.icns" "\$new/Contents/Resources/Sunbird.icns"
+         /usr/bin/plutil -remove CFBundleIconName "\$plist" 2>/dev/null || true
+         /usr/bin/plutil -replace CFBundleIconFile -string Sunbird "\$plist"
+      fi
+      # Ad hoc, without the hardened runtime or Discord's entitlements; the
+      # helpers and frameworks inside keep Discord's own signatures.
+      if ! /usr/bin/codesign --force --sign - "\$new" >/dev/null 2>&1; then
+         rm -rf "\$tmp"
+         fail "Couldn't sign the copy of Discord Phoenix."
+      fi
+      rm -rf "\$copy" "\$home/Discord.app"
+      mv "\$new" "\$copy"
+      rmdir "\$tmp"
+      echo "\$stamp" >"\$home/stamp"
+      # The Dock and Finder cache icons by path until told the bundle changed.
+      /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "\$copy" 2>/dev/null || true
    fi
-   tmp=\$(mktemp -d "\$home/Sunbird.XXXXXX")
-   new="\$tmp/Sunbird.app"
-   # A clone on APFS, so the copy takes no space until Discord updates.
-   if ! /bin/cp -cR "\$source" "\$new" 2>/dev/null; then
-      /usr/bin/ditto "\$source" "\$new" || { rm -rf "\$tmp"; fail "Couldn't copy Discord Phoenix."; }
+   if [ -n "\$locked" ]; then
+      rm -rf "\$lock"
+      trap - EXIT INT TERM
    fi
-   /usr/bin/xattr -cr "\$new"
-   # Named and drawn as Sunbird in the Dock, the app switcher and the menu
-   # bar. The bundle id stays Discord's, which its data and login go by. The
-   # asset catalog's icon outranks CFBundleIconFile, so its name goes.
-   plist="\$new/Contents/Info.plist"
-   /usr/bin/plutil -replace CFBundleName -string Sunbird "\$plist"
-   /usr/bin/plutil -replace CFBundleDisplayName -string Sunbird "\$plist"
-   # Discord relaunches itself with a bare \`open -n\`, so the copy loads
-   # Sunbird from its own Info.plist.
-   /usr/bin/plutil -replace LSEnvironment.DYLD_INSERT_LIBRARIES -string "\$home/libphoenix.dylib" "\$plist"
-   # Where the loader points Discord's relaunch after an update, so the new
-   # build starts through this launcher too.
-   /usr/bin/plutil -replace LSEnvironment.SUNBIRD -string $(q "$app") "\$plist"
-   if [ -f "\$home/Sunbird.icns" ]; then
-      cp "\$home/Sunbird.icns" "\$new/Contents/Resources/Sunbird.icns"
-      /usr/bin/plutil -remove CFBundleIconName "\$plist" 2>/dev/null || true
-      /usr/bin/plutil -replace CFBundleIconFile -string Sunbird "\$plist"
-   fi
-   # Ad hoc, without the hardened runtime or Discord's entitlements; the
-   # helpers and frameworks inside keep Discord's own signatures.
-   if ! /usr/bin/codesign --force --sign - "\$new" >/dev/null 2>&1; then
-      rm -rf "\$tmp"
-      fail "Couldn't sign the copy of Discord Phoenix."
-   fi
-   rm -rf "\$copy" "\$home/Discord.app"
-   mv "\$new" "\$copy"
-   rmdir "\$tmp"
-   echo "\$stamp" >"\$home/stamp"
-   # The Dock and Finder cache icons by path until told the bundle changed.
-   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "\$copy" 2>/dev/null || true
 fi
 
 [ -f "\$home/libphoenix.dylib" ] ||
@@ -217,7 +295,16 @@ if [ -n "\$pids" ] && [ -z "\$sunbird" ]; then
 fi
 exec /usr/bin/open -a "\$copy" --args "\$@"
 EOF
-chmod +x "$app/Contents/MacOS/sunbird"
+chmod +x "$app/Contents/MacOS/sunbird.new"
+mv -f "$app/Contents/MacOS/sunbird.new" "$app/Contents/MacOS/sunbird"
+# The launcher compares this with the site's installer to know when to
+# replace itself. A piped install has no file to hash, so its first start
+# fetches the installer once.
+if [ "${0#*/}" != "$0" ] && [ -f "$0" ]; then
+   gzip -c <"$0" | tail -c8 | od -An -N4 -tu4 | tr -d ' \n' >"$home/installer.crc"
+else
+   rm -f "$home/installer.crc"
+fi
 
 # Sunbird's mark, the dashboard's sun, drawn with AppKit so no image ships.
 make_icon() {
@@ -249,7 +336,10 @@ JS
    rm -rf "$work"
    return $status
 }
-if make_icon "$home/Sunbird.icns"; then
+# A refresh reuses the icon drawn at install.
+if [ -n "$launcher_only" ] && [ -f "$home/Sunbird.icns" ]; then
+   cp "$home/Sunbird.icns" "$app/Contents/Resources/Sunbird.icns"
+elif make_icon "$home/Sunbird.icns"; then
    cp "$home/Sunbird.icns" "$app/Contents/Resources/Sunbird.icns"
 else
    echo "Couldn't draw Sunbird's icon; it keeps a plain one." >&2
@@ -274,6 +364,10 @@ EOF
 /usr/bin/codesign --force --sign - "$app" >/dev/null 2>&1 || true
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" 2>/dev/null || true
 
+if [ -n "$launcher_only" ] && [ -f "$home/libphoenix.dylib" ]; then
+   echo "Sunbird's launcher is refreshed."
+   exit 0
+fi
 # First download now, so a missing network shows up here rather than as a
 # Discord without Sunbird.
 echo "Downloading Sunbird..."

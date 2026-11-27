@@ -6,7 +6,8 @@ license.workspace = true
 version.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-misstep = { workspace = true }
+crc32fast = { workspace = true }
+misstep   = { workspace = true }
 
 [lints]
 workspace = true

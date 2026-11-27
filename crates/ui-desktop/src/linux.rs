@@ -84,9 +84,107 @@ fn spawn_reaped(command: &mut Command) -> Result<(), Error> {
    Ok(())
 }
 
+/// Runs a dialog to its end, `None` when the tool isn't installed.
+fn dialog(program: &str, args: &[&str]) -> Option<bool> {
+   Command::new(program)
+      .args(args)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status()
+      .ok()
+      .map(|status| status.success())
+}
+
+/// `$XDG_DATA_HOME`, or `~/.local/share`.
+fn data_home() -> Option<PathBuf> {
+   env::var_os("XDG_DATA_HOME")
+      .filter(|dir| !dir.is_empty())
+      .map(PathBuf::from)
+      .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+}
+
+/// `$XDG_CONFIG_HOME/autostart/sunbird.desktop`, or under `~/.config`.
+fn autostart_entry() -> Option<PathBuf> {
+   env::var_os("XDG_CONFIG_HOME")
+      .filter(|dir| !dir.is_empty())
+      .map(PathBuf::from)
+      .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+      .map(|config| config.join("autostart/sunbird.desktop"))
+}
+
+const fn platform(message: String) -> Error {
+   Error::Platform { message }
+}
+
 pub struct Host;
 
 impl DesktopHost for Host {
+   fn alert(title: &str, body: &str) {
+      let shown = dialog("zenity", &[
+         "--warning",
+         "--no-markup",
+         "--title",
+         title,
+         "--text",
+         body,
+      ])
+      .or_else(|| dialog("kdialog", &["--title", title, "--sorry", body]));
+      if shown.is_none() {
+         let _ = dialog("notify-send", &[
+            "--app-name=Sunbird",
+            "--urgency=critical",
+            "--",
+            title,
+            body,
+         ]);
+      }
+   }
+
+   fn confirm(title: &str, body: &str) -> bool {
+      dialog("zenity", &[
+         "--question",
+         "--no-markup",
+         "--title",
+         title,
+         "--text",
+         body,
+      ])
+      .or_else(|| dialog("kdialog", &["--title", title, "--yesno", body]))
+      .unwrap_or(false)
+   }
+
+   fn launcher() -> Option<PathBuf> {
+      let launcher = data_home()?.join("sunbird/sunbird");
+      launcher.is_file().then_some(launcher)
+   }
+
+   fn set_autostart(enabled: bool) -> Result<(), Error> {
+      let entry = autostart_entry().ok_or_else(|| platform("HOME is unset".to_owned()))?;
+      if !enabled {
+         return match std::fs::remove_file(&entry) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+               Err(platform(format!("{}: {err}", entry.display())))
+            },
+            _ => Ok(()),
+         };
+      }
+      let launcher = Self::launcher()
+         .ok_or_else(|| platform("the Sunbird launcher is not installed".to_owned()))?;
+      // `sunbird-linux.sh` refuses homes with spaces or quotes, so the path
+      // needs no escaping inside the quotes.
+      let text = format!(
+         "[Desktop Entry]\nType=Application\nName=Sunbird\nComment=Discord with \
+          Sunbird\nExec=\"{}\"\nIcon=discord\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+         launcher.display()
+      );
+      if let Some(dir) = entry.parent() {
+         std::fs::create_dir_all(dir)
+            .map_err(|err| platform(format!("{}: {err}", dir.display())))?;
+      }
+      std::fs::write(&entry, text).map_err(|err| platform(format!("{}: {err}", entry.display())))
+   }
+
    fn copy(text: &str) -> Result<(), Error> {
       let wayland = env::var_os("WAYLAND_DISPLAY").is_some();
       let mut tools = Vec::with_capacity(3);

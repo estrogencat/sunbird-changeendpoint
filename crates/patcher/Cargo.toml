@@ -14,6 +14,7 @@ memchr       = { workspace = true }
 misstep      = { workspace = true }
 object       = { workspace = true }
 phoenix-sigs = { features = [ "file" ], workspace = true }
+phoenix-wire = { workspace = true }
 rsa          = { default-features = false, features = [ "sha2", "std" ], version = "0.9" }
 serde_json   = { workspace = true }
 sha2         = { default-features = false, version = "0.10" }

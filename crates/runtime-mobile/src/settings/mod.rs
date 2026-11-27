@@ -8,13 +8,16 @@
 
 mod actions;
 mod batch;
+mod cards;
 mod code;
 mod console;
 mod pages;
 mod plugin;
 mod render;
 mod rows;
+mod theme;
 mod tree;
+#[cfg(target_os = "android")] mod updater;
 
 use std::{
    collections::{
@@ -77,18 +80,6 @@ const ICON_RELOAD: &str = "res://ic_mana_puzzle_piece_retry";
 const ICON_UNINSTALL: &str = "res://ic_mana_puzzle_piece_minus";
 const ICON_CONSOLE: &str = "res://ic_mana_angle_brackets";
 const ICON_FILE: &str = "res://ic_mana_image_file_up";
-/// Text colors, ARGB, for Discord's dark theme.
-const COLOR_TEXT: i64 = 0xFFF6_F6F7;
-const COLOR_MUTED: i64 = 0xFF94_9BA4;
-const COLOR_WARN: i64 = 0xFFF0_B232;
-const COLOR_ERROR: i64 = 0xFFF2_3F42;
-const COLOR_ACCENT: i64 = 0xFF79_C0FF;
-const COLOR_TAG: i64 = 0xFFD2_A8FF;
-const COLOR_STRING: i64 = 0xFF7E_E787;
-const COLOR_KEYWORD: i64 = 0xFFFF_7B72;
-const COLOR_NUMBER: i64 = 0xFF79_C0FF;
-const COLOR_COMMENT: i64 = 0xFF8B_949E;
-
 /// Plugins are named by their index in [`phoenix_runtime::plugins`] as of the
 /// last render, which every install follows with a fresh one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +106,11 @@ enum Press {
    ApplyUpdate,
    /// The site, to get the update [`crate::update`] found.
    OpenSite,
+   /// The page that updates Discord itself, and starting that update.
+   OpenDiscordUpdate,
+   StartDiscordUpdate,
+   /// A progress bar's track, which reports its width for its fill's spring.
+   Measure,
    ToggleStaff,
    ToggleRemoteShell,
    Back,
@@ -127,6 +123,7 @@ enum PageKind {
    Install,
    Plugin(usize),
    Code(usize),
+   DiscordUpdate,
 }
 
 /// What the UI thread hands to the worker. UI ops must not be sent from the
@@ -142,6 +139,8 @@ enum Job {
    Picked(crate::picker::Picked),
    /// Something the open pages show changed.
    Refresh,
+   /// Phoenix redrawn Settings for another light/dark theme.
+   ThemeChanged,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -180,16 +179,34 @@ struct Page {
 
 /// The open Settings screen and what phoenix added to it.
 struct Screen {
-   list:       i32,
-   /// Rust's own rows in the list and pages on the navigator, kept current
-   /// from its batches.
-   rust_rows:  Option<Vec<i32>>,
-   search:     Option<i32>,
-   navigator:  Option<i32>,
+   list:      i32,
+   rows:      Option<Rows>,
+   navigator: Option<Navigator>,
+   header:    Option<Props>,
+   stack:     Vec<Page>,
+}
+
+/// Rust's own rows in the list and pages on the navigator, kept current
+/// from its batches.
+struct Rows {
+   rust:   Vec<i32>,
+   search: Option<i32>,
+   entry:  Entry,
+}
+
+struct Navigator {
+   id:         i32,
    rust_pages: Option<Vec<i32>>,
-   header:     Option<Props>,
-   entry:      Option<Entry>,
-   stack:      Vec<Page>,
+}
+
+impl Screen {
+   fn navigator_id(&self) -> Option<i32> {
+      self.navigator.as_ref().map(|navigator| navigator.id)
+   }
+
+   fn rust_pages(&self) -> Option<&[i32]> {
+      self.navigator.as_ref()?.rust_pages.as_deref()
+   }
 }
 
 struct Settings {
@@ -270,7 +287,26 @@ pub fn start() {
          let ops = {
             let mut state = settings();
             if let Some(plugins) = plugins {
+               let old = state
+                  .plugins
+                  .iter()
+                  .map(|plugin| plugin.name.clone())
+                  .collect::<Vec<_>>();
                state.plugins = plugins;
+               let names = state
+                  .plugins
+                  .iter()
+                  .map(|plugin| plugin.name.clone())
+                  .collect::<Vec<_>>();
+               state.drafts.retain(|field, _| {
+                  match *field {
+                     Field::Eval | Field::Install => true,
+                     Field::Setting(index, _) | Field::Code(index) => {
+                        old.get(index)
+                           .is_some_and(|name| names.get(index).is_some_and(|new| new == name))
+                     },
+                  }
+               });
             }
             let mut ops = state.run(job);
             if !state.motion.is_empty() {
@@ -285,7 +321,23 @@ pub fn start() {
          }
       }
    });
+   #[cfg(target_os = "android")]
+   thread::spawn(|| {
+      // Sunbird's banner first, since a banner replaces the one showing.
+      phoenix_runtime::update::check_and_notify();
+      crate::discord_update::check();
+   });
+   #[cfg(not(target_os = "android"))]
    phoenix_runtime::update::check();
+}
+
+/// Opens the Discord update page on the worker, over the main page.
+#[cfg(target_os = "android")]
+fn open_discord_update() {
+   if let Some(worker) = WORKER.get() {
+      let _ = worker.send(Job::Press(Press::OpenMain));
+      let _ = worker.send(Job::Press(Press::OpenDiscordUpdate));
+   }
 }
 
 /// Rebuilds the open pages, for state that changed outside them.

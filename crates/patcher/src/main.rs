@@ -11,6 +11,10 @@
 //! replaces the loader in an APK this patcher merged, such as the one installed
 //! on a phone (`adb shell pm path com.discord`), and signs it again, so a new
 //! loader installs over it without the splits it was made from.
+//!
+//! `patcher --check-host <base.apk>` fails unless the APK's host name table
+//! numbers every host call, event and field the runtime uses, which CI checks
+//! before a Discord build is offered as an update.
 
 use std::{
    collections::BTreeMap,
@@ -49,13 +53,15 @@ const USAGE: &str = "usage: patcher --out <dir or file.apk> [--merge [--package 
                      <name>]] [--loader <libphoenix.so> [--lib [<name>=]<extra.so>]... [--plugin \
                      <name.js>]...] [--frida <gadget.so[.gz]> --frida-bootstrap <bootstrap.js> \
                      [--frida-script <x.js>]...] <split.apk>...\n       patcher --swap --loader \
-                     <libphoenix.so> --out <file.apk> <patched.apk>";
+                     <libphoenix.so> --out <file.apk> <patched.apk>\n       patcher --check-host \
+                     <base.apk>";
 
 #[derive(Default)]
 struct Args {
    out:       Option<PathBuf>,
    merge:     bool,
    swap:      bool,
+   check:     bool,
    package:   Option<String>,
    label:     Option<String>,
    loader:    Option<PathBuf>,
@@ -77,6 +83,7 @@ impl Args {
             Some("--out") => parsed.out = Some(value()?),
             Some("--merge") => parsed.merge = true,
             Some("--swap") => parsed.swap = true,
+            Some("--check-host") => parsed.check = true,
             Some("--package") => parsed.package = Some(text(value()?)?),
             Some("--label") => parsed.label = Some(text(value()?)?),
             Some("--loader") => parsed.loader = Some(value()?),
@@ -88,6 +95,13 @@ impl Args {
             Some(flag) if flag.starts_with("--") => bail!("unknown flag {flag}\n{USAGE}"),
             _ => parsed.apks.push(PathBuf::from(arg)),
          }
+      }
+      if parsed.check {
+         ensure!(
+            parsed.apks.len() == 1,
+            "--check-host takes one base APK\n{USAGE}"
+         );
+         return Ok(parsed);
       }
       ensure!(!parsed.apks.is_empty() && parsed.out.is_some(), "{USAGE}");
       ensure!(
@@ -175,6 +189,9 @@ fn read_text(path: &Path) -> misstep::Result<String> {
 fn main() -> misstep::Result<()> {
    misstep::install_panic_hook();
    let args = Args::parse()?;
+   if args.check {
+      return check_host(&args.apks[0]);
+   }
    let out = args.out.as_deref().context(USAGE)?;
    if args.swap {
       let loader = Library::new(LOADER, read(args.loader.as_deref().context(USAGE)?)?)?;
@@ -218,6 +235,26 @@ fn main() -> misstep::Result<()> {
    for (name, apk) in signed {
       save(&out.join(name), &apk)?;
    }
+   Ok(())
+}
+
+/// Fails unless `apk` numbers every name in [`phoenix_wire::names::all`].
+fn check_host(apk: &Path) -> misstep::Result<()> {
+   let names = phoenix_wire::names::all();
+   let numbers = patcher::host_names(&read(apk)?, &names)?;
+   let missing = names
+      .iter()
+      .zip(&numbers)
+      .filter(|(_, number)| number.is_none())
+      .map(|(name, _)| *name)
+      .collect::<Vec<_>>();
+   ensure!(
+      missing.is_empty(),
+      "{} has no host number for {}",
+      apk.display(),
+      missing.join(", ")
+   );
+   println!("{}: all {} host names numbered", apk.display(), names.len());
    Ok(())
 }
 

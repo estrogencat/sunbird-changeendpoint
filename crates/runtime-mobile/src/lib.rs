@@ -7,6 +7,7 @@
 mod bridge;
 mod debug;
 mod discord;
+#[cfg(target_os = "android")] mod discord_update;
 #[cfg(target_os = "android")] mod fetch;
 #[cfg(target_os = "ios")] mod foundation;
 mod host;
@@ -23,6 +24,12 @@ mod socket;
 
 pub(crate) use phoenix_runtime::highlight;
 
+#[cfg(target_os = "android")]
+use std::sync::{
+   Arc,
+   Mutex,
+   PoisonError,
+};
 use std::{
    ffi::c_void,
    path::{
@@ -33,7 +40,10 @@ use std::{
 
 use phoenix_hook::image::Image;
 #[cfg(target_os = "android")]
-use phoenix_runtime::update::Update;
+use phoenix_runtime::update::{
+   Slot,
+   Update,
+};
 use phoenix_runtime::{
    Error,
    Notice,
@@ -49,11 +59,20 @@ use phoenix_runtime::{
       Request,
       Response,
    },
+   permissions::{
+      Permission,
+      Permissions,
+   },
    remote,
    store::{
       Rows,
       StoreError,
    },
+};
+#[cfg(target_os = "android")]
+use phoenix_sigs::index::{
+   Index,
+   Isa,
 };
 use rquickjs::{
    Ctx,
@@ -67,13 +86,42 @@ use crate::patches::banners::{
 
 struct Mobile;
 
+/// The index the emoji and staff locators share, built by whichever runs first
+/// and freed once both have, since it holds tens of MB.
+#[cfg(target_os = "android")]
+static INDEX: Mutex<(Option<Arc<Index<'static>>>, usize)> = Mutex::new((None, 0));
+
+/// Runs `locate` on the shared index of `image`.
+#[cfg(target_os = "android")]
+fn with_index<T>(
+   image: &'static Image<'static>,
+   locate: impl FnOnce(&Index<'static>) -> phoenix_sigs::Found<T>,
+) -> phoenix_sigs::Found<T> {
+   const USERS: usize = 2;
+   let index = {
+      let mut shared = INDEX.lock().unwrap_or_else(PoisonError::into_inner);
+      Arc::clone(
+         shared
+            .0
+            .get_or_insert_with(|| Arc::new(Index::new(image, Isa::HOST))),
+      )
+   };
+   let found = locate(&index);
+   let mut shared = INDEX.lock().unwrap_or_else(PoisonError::into_inner);
+   shared.1 += 1;
+   if shared.1 >= USERS {
+      shared.0 = None;
+   }
+   found
+}
+
 /// Starts phoenix inside Phoenix's mobile client.
 pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    phoenix_runtime::start(&Mobile, home, bundled)
 }
 
 /// Phoenix Unlock's green, for update banners.
-const ACCENT: i64 = 0xFF23_A55A;
+pub(crate) const ACCENT: i64 = 0xFF23_A55A;
 
 impl Platform for Mobile {
    fn send(&self, request: &Request) -> Result<Response, FetchError> {
@@ -114,11 +162,15 @@ impl Platform for Mobile {
       &self,
       ctx: &Ctx<'js>,
       plugin: &str,
+      permissions: &Permissions,
       api: &Object<'js>,
       messages: &Object<'js>,
    ) -> rquickjs::Result<()> {
-      js::messages::patch_api(ctx, plugin, api, messages)?;
-      api.set("bridge", js::bridge::bridge_object(ctx)?)
+      js::messages::patch_api(ctx, plugin, permissions, api, messages)?;
+      if permissions.allows(Permission::Hooks) {
+         api.set("bridge", js::bridge::bridge_object(ctx)?)?;
+      }
+      Ok(())
    }
 
    fn unload(&self, ctx: &Ctx<'_>, plugin: &str) {
@@ -150,7 +202,7 @@ impl Platform for Mobile {
 
    #[cfg(target_os = "android")]
    fn before_plugins(&self, home: &Path) {
-      loader::adopt_staged(home, &home.join("plugins"));
+      phoenix_runtime::update::adopt_staged(home, &home.join("plugins"));
    }
 
    #[cfg(target_os = "ios")]
@@ -205,7 +257,7 @@ impl Platform for Mobile {
                |version| format!("Build {version}, tap to update in-app"),
             );
             banners::show_banner(
-               "Phoenix Unlock update available".to_owned(),
+               "Sunbird update available".to_owned(),
                Some(body),
                Some("res://ic_mana_puzzle_piece_retry".to_owned()),
                Some(ACCENT),
@@ -232,8 +284,8 @@ impl Platform for Mobile {
    }
 
    #[cfg(target_os = "android")]
-   fn update_loader(&self, version: &str, update: &Update) {
-      loader::install(version, update);
+   fn update_loader(&self, slot: Slot, version: &str, update: &Update) {
+      loader::install(slot, version, update);
    }
 
    fn route(&self, request: &remote::Request) -> Option<remote::Reply> {

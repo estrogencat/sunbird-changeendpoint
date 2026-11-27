@@ -48,6 +48,8 @@ use crate::{
 pub enum BannerAction {
    None,
    ApplyUpdate,
+   /// Opens Settings on the Discord update page.
+   OpenDiscordUpdate,
    JsCallback,
 }
 
@@ -96,33 +98,63 @@ pub fn dismiss_banner(id: u32) {
 /// appear over the live screen rather than behind the splash animation.
 const BANNER_STARTUP_DELAY: Duration = Duration::from_millis(1500);
 
+#[derive(Default)]
+pub struct BannerQueue {
+   startup:         Startup,
+   pending:         Vec<BannerSpec>,
+   flush_scheduled: bool,
+}
+
+#[derive(Default)]
+enum Startup {
+   #[default]
+   NoRoot,
+   Settling(Instant),
+   Settled,
+}
+
+impl Startup {
+   /// How long banners still wait, `None` before the root view exists.
+   fn remaining(&mut self) -> Option<Duration> {
+      match *self {
+         Self::NoRoot => None,
+         Self::Settling(since) => {
+            let left = BANNER_STARTUP_DELAY.saturating_sub(since.elapsed());
+            if left.is_zero() {
+               *self = Self::Settled;
+            }
+            Some(left)
+         },
+         Self::Settled => Some(Duration::ZERO),
+      }
+   }
+}
+
 impl Patches {
    pub fn note_root_ready(&mut self) {
-      if self.root_ready_at.is_none() {
-         self.root_ready_at = Some(Instant::now());
+      let banners = &mut self.banner_queue;
+      if matches!(banners.startup, Startup::NoRoot) {
+         banners.startup = Startup::Settling(Instant::now());
       }
-      if !self.pending_banners.is_empty() && !self.banner_flush_scheduled {
-         self.banner_flush_scheduled = true;
-         let delay = self.root_ready_at.map_or(Duration::ZERO, |at| {
-            BANNER_STARTUP_DELAY.saturating_sub(at.elapsed())
-         });
-         thread::spawn(move || {
-            if !delay.is_zero() {
-               thread::sleep(delay);
-            }
-            queue(Job::FlushBanners);
-         });
+      if banners.pending.is_empty() || banners.flush_scheduled {
+         return;
       }
+      banners.flush_scheduled = true;
+      let delay = banners.startup.remaining().unwrap_or_default();
+      thread::spawn(move || {
+         if !delay.is_zero() {
+            thread::sleep(delay);
+         }
+         queue(Job::FlushBanners);
+      });
    }
 
    pub fn show_banner(&mut self, spec: BannerSpec) -> Vec<Op> {
       let ready = self.mirror.root().is_some()
          && bridge::ready()
-         && self
-            .root_ready_at
-            .is_some_and(|at| at.elapsed() >= BANNER_STARTUP_DELAY);
+         && self.banner_queue.startup.remaining() == Some(Duration::ZERO);
       if !ready {
-         self.pending_banners.push(spec);
+         self.banner_queue.pending.push(spec);
          if self.mirror.root().is_some() {
             self.note_root_ready();
          }
@@ -132,18 +164,15 @@ impl Patches {
    }
 
    pub fn flush_banners(&mut self) -> Vec<Op> {
-      self.banner_flush_scheduled = false;
+      self.banner_queue.flush_scheduled = false;
       if self.mirror.root().is_none() || !bridge::ready() {
          return Vec::new();
       }
-      if self
-         .root_ready_at
-         .is_some_and(|at| at.elapsed() < BANNER_STARTUP_DELAY)
-      {
+      if self.banner_queue.startup.remaining() != Some(Duration::ZERO) {
          self.note_root_ready();
          return Vec::new();
       }
-      let queued = std::mem::take(&mut self.pending_banners);
+      let queued = std::mem::take(&mut self.banner_queue.pending);
       let mut out = Vec::new();
       for spec in queued {
          out.extend(self.open_banner(spec));
@@ -154,7 +183,7 @@ impl Patches {
    /// Attaches a native Phoenix `banner` overlay to the root view.
    fn open_banner(&mut self, spec: BannerSpec) -> Vec<Op> {
       let Some(root) = self.mirror.root() else {
-         self.pending_banners.push(spec);
+         self.banner_queue.pending.push(spec);
          return Vec::new();
       };
       // Replace any currently visible banner so notifications don't pile up.
@@ -214,7 +243,7 @@ impl Patches {
 
    fn close_banner(&mut self, id: u32) -> (Vec<Op>, bool) {
       let mut had_js = false;
-      self.pending_banners.retain(|spec| {
+      self.banner_queue.pending.retain(|spec| {
          if spec.id == id {
             if matches!(spec.action, BannerAction::JsCallback) {
                had_js = true;
@@ -444,6 +473,12 @@ fn banner_dismiss(id: u32) -> Draft {
    }
 }
 
+/// Whether a banner shows or waits to, since a new one replaces it.
+pub fn busy() -> bool {
+   let patches = patches();
+   !patches.banner_actions.is_empty() || !patches.banner_queue.pending.is_empty()
+}
+
 pub fn dismiss(id: u32) -> Vec<Op> {
    let (ops, notify_js) = patches().close_banner(id);
    if notify_js && let Some(engine) = phoenix_runtime::engine() {
@@ -458,6 +493,10 @@ pub fn pressed(id: u32) -> Vec<Op> {
       BannerAction::None => {},
       BannerAction::ApplyUpdate => {
          phoenix_runtime::update::apply();
+      },
+      BannerAction::OpenDiscordUpdate => {
+         #[cfg(target_os = "android")]
+         crate::discord_update::open_page();
       },
       BannerAction::JsCallback => {
          if let Some(engine) = phoenix_runtime::engine() {

@@ -10,6 +10,10 @@
 use std::{
    ffi::c_void,
    mem::MaybeUninit,
+   ops::{
+      Deref,
+      DerefMut,
+   },
    ptr,
    slice,
    str,
@@ -18,6 +22,7 @@ use std::{
       Condvar,
       LazyLock,
       Mutex,
+      MutexGuard,
       OnceLock,
       PoisonError,
       atomic::{
@@ -27,7 +32,10 @@ use std::{
          Ordering,
       },
    },
-   time::Duration,
+   time::{
+      Duration,
+      Instant,
+   },
 };
 
 use phoenix_hook::image::Image;
@@ -38,8 +46,10 @@ use phoenix_runtime::highlight::{
 };
 use phoenix_sigs::desktop::{
    self,
+   Dismiss,
    FieldLayout,
    ModalLayout,
+   ScaleFadeLayout,
    layout,
 };
 
@@ -93,6 +103,8 @@ const COL_OK: u32 = 0xFF7E_E787;
 pub struct ModalButton {
    pub label:    String,
    pub danger:   bool,
+   /// Drawn as the page's main action.
+   pub primary:  bool,
    pub on_press: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -113,6 +125,15 @@ pub enum ModalSection {
       monospace: bool,
       highlight: bool,
    },
+   /// A Mana `Switch` row. The page is rebuilt from its spec every frame, so
+   /// `on_toggle` replaces the page with `checked` flipped to show the change.
+   Switch {
+      id:          String,
+      label:       String,
+      description: Option<String>,
+      checked:     bool,
+      on_toggle:   Arc<dyn Fn(bool) + Send + Sync>,
+   },
 }
 
 /// Specification for a native GPUI plugin page (`phoenix.ui.openPage`).
@@ -127,6 +148,8 @@ pub struct PageModalSpec {
 pub struct Choice {
    picked: Mutex<Option<i32>>,
    done:   Condvar,
+   #[cfg(target_os = "macos")]
+   panel_id: OnceLock<u64>,
 }
 
 impl Choice {
@@ -134,6 +157,8 @@ impl Choice {
       Self {
          picked: Mutex::new(None),
          done:   Condvar::new(),
+         #[cfg(target_os = "macos")]
+         panel_id: OnceLock::new(),
       }
    }
 
@@ -168,7 +193,24 @@ pub struct ChoiceOption {
 struct CodeEditorModal {
    plugin:       String,
    pending_init: Option<String>,
-   status:       Option<(String, bool)>,
+   status:       FieldStatus,
+}
+
+#[derive(Clone)]
+enum FieldStatus {
+   Idle,
+   Working(String),
+   Failed(String),
+}
+
+impl FieldStatus {
+   fn line(&self) -> Option<(&str, u32)> {
+      match self {
+         Self::Idle => None,
+         Self::Working(msg) => Some((msg, COL_OK)),
+         Self::Failed(msg) => Some((msg, COL_ERROR)),
+      }
+   }
 }
 
 /// What a plugin's text, number or secret setting holds.
@@ -215,8 +257,7 @@ enum FieldTarget {
 struct InstallUrlModal {
    target:       FieldTarget,
    pending_init: Option<String>,
-   status:       Option<(String, bool)>,
-   busy:         bool,
+   status:       FieldStatus,
 }
 
 #[derive(Clone)]
@@ -250,6 +291,7 @@ enum Snapshot {
 type RawModal = Scratch<{ layout::SCRATCH_CAP }>;
 type RawTextInput = Scratch<{ layout::SCRATCH_CAP }>;
 type RawTextArea = Scratch<{ layout::SCRATCH_CAP }>;
+type RawScaleFade = Scratch<{ layout::SCALE_FADE_CAP }>;
 
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
@@ -317,6 +359,18 @@ type TextAreaIntoAnyFn =
    unsafe extern "C" fn(*mut RawAnyElement, *mut RawTextArea) -> *mut RawAnyElement;
 type ListenerPushFn = unsafe extern "C" fn(*mut c_void, *mut u8, *const RcFnVtbl);
 type IsHoveredFn = unsafe extern "C" fn(*const c_void, *const c_void) -> bool;
+type AnimationFrameFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type ScaleFadeIntoAnyFn = unsafe extern "C" fn(
+   *mut RawAnyElement,
+   *mut RawScaleFade,
+   *const c_void,
+) -> *mut RawAnyElement;
+
+struct ScaleFadeSymbols {
+   into_any:   ScaleFadeIntoAnyFn,
+   caller_loc: *const c_void,
+   layout:     ScaleFadeLayout,
+}
 
 struct ModalSymbols {
    vec_push_any:        VecPushAnyFn,
@@ -362,6 +416,8 @@ unsafe impl Send for TextFieldSymbols {}
 unsafe impl Sync for TextFieldSymbols {}
 unsafe impl Send for DismissSymbols {}
 unsafe impl Sync for DismissSymbols {}
+unsafe impl Send for ScaleFadeSymbols {}
+unsafe impl Sync for ScaleFadeSymbols {}
 
 static ORIG_OVERLAY_RENDER: OnceLock<OverlayRenderFn> = OnceLock::new();
 
@@ -400,13 +456,336 @@ fn epoch_ms() -> u64 {
 static MODAL_SYM: OnceLock<ModalSymbols> = OnceLock::new();
 static FIELD_SYM: OnceLock<TextFieldSymbols> = OnceLock::new();
 static DISMISS_SYM: OnceLock<DismissSymbols> = OnceLock::new();
+static ANIMATION_FRAME: OnceLock<AnimationFrameFn> = OnceLock::new();
+static SCALE_FADE: OnceLock<ScaleFadeSymbols> = OnceLock::new();
+static PUMP_RUNNING: AtomicBool = AtomicBool::new(false);
 /// Set while one mouse press is dispatched if it landed on the modal card.
 static PRESS_IN_CARD: AtomicBool = AtomicBool::new(false);
 static WINDOW_VAL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
+// Discord's `modal-layer-card` spring parameters (open underdamped, close overdamped).
+const MODAL_SCALE_FROM: f32 = 0.90;
+const OPEN_STIFFNESS: f32 = 1000.0;
+const OPEN_DAMPING: f32 = 48.0;
+const CLOSE_STIFFNESS: f32 = 1200.0;
+const CLOSE_DAMPING: f32 = 80.0;
+const SETTLE_POS: f32 = 0.0004;
+const SETTLE_VEL: f32 = 0.01;
+const MAX_TRANSITION_SECS: f32 = 0.45;
+const FALLBACK_TICK: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy)]
+struct Transition {
+   started:   Instant,
+   from:      f32,
+   vel0:      f32,
+   target:    f32,
+   stiffness: f32,
+   damping:   f32,
+}
+
+impl Transition {
+   const fn open(now: Instant) -> Self {
+      Self::open_from(0.0, 0.0, now)
+   }
+
+   const fn open_from(from: f32, vel0: f32, now: Instant) -> Self {
+      Self {
+         started: now,
+         from,
+         vel0,
+         target: 1.0,
+         stiffness: OPEN_STIFFNESS,
+         damping: OPEN_DAMPING,
+      }
+   }
+
+   const fn close_from(from: f32, vel0: f32, now: Instant) -> Self {
+      Self {
+         started: now,
+         from,
+         vel0,
+         target: 0.0,
+         stiffness: CLOSE_STIFFNESS,
+         damping: CLOSE_DAMPING,
+      }
+   }
+
+   fn sample(&self, now: Instant) -> (f32, f32, bool) {
+      let t = now.saturating_duration_since(self.started).as_secs_f32();
+      if t >= MAX_TRANSITION_SECS {
+         return (self.target, 0.0, true);
+      }
+      let d0 = self.from - self.target;
+      let k = self.stiffness;
+      let c = self.damping;
+      let delta = c.mul_add(c, -4.0 * k);
+      let (disp, vel) = if delta < 0.0 {
+         let alpha = 0.5 * c;
+         let wd = (-delta).sqrt() * 0.5;
+         let b = alpha.mul_add(d0, self.vel0) / wd;
+         let decay = (-alpha * t).exp();
+         let (sin, cos) = (wd * t).sin_cos();
+         let disp = decay * d0.mul_add(cos, b * sin);
+         let vel = decay
+            * b.mul_add(wd, -(alpha * d0))
+               .mul_add(cos, (-d0).mul_add(wd, -(alpha * b)) * sin);
+         (disp, vel)
+      } else if delta > 0.0 {
+         let root = delta.sqrt();
+         let r1 = f32::midpoint(-c, root);
+         let r2 = f32::midpoint(-c, -root);
+         let c1 = (-r2).mul_add(d0, self.vel0) / (r1 - r2);
+         let c2 = d0 - c1;
+         let e1 = (r1 * t).exp();
+         let e2 = (r2 * t).exp();
+         (c1.mul_add(e1, c2 * e2), (c1 * r1).mul_add(e1, c2 * r2 * e2))
+      } else {
+         let alpha = 0.5 * c;
+         let b = alpha.mul_add(d0, self.vel0);
+         let decay = (-alpha * t).exp();
+         let disp = decay * b.mul_add(t, d0);
+         let vel = decay * (-alpha * b).mul_add(t, alpha.mul_add(-d0, b));
+         (disp, vel)
+      };
+      if disp.abs() <= SETTLE_POS && vel.abs() <= SETTLE_VEL {
+         (self.target, 0.0, true)
+      } else {
+         (self.target + disp, vel, false)
+      }
+   }
+}
+
+struct RenderFrame {
+   snapshot:    Snapshot,
+   progress:    f32,
+   animating:   bool,
+   interactive: bool,
+   instance_id: u64,
+}
+
+struct ModalState {
+   active:      Option<ActiveModal>,
+   closing:     Option<ActiveModal>,
+   transition:  Option<Transition>,
+   instance_id: u64,
+}
+
+impl ModalState {
+   const fn empty() -> Self {
+      Self {
+         active:      None,
+         closing:     None,
+         transition:  None,
+         instance_id: 0,
+      }
+   }
+
+   const fn is_visible(&self) -> bool {
+      self.active.is_some() || self.closing.is_some()
+   }
+
+   fn sample_current(&self, now: Instant) -> (f32, f32) {
+      match self.transition {
+         Some(tr) => {
+            let (pos, vel, _) = tr.sample(now);
+            (pos, vel)
+         },
+         None if self.active.is_some() => (1.0, 0.0),
+         None => (0.0, 0.0),
+      }
+   }
+
+   fn open(&mut self, modal: ActiveModal, now: Instant) {
+      if self.active.is_none() {
+         if let Some(tr) = self.transition {
+            let (pos, vel, _) = tr.sample(now);
+            self.transition = Some(Transition::open_from(pos, vel, now));
+         } else {
+            self.instance_id = self.instance_id.wrapping_add(1).max(1);
+            self.transition = Some(Transition::open(now));
+         }
+      }
+      self.closing = None;
+      self.active = Some(modal);
+   }
+
+   fn close(&mut self, now: Instant) -> bool {
+      let Some(taken) = self.active.take() else {
+         return false;
+      };
+      if let Some(restored) = uncover(&taken) {
+         self.active = Some(restored);
+         self.closing = None;
+      } else {
+         let (pos, vel) = self.sample_current(now);
+         self.closing = Some(taken);
+         self.transition = Some(Transition::close_from(pos, vel, now));
+      }
+      true
+   }
+
+   fn render_frame(&mut self, now: Instant) -> Option<RenderFrame> {
+      if let Some(active) = self.active.as_mut() {
+         let (progress, animating) = match self.transition {
+            Some(tr) => {
+               let (pos, _, settled) = tr.sample(now);
+               if settled {
+                  self.transition = None;
+                  (1.0, false)
+               } else {
+                  (pos, true)
+               }
+            },
+            None => (1.0, false),
+         };
+         return Some(RenderFrame {
+            snapshot: snapshot_modal(active, true),
+            progress,
+            animating,
+            interactive: true,
+            instance_id: self.instance_id,
+         });
+      }
+      let closing = self.closing.as_mut()?;
+      let (progress, settled) = self.transition.map_or((0.0, true), |tr| {
+         let (pos, _, settled) = tr.sample(now);
+         (pos, settled)
+      });
+      if settled {
+         self.closing = None;
+         self.transition = None;
+         return None;
+      }
+      Some(RenderFrame {
+         snapshot: snapshot_modal(closing, false),
+         progress,
+         animating: true,
+         interactive: false,
+         instance_id: self.instance_id,
+      })
+   }
+}
+
+fn snapshot_modal(modal: &mut ActiveModal, take_init: bool) -> Snapshot {
+   match modal {
+      ActiveModal::Page { spec, .. } | ActiveModal::Choice { spec, .. } => {
+         Snapshot::Page(spec.clone())
+      },
+      ActiveModal::CodeEditor(ed) => {
+         Snapshot::CodeEditor(CodeEditorModal {
+            plugin:       ed.plugin.clone(),
+            pending_init: if take_init {
+               ed.pending_init.take()
+            } else {
+               None
+            },
+            status:       ed.status.clone(),
+         })
+      },
+      ActiveModal::InstallUrl(inst) => {
+         Snapshot::InstallUrl(InstallUrlModal {
+            target:       inst.target.clone(),
+            pending_init: if take_init {
+               inst.pending_init.take()
+            } else {
+               None
+            },
+            status:       inst.status.clone(),
+         })
+      },
+   }
+}
+
 static MODAL_OPEN: AtomicBool = AtomicBool::new(false);
 static NEXT_PAGE_ID: AtomicU64 = AtomicU64::new(1);
-static ACTIVE_MODAL: LazyLock<Mutex<Option<ActiveModal>>> = LazyLock::new(|| Mutex::new(None));
+static ACTIVE_MODAL: LazyLock<Mutex<ModalState>> = LazyLock::new(|| Mutex::new(ModalState::empty()));
+
+struct ActiveGuard(MutexGuard<'static, ModalState>);
+
+impl Deref for ActiveGuard {
+   type Target = ModalState;
+
+   fn deref(&self) -> &Self::Target {
+      &self.0
+   }
+}
+
+impl DerefMut for ActiveGuard {
+   fn deref_mut(&mut self) -> &mut Self::Target {
+      &mut self.0
+   }
+}
+
+impl Drop for ActiveGuard {
+   /// `MODAL_OPEN` changes only under this lock, so a close racing an open
+   /// cannot leave a held or closing modal undrawn.
+   fn drop(&mut self) {
+      MODAL_OPEN.store(self.0.is_visible(), Ordering::Release);
+   }
+}
+
+fn active_modal() -> ActiveGuard {
+   ActiveGuard(ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+fn schedule_next_frame(window: *mut c_void, app: *mut c_void) {
+   if let Some(&anim_frame) = ANIMATION_FRAME.get()
+      && !window.is_null()
+      && !app.is_null()
+   {
+      // SAFETY: called on the GPUI main thread with live `window` and `app`.
+      unsafe { anim_frame(window, app) };
+      return;
+   }
+   if PUMP_RUNNING.swap(true, Ordering::AcqRel) {
+      return;
+   }
+   std::thread::spawn(|| {
+      loop {
+         std::thread::sleep(FALLBACK_TICK);
+         let keep_going = active_modal().transition.is_some();
+         force_redraw();
+         if !keep_going {
+            break;
+         }
+      }
+      PUMP_RUNNING.store(false, Ordering::Release);
+   });
+}
+
+fn wrap_scale_fade(
+   child: RawAnyElement,
+   progress: f32,
+   instance_id: u64,
+) -> Result<RawAnyElement, RawAnyElement> {
+   let Some(sf) = SCALE_FADE.get() else {
+      return Err(child);
+   };
+   let at = &sf.layout;
+   let mut raw = RawScaleFade::zeroed();
+   raw.put(at.child, child);
+   raw.put(at.opacity_range, [0.0f32, 1.0f32]);
+   raw.put(at.label_none, 0xFFu8);
+   raw.put(at.element_id + at.element_id_tag_off, at.element_id_tag);
+   raw.put(at.element_id + at.element_id_key, instance_id);
+   raw.put(
+      at.element_id + at.element_id_str,
+      SharedString::from_static("sunbird-modal-scale"),
+   );
+   raw.put(at.progress, progress);
+   raw.put(at.scale_from, MODAL_SCALE_FROM);
+   raw.put(at.origin, 0u32);
+   raw.put(at.fade, 1u8);
+   // SAFETY: `into_any`, `caller_loc`, and every field offset in `at` were
+   // decoded from Discord's binary and bounds-checked against `SCALE_FADE_CAP`.
+   let out = unsafe {
+      let mut out = MaybeUninit::<RawAnyElement>::uninit();
+      (sf.into_any)(out.as_mut_ptr(), &raw mut raw, sf.caller_loc);
+      out.assume_init()
+   };
+   Ok(out)
+}
 
 /// Main-thread-owned GPUI `Entity<FieldState>` handles, lazily created on first
 /// render when `window` and `app` are live.
@@ -426,6 +805,7 @@ static FIELD_ENTITIES: LazyLock<Mutex<FieldEntities>> = LazyLock::new(|| {
 enum ModalAction {
    Close,
    PageButton(Arc<dyn Fn() + Send + Sync>),
+   Switch(Arc<dyn Fn(bool) + Send + Sync>),
    SaveCode(String),
    CopyCode,
    SubmitInstallUrl,
@@ -458,6 +838,16 @@ static MODAL_CLOSE_VTBL: RcFnVtbl = RcFnVtbl {
    call_once:     modal_close_callback as *const c_void,
    call_mut:      modal_close_callback as *const c_void,
    call:          modal_close_callback as *const c_void,
+   extra:         ptr::null(),
+};
+
+static MODAL_SWITCH_VTBL: RcFnVtbl = RcFnVtbl {
+   drop_in_place: ptr::null(),
+   size:          size_of::<u64>(),
+   align:         align_of::<u64>(),
+   call_once:     modal_switch_callback as *const c_void,
+   call_mut:      modal_switch_callback as *const c_void,
+   call:          modal_switch_callback as *const c_void,
    extra:         ptr::null(),
 };
 
@@ -667,6 +1057,27 @@ unsafe extern "C" fn modal_close_callback(
    let _ = std::panic::catch_unwind(close_active);
 }
 
+/// A modal `Switch`'s `on_change`, with the Rust ABI of the `Fn::call` slot
+/// it fills, like `gpui::switch_callback`.
+unsafe fn modal_switch_callback(
+   self_ptr: *const u64,
+   checked: u8,
+   _window: *mut c_void,
+   _app: *mut c_void,
+) {
+   if self_ptr.is_null() {
+      return;
+   }
+   let _ = std::panic::catch_unwind(|| {
+      // SAFETY: `self_ptr` points to `RcInner.action_id`.
+      let id = unsafe { *self_ptr };
+      if let Some(ModalAction::Switch(on_toggle)) = lookup_modal_action(id) {
+         let on = checked != 0;
+         std::thread::spawn(move || on_toggle(on));
+      }
+   });
+}
+
 /// Mana `Button::on_click` invokes `Fn::call(&self, event, window, app)` — 4
 /// arguments, giving us a live `*mut App` for reading native `FieldState`s.
 unsafe extern "C" fn modal_button_callback(
@@ -679,6 +1090,9 @@ unsafe extern "C" fn modal_button_callback(
       return;
    }
    let _ = std::panic::catch_unwind(|| {
+      if active_modal().active.is_none() {
+         return;
+      }
       // SAFETY: `self_ptr` points to `RcInner.action_id`.
       let id = unsafe { *self_ptr };
       let Some(action) = lookup_modal_action(id) else {
@@ -689,6 +1103,7 @@ unsafe extern "C" fn modal_button_callback(
          ModalAction::PageButton(cb) => {
             std::thread::spawn(move || cb());
          },
+         ModalAction::Switch(_) => {},
          ModalAction::CopyCode => {
             if let Some(code) = read_code_field(app) {
                match phoenix_ui_desktop::copy(&code) {
@@ -699,7 +1114,7 @@ unsafe extern "C" fn modal_button_callback(
          },
          ModalAction::SaveCode(plugin) => {
             let Some(code) = read_code_field(app) else {
-               set_editor_status("Could not read text field", true);
+               set_editor_status(FieldStatus::Failed("Could not read text field".to_owned()));
                return;
             };
             match phoenix_runtime::save_source(&plugin, code) {
@@ -708,16 +1123,12 @@ unsafe extern "C" fn modal_button_callback(
                   phoenix_ui_desktop::toast(&format!("Saved & reloaded {plugin}"));
                },
                Err(err) => {
-                  set_editor_status(&format!("Save failed: {err}"), true);
+                  set_editor_status(FieldStatus::Failed(format!("Save failed: {err}")));
                },
             }
          },
          ModalAction::SubmitInstallUrl => {
-            let target = match ACTIVE_MODAL
-               .lock()
-               .unwrap_or_else(PoisonError::into_inner)
-               .as_ref()
-            {
+            let target = match active_modal().active.as_ref() {
                Some(ActiveModal::InstallUrl(inst)) => inst.target.clone(),
                _ => return,
             };
@@ -729,7 +1140,9 @@ unsafe extern "C" fn modal_button_callback(
                },
                FieldTarget::Prompt(prompt) => {
                   let Some(raw) = read_url_field(app) else {
-                     set_install_status("Could not read the text field", true, false);
+                     set_install_status(FieldStatus::Failed(
+                        "Could not read the text field".to_owned(),
+                     ));
                      return;
                   };
                   let text = raw.trim().to_owned();
@@ -742,15 +1155,19 @@ unsafe extern "C" fn modal_button_callback(
                },
             }
             let Some(raw) = read_url_field(app) else {
-               set_install_status("Could not read URL field", true, false);
+               set_install_status(FieldStatus::Failed("Could not read URL field".to_owned()));
                return;
             };
             let url = raw.trim().to_owned();
             if url.is_empty() {
-               set_install_status("Enter an https:// link to a plugin .js file", true, false);
+               set_install_status(FieldStatus::Failed(
+                  "Enter an https:// link to a plugin .js file".to_owned(),
+               ));
                return;
             }
-            set_install_status("Downloading and installing plugin...", false, true);
+            set_install_status(FieldStatus::Working(
+               "Downloading and installing plugin...".to_owned(),
+            ));
             std::thread::spawn(move || {
                match phoenix_runtime::install(&url) {
                   Ok(installed) => {
@@ -758,7 +1175,7 @@ unsafe extern "C" fn modal_button_callback(
                      phoenix_ui_desktop::toast(&installed.to_string());
                   },
                   Err(err) => {
-                     set_install_status(&format!("{err}"), true, false);
+                     set_install_status(FieldStatus::Failed(err.to_string()));
                   },
                }
             });
@@ -810,6 +1227,23 @@ mod panel {
             }
          },
          ModalSection::Text { title, text } => PanelSection::Text { title, text },
+         // `AppKit` panels have no switch, so it is a button naming the state
+         // it changes to.
+         ModalSection::Switch {
+            label,
+            checked,
+            on_toggle,
+            ..
+         } => {
+            PanelSection::Buttons {
+               title:   Some(format!("{label}: {}", if checked { "on" } else { "off" })),
+               buttons: vec![PanelButton {
+                  label:    if checked { "Turn off" } else { "Turn on" }.to_owned(),
+                  danger:   false,
+                  on_press: Arc::new(move || on_toggle(!checked)),
+               }],
+            }
+         },
          ModalSection::Code {
             title,
             text,
@@ -867,42 +1301,82 @@ mod panel {
          });
       }
       let dismissed = Arc::clone(choice);
-      let _ = id.set(show_panel(
-         title,
-         sections,
-         Some(Arc::new(move || dismissed.pick(-1))),
-      ));
+      let panel_id = show_panel(title, sections, Some(Arc::new(move || dismissed.pick(-1))));
+      let _ = id.set(panel_id);
+      let _ = choice.panel_id.set(panel_id);
    }
 }
 
 /// Opens a native GPUI modal for `phoenix.ui.openPage` and triggers a GPUI
 /// redraw immediately.
 pub fn open_page(spec: PageModalSpec) -> u64 {
-   if cfg!(target_os = "macos") {
-      return open_panel(spec);
+   open_page_closing(spec, None)
+}
+
+type OnClose = Arc<dyn Fn() + Send + Sync>;
+
+/// What runs when the user closes the page with this id (its Close button or
+/// the scrim), but not when [`close_page`] closes it.
+static ON_CLOSE: Mutex<Option<(u64, OnClose)>> = Mutex::new(None);
+
+/// [`open_page`], running `on_close` on a worker thread when the user closes
+/// it. Only the newest page keeps its `on_close`.
+pub fn open_page_closing(spec: PageModalSpec, on_close: Option<OnClose>) -> u64 {
+   if cfg!(target_os = "macos") && ORIG_OVERLAY_RENDER.get().is_none() {
+      return open_panel(spec, on_close);
    }
    resolve_pending_choice();
    let id = NEXT_PAGE_ID.fetch_add(1, Ordering::Relaxed);
-   set_active(Some(ActiveModal::Page { id, spec }));
+   *ON_CLOSE.lock().unwrap_or_else(PoisonError::into_inner) = on_close.map(|run| (id, run));
+   set_active(ActiveModal::Page { id, spec });
    id
 }
 
 #[cfg(target_os = "macos")]
-fn open_panel(spec: PageModalSpec) -> u64 {
-   panel::open(spec, None)
+fn open_panel(spec: PageModalSpec, on_close: Option<OnClose>) -> u64 {
+   // `AppKit` builds the panel on the main thread right after this, which the
+   // first-launch watchdog takes as drawn.
+   MODAL_RENDERED.store(true, Ordering::Release);
+   panel::open(spec, on_close)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_panel(_spec: PageModalSpec) -> u64 {
+fn open_panel(_spec: PageModalSpec, _on_close: Option<OnClose>) -> u64 {
    0
 }
 
-/// Replaces the active modal. `MODAL_OPEN` changes under the same lock, so a
-/// close racing an open cannot leave a held modal undrawn.
-fn set_active(modal: Option<ActiveModal>) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   MODAL_OPEN.store(modal.is_some(), Ordering::Release);
-   *guard = modal;
+/// Takes page `id`'s `on_close`, if it still has one.
+fn take_on_close(id: u64) -> Option<OnClose> {
+   let mut slot = ON_CLOSE.lock().unwrap_or_else(PoisonError::into_inner);
+   if slot.as_ref().is_some_and(|(page, _)| *page == id) {
+      slot.take().map(|(_, run)| run)
+   } else {
+      None
+   }
+}
+
+/// Whether [`install`] hooked `Workspace::render_overlays`, which draws every
+/// GPUI modal.
+pub fn hooked() -> bool {
+   ORIG_OVERLAY_RENDER.get().is_some()
+}
+
+/// Set once `Workspace::render_overlays` runs: Discord's window is drawing.
+static WINDOW_SEEN: AtomicBool = AtomicBool::new(false);
+/// Set once a modal was built into a frame (or an `AppKit` panel opened).
+static MODAL_RENDERED: AtomicBool = AtomicBool::new(false);
+
+pub fn window_seen() -> bool {
+   WINDOW_SEEN.load(Ordering::Acquire)
+}
+
+pub fn rendered() -> bool {
+   MODAL_RENDERED.load(Ordering::Acquire)
+}
+
+fn set_active(modal: ActiveModal) {
+   let mut guard = active_modal();
+   guard.open(modal, Instant::now());
    drop(guard);
    force_redraw();
 }
@@ -918,7 +1392,7 @@ pub fn open_choice(
 ) -> Arc<Choice> {
    let choice = Arc::new(Choice::new());
    #[cfg(target_os = "macos")]
-   if cfg!(target_os = "macos") {
+   if ORIG_OVERLAY_RENDER.get().is_none() {
       panel::open_choice(title, body, options, &choice);
       return choice;
    }
@@ -927,11 +1401,7 @@ pub fn open_choice(
       return choice;
    }
    resolve_pending_choice();
-   let under = match ACTIVE_MODAL
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .as_ref()
-   {
+   let under = match active_modal().active.as_ref() {
       Some(ActiveModal::Page { id, spec }) => Some((*id, spec.clone())),
       Some(ActiveModal::Choice { under, .. }) => under.clone(),
       _ => None,
@@ -950,6 +1420,7 @@ pub fn open_choice(
             ModalButton {
                label:    option.label,
                danger:   option.danger,
+               primary:  false,
                on_press: Arc::new(move || {
                   finish_choice(&picked, i32::try_from(index).unwrap_or(-1));
                }),
@@ -961,11 +1432,11 @@ pub fn open_choice(
          buttons,
       });
    }
-   set_active(Some(ActiveModal::Choice {
+   set_active(ActiveModal::Choice {
       spec: PageModalSpec { title, sections },
       choice: Arc::clone(&choice),
       under,
-   }));
+   });
    choice
 }
 
@@ -986,18 +1457,21 @@ pub fn ask(
 
 /// Closes `choice`'s dialog if it is still the one on screen.
 pub fn dismiss_choice(choice: &Arc<Choice>) {
+   #[cfg(target_os = "macos")]
+   if let Some(&id) = choice.panel_id.get() {
+      phoenix_ui_desktop::close_panel(id);
+   }
    finish_choice(choice, -1);
 }
 
 /// Answers `choice` with `index` and closes its dialog, leaving any dialog
 /// that already replaced it open.
 fn finish_choice(choice: &Arc<Choice>, index: i32) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   let current = matches!(guard.as_ref(), Some(ActiveModal::Choice { choice: active, .. }) if Arc::ptr_eq(active, choice));
+   let mut guard = active_modal();
+   let current = matches!(guard.active.as_ref(), Some(ActiveModal::Choice { choice: active, .. }) if Arc::ptr_eq(active, choice));
    choice.pick(index);
    if current {
-      *guard = uncover(guard.take());
-      MODAL_OPEN.store(guard.is_some(), Ordering::Release);
+      guard.close(Instant::now());
    }
    drop(guard);
    if current {
@@ -1007,19 +1481,24 @@ fn finish_choice(choice: &Arc<Choice>, index: i32) {
 
 /// Answers any open choose dialog with -1 before it is replaced.
 fn resolve_pending_choice() {
-   let guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   if let Some(ActiveModal::Choice { choice, .. }) = guard.as_ref() {
+   let guard = active_modal();
+   if let Some(ActiveModal::Choice { choice, .. }) = guard.active.as_ref() {
       choice.pick(-1);
    }
 }
 
 /// The page a closing modal leaves on screen.
-fn uncover(closing: Option<ActiveModal>) -> Option<ActiveModal> {
+fn uncover(closing: &ActiveModal) -> Option<ActiveModal> {
    match closing {
-      Some(ActiveModal::Choice {
+      ActiveModal::Choice {
          under: Some((id, spec)),
          ..
-      }) => Some(ActiveModal::Page { id, spec }),
+      } => {
+         Some(ActiveModal::Page {
+            id:   *id,
+            spec: spec.clone(),
+         })
+      },
       _ => None,
    }
 }
@@ -1027,8 +1506,8 @@ fn uncover(closing: Option<ActiveModal>) -> Option<ActiveModal> {
 /// Swaps the sections of page `id`, on screen or under a choose dialog.
 /// False when that page is gone.
 pub fn replace_page(id: u64, spec: PageModalSpec) -> bool {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   let slot = match guard.as_mut() {
+   let mut guard = active_modal();
+   let slot = match guard.active.as_mut() {
       Some(
          ActiveModal::Page { id: cur, spec }
          | ActiveModal::Choice {
@@ -1047,11 +1526,14 @@ pub fn replace_page(id: u64, spec: PageModalSpec) -> bool {
 /// Closes an open page modal if its id still matches `id`.
 pub fn close_page(id: u64) {
    #[cfg(target_os = "macos")]
-   phoenix_ui_desktop::close_panel(id);
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   if matches!(&*guard, Some(ActiveModal::Page { id: cur, .. }) if *cur == id) {
-      *guard = None;
-      MODAL_OPEN.store(false, Ordering::Release);
+   if ORIG_OVERLAY_RENDER.get().is_none() {
+      phoenix_ui_desktop::close_panel(id);
+      return;
+   }
+   let mut guard = active_modal();
+   if matches!(&guard.active, Some(ActiveModal::Page { id: cur, .. }) if *cur == id)
+      && guard.close(Instant::now())
+   {
       drop(guard);
       force_redraw();
    }
@@ -1060,45 +1542,42 @@ pub fn close_page(id: u64) {
 /// Opens a native GPUI multiline code editor modal for `plugin`.
 pub fn open_code_editor(plugin: String, initial_source: String) {
    resolve_pending_choice();
-   set_active(Some(ActiveModal::CodeEditor(CodeEditorModal {
+   set_active(ActiveModal::CodeEditor(CodeEditorModal {
       plugin,
       pending_init: Some(initial_source),
-      status: None,
-   })));
+      status: FieldStatus::Idle,
+   }));
 }
 
 /// Opens a native GPUI single-line URL installer modal.
 pub fn open_install_url() {
    resolve_pending_choice();
-   set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
+   set_active(ActiveModal::InstallUrl(InstallUrlModal {
       target:       FieldTarget::Install,
       pending_init: Some(String::new()),
-      status:       None,
-      busy:         false,
-   })));
+      status:       FieldStatus::Idle,
+   }));
 }
 
 /// Opens the one-line field on a plugin's text, number or secret setting.
 pub fn open_setting_editor(field: SettingField) {
    resolve_pending_choice();
-   set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
+   set_active(ActiveModal::InstallUrl(InstallUrlModal {
       pending_init: Some(field.initial.clone()),
       target:       FieldTarget::Setting(field),
-      status:       None,
-      busy:         false,
-   })));
+      status:       FieldStatus::Idle,
+   }));
 }
 
 /// Opens the one-line field for `prompt`, which gets the text when it is
 /// submitted.
 pub fn open_prompt(prompt: Prompt) {
    resolve_pending_choice();
-   set_active(Some(ActiveModal::InstallUrl(InstallUrlModal {
+   set_active(ActiveModal::InstallUrl(InstallUrlModal {
       target:       FieldTarget::Prompt(prompt),
       pending_init: Some(String::new()),
-      status:       None,
-      busy:         false,
-   })));
+      status:       FieldStatus::Idle,
+   }));
 }
 
 /// Stores the field's text as `field`'s value and closes the modal, or says
@@ -1110,7 +1589,9 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
       read_url_field(app)
    };
    let Some(raw) = raw else {
-      set_install_status("Could not read the text field", true, false);
+      set_install_status(FieldStatus::Failed(
+         "Could not read the text field".to_owned(),
+      ));
       return;
    };
    let text = raw.trim();
@@ -1122,7 +1603,7 @@ fn save_setting(app: *mut c_void, field: &SettingField) {
       match text.parse::<f64>() {
          Ok(number) if number.is_finite() => phoenix_runtime::Chosen::Number(number),
          _ => {
-            set_install_status("Enter a number", true, false);
+            set_install_status(FieldStatus::Failed("Enter a number".to_owned()));
             return;
          },
       }
@@ -1138,15 +1619,15 @@ fn save_server_field(key: &str, text: &str) {
    if key != "add" {
       match crate::gpui::edit_server(key, text) {
          Ok(()) => close_active(),
-         Err(err) => set_install_status(&err, true, false),
+         Err(err) => set_install_status(FieldStatus::Failed(err)),
       }
       return;
    }
    if text.is_empty() {
-      set_install_status("Enter the server's address", true, false);
+      set_install_status(FieldStatus::Failed("Enter the server's address".to_owned()));
       return;
    }
-   set_install_status("Looking for the server...", false, true);
+   set_install_status(FieldStatus::Working("Looking for the server...".to_owned()));
    let address = text.to_owned();
    std::thread::spawn(move || {
       match crate::gpui::add_server(&address) {
@@ -1154,34 +1635,39 @@ fn save_server_field(key: &str, text: &str) {
             close_active();
             phoenix_ui_desktop::toast(&format!("Added {name}"));
          },
-         Err(err) => set_install_status(&err, true, false),
+         Err(err) => set_install_status(FieldStatus::Failed(err)),
       }
    });
 }
 
 fn close_active() {
    resolve_pending_choice();
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   *guard = uncover(guard.take());
-   MODAL_OPEN.store(guard.is_some(), Ordering::Release);
+   let mut guard = active_modal();
+   if let Some(ActiveModal::Page { id, .. }) = guard.active.as_ref()
+      && let Some(on_close) = take_on_close(*id)
+   {
+      std::thread::spawn(move || on_close());
+   }
+   let changed = guard.close(Instant::now());
    drop(guard);
-   force_redraw();
+   if changed {
+      force_redraw();
+   }
 }
 
-fn set_editor_status(msg: &str, is_error: bool) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   if let Some(ActiveModal::CodeEditor(ed)) = guard.as_mut() {
-      ed.status = Some((msg.to_owned(), is_error));
+fn set_editor_status(status: FieldStatus) {
+   let mut guard = active_modal();
+   if let Some(ActiveModal::CodeEditor(ed)) = guard.active.as_mut() {
+      ed.status = status;
    }
    drop(guard);
    force_redraw();
 }
 
-fn set_install_status(msg: &str, is_error: bool, busy: bool) {
-   let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-   if let Some(ActiveModal::InstallUrl(inst)) = guard.as_mut() {
-      inst.status = Some((msg.to_owned(), is_error));
-      inst.busy = busy;
+fn set_install_status(status: FieldStatus) {
+   let mut guard = active_modal();
+   if let Some(ActiveModal::InstallUrl(inst)) = guard.active.as_mut() {
+      inst.status = status;
    }
    drop(guard);
    force_redraw();
@@ -1197,6 +1683,40 @@ pub fn force_redraw() {
 // Installation (`DllMain` / `crate::prepare`)
 // ---------------------------------------------------------------------------
 
+fn sret_wrap(addr: usize) -> Result<usize, &'static str> {
+   if crate::X86_CODE {
+      Ok(addr)
+   } else {
+      phoenix_hook::image::sret_caller(addr).ok_or("no memory for sret caller thunk")
+   }
+}
+
+fn set_dismiss(found: &Dismiss, interactivity: usize) {
+   // SAFETY: resolved and shape-checked against Discord by `sigs`.
+   let _ = DISMISS_SYM.set(unsafe {
+      DismissSymbols {
+         push: std::mem::transmute::<usize, ListenerPushFn>(found.listener_push),
+         is_hovered: std::mem::transmute::<usize, IsHoveredFn>(found.hitbox_is_hovered),
+         interactivity,
+         mouse_down_listeners: found.mouse_down_listeners,
+         propagate_event: found.propagate_event,
+      }
+   });
+}
+
+/// Fallback on macOS if native modal resolution fails: still resolve
+/// `mouse_down` so `rowDoubleTap` keeps working.
+#[cfg(target_os = "macos")]
+fn install_mouse_down_fallback(image: &Image<'static>, div: &desktop::DivLayout) {
+   match phoenix_sigs::macos::mouse_down(image, div) {
+      Ok(found) => {
+         set_dismiss(&found, div.interactivity);
+         log::info!("desktop mouse_down: resolved {found:x?}");
+      },
+      Err(err) => log::warn!("desktop mouse_down: {err}, rowDoubleTap disabled"),
+   }
+}
+
 /// Locates Discord's native `Modal`, `Div::id`, `TextInput`/`TextArea`, and
 /// window root render, then hooks `WindowRoot::render`.
 #[expect(clippy::too_many_lines, reason = "one symbol table per located group")]
@@ -1209,109 +1729,140 @@ pub fn install(image: &Image<'static>) {
       log::warn!("desktop modal: Div::child(AnyElement) unavailable, skipping");
       return;
    }
-   let found = match desktop::modal(image, div_into_any, &gpui_layout.div) {
+   let located = if crate::X86_CODE {
+      desktop::modal(image, div_into_any, &gpui_layout.div)
+   } else {
+      phoenix_sigs::macos::modal(image, div_into_any, &gpui_layout.div)
+   };
+   let found = match located {
       Ok(m) => m,
+      Err(err) => {
+         log::warn!("desktop modal: {err}, native modals disabled");
+         #[cfg(target_os = "macos")]
+         install_mouse_down_fallback(image, &gpui_layout.div);
+         return;
+      },
+   };
+   WINDOW_VAL_OFFSET.store(found.window_validation_offset, Ordering::Release);
+   set_dismiss(&found.dismiss, gpui_layout.div.interactivity);
+
+   let modal_sym = match (|| -> Result<ModalSymbols, &'static str> {
+      let modal_new = sret_wrap(found.modal_new)?;
+      let modal_into_any = sret_wrap(found.modal_into_any)?;
+      let modal_child_div = sret_wrap(found.modal_child_div)?;
+      let modal_footer_button = sret_wrap(found.modal_footer_button)?;
+      let div_id = sret_wrap(found.div_id)?;
+      // SAFETY: resolved and layout-verified against Discord.
+      Ok(unsafe {
+         ModalSymbols {
+            vec_push_any:        std::mem::transmute::<usize, VecPushAnyFn>(found.vec_push_any),
+            modal_new:           std::mem::transmute::<usize, ModalNewFn>(modal_new),
+            modal_into_any:      std::mem::transmute::<usize, ModalIntoAnyFn>(modal_into_any),
+            modal_child_div:     std::mem::transmute::<usize, ModalChildDivFn>(modal_child_div),
+            modal_footer_button: std::mem::transmute::<usize, ModalFooterBtnFn>(
+               modal_footer_button,
+            ),
+            div_id:              std::mem::transmute::<usize, DivIdFn>(div_id),
+            layout:              found.layout,
+         }
+      })
+   })() {
+      Ok(sym) => sym,
       Err(err) => {
          log::warn!("desktop modal: {err}, native modals disabled");
          return;
       },
    };
-   WINDOW_VAL_OFFSET.store(found.window_validation_offset, Ordering::Release);
-   // SAFETY: resolved and shape-checked against `Discord.exe` by `sigs`.
-   let _ = DISMISS_SYM.set(unsafe {
-      DismissSymbols {
-         push:                 std::mem::transmute::<usize, ListenerPushFn>(
-            found.dismiss.listener_push,
-         ),
-         is_hovered:           std::mem::transmute::<usize, IsHoveredFn>(
-            found.dismiss.hitbox_is_hovered,
-         ),
-         interactivity:        gpui_layout.div.interactivity,
-         mouse_down_listeners: found.dismiss.mouse_down_listeners,
-         propagate_event:      found.dismiss.propagate_event,
-      }
-   });
-
-   // SAFETY: resolved and layout-verified against `Discord.exe`.
-   let modal_sym = unsafe {
-      ModalSymbols {
-         vec_push_any:        std::mem::transmute::<usize, VecPushAnyFn>(found.vec_push_any),
-         modal_new:           std::mem::transmute::<usize, ModalNewFn>(found.modal_new),
-         modal_into_any:      std::mem::transmute::<usize, ModalIntoAnyFn>(found.modal_into_any),
-         modal_child_div:     std::mem::transmute::<usize, ModalChildDivFn>(found.modal_child_div),
-         modal_footer_button: std::mem::transmute::<usize, ModalFooterBtnFn>(
-            found.modal_footer_button,
-         ),
-         div_id:              std::mem::transmute::<usize, DivIdFn>(found.div_id),
-         layout:              found.layout,
-      }
-   };
    let _ = MODAL_SYM.set(modal_sym);
 
-   match desktop::text_fields(image) {
+   let tf = if crate::X86_CODE {
+      desktop::text_fields(image)
+   } else {
+      phoenix_sigs::macos::text_fields(image)
+   };
+   match tf {
       Ok(tf) => {
-         // SAFETY: resolved and cross-checked against `Discord.exe`.
-         let sym = unsafe {
-            TextFieldSymbols {
-               cx_new_single:       std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_single),
-               cx_new_multiline:    std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_multiline),
-               entity_map_get:      std::mem::transmute::<usize, EntityMapGetFn>(tf.entity_map_get),
-               entity_downgrade:    std::mem::transmute::<usize, EntityDowngradeFn>(
-                  tf.entity_downgrade,
-               ),
-               weak_drop:           std::mem::transmute::<usize, WeakDropFn>(tf.weak_drop),
-               text_get:            std::mem::transmute::<usize, TextGetFn>(tf.text_get),
-               set_value:           std::mem::transmute::<usize, SetValueFn>(tf.set_value),
-               update_entity_dyn:   std::mem::transmute::<usize, UpdateEntityDynFn>(
-                  tf.update_entity_dyn,
-               ),
-               arc_drop_slow:       std::mem::transmute::<usize, ArcDropSlowFn>(tf.arc_drop_slow),
-               text_input_new:      std::mem::transmute::<usize, TextInputNewFn>(tf.text_input_new),
-               text_input_into_any: std::mem::transmute::<usize, TextInputIntoAnyFn>(
-                  tf.text_input_into_any,
-               ),
-               text_area_new:       std::mem::transmute::<usize, TextAreaNewFn>(tf.text_area_new),
-               text_area_into_any:  std::mem::transmute::<usize, TextAreaIntoAnyFn>(
-                  tf.text_area_into_any,
-               ),
-               layout:              tf.layout,
-            }
-         };
-         let _ = FIELD_SYM.set(sym);
-         log::info!(
-            "desktop modal: resolved native TextInput/TextArea (single={:#x}, multi={:#x}) {:x?}",
-            tf.cx_new_single,
-            tf.cx_new_multiline,
-            tf.layout,
-         );
+         let wrapped = (|| -> Result<TextFieldSymbols, &'static str> {
+            let cx_new_single = sret_wrap(tf.cx_new_single)?;
+            let cx_new_multiline = sret_wrap(tf.cx_new_multiline)?;
+            let entity_downgrade = sret_wrap(tf.entity_downgrade)?;
+            let text_get = sret_wrap(tf.text_get)?;
+            let text_input_new = sret_wrap(tf.text_input_new)?;
+            let text_input_into_any = sret_wrap(tf.text_input_into_any)?;
+            let text_area_new = sret_wrap(tf.text_area_new)?;
+            let text_area_into_any = sret_wrap(tf.text_area_into_any)?;
+            // SAFETY: resolved and cross-checked against Discord.
+            Ok(unsafe {
+               TextFieldSymbols {
+                  cx_new_single:       std::mem::transmute::<usize, CxNewFieldFn>(cx_new_single),
+                  cx_new_multiline:    std::mem::transmute::<usize, CxNewFieldFn>(cx_new_multiline),
+                  entity_map_get:      std::mem::transmute::<usize, EntityMapGetFn>(
+                     tf.entity_map_get,
+                  ),
+                  entity_downgrade:    std::mem::transmute::<usize, EntityDowngradeFn>(
+                     entity_downgrade,
+                  ),
+                  weak_drop:           std::mem::transmute::<usize, WeakDropFn>(tf.weak_drop),
+                  text_get:            std::mem::transmute::<usize, TextGetFn>(text_get),
+                  set_value:           std::mem::transmute::<usize, SetValueFn>(tf.set_value),
+                  update_entity_dyn:   std::mem::transmute::<usize, UpdateEntityDynFn>(
+                     tf.update_entity_dyn,
+                  ),
+                  arc_drop_slow:       std::mem::transmute::<usize, ArcDropSlowFn>(
+                     tf.arc_drop_slow,
+                  ),
+                  text_input_new:      std::mem::transmute::<usize, TextInputNewFn>(text_input_new),
+                  text_input_into_any: std::mem::transmute::<usize, TextInputIntoAnyFn>(
+                     text_input_into_any,
+                  ),
+                  text_area_new:       std::mem::transmute::<usize, TextAreaNewFn>(text_area_new),
+                  text_area_into_any:  std::mem::transmute::<usize, TextAreaIntoAnyFn>(
+                     text_area_into_any,
+                  ),
+                  layout:              tf.layout,
+               }
+            })
+         })();
+         match wrapped {
+            Ok(sym) => {
+               let _ = FIELD_SYM.set(sym);
+               log::info!(
+                  "desktop modal: resolved native TextInput/TextArea (single={:#x}, multi={:#x}) \
+                   {:x?}",
+                  tf.cx_new_single,
+                  tf.cx_new_multiline,
+                  tf.layout,
+               );
+            },
+            Err(err) => {
+               log::warn!("desktop modal: native TextInput/TextArea thunk failed: {err}");
+            },
+         }
       },
       Err(err) => {
          log::warn!("desktop modal: native TextInput/TextArea unavailable: {err}");
       },
    }
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `overlay_render_detour` matches `Workspace::render_overlays`'s 5-arg sret
-   // ABI returning `Vec<AnyElement>`.
-   let trampoline = match unsafe {
-      image.hook_entry(
+   // ABI returning `Vec<AnyElement>` (via `sret_callee`/`sret_caller` on
+   // arm64).
+   let Some(orig) = (unsafe {
+      crate::hook_sret::<OverlayRenderFn>(
+         image,
+         |pro| pro.frame,
          found.overlay_render,
-         pro.pattern,
-         pro.len,
          overlay_render_detour as *const () as usize,
+         "desktop modal: overlay render hook failed",
       )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop modal: overlay render hook failed: {err}");
-         return;
-      },
+   }) else {
+      return;
    };
-   // SAFETY: `trampoline` replays the 19-byte prologue and jumps to `+19`.
-   let orig = unsafe { std::mem::transmute::<usize, OverlayRenderFn>(trampoline) };
    let _ = ORIG_OVERLAY_RENDER.set(orig);
-   install_settings_layer(image, pro);
+   install_settings_layer(image);
+   install_transitions(image);
+   crate::notices::enable();
    log::info!(
       "desktop modal: hooked Workspace::render_overlays @ {:#x} (push={:#x}, val +{:#x}) {:x?}",
       found.overlay_render,
@@ -1323,8 +1874,13 @@ pub fn install(image: &Image<'static>) {
 
 /// Hooks the Settings layer's render, so modals opened over Settings draw
 /// above it.
-fn install_settings_layer(image: &Image<'static>, pro: desktop::Prologue) {
-   let func = match desktop::settings_layer(image) {
+fn install_settings_layer(image: &Image<'static>) {
+   let located = if crate::X86_CODE {
+      desktop::settings_layer(image)
+   } else {
+      phoenix_sigs::macos::settings_layer(image)
+   };
+   let func = match located {
       Ok(func) => func,
       Err(err) => {
          log::warn!("desktop modal: {err}, modals stay under Settings");
@@ -1333,21 +1889,62 @@ fn install_settings_layer(image: &Image<'static>, pro: desktop::Prologue) {
    };
    // SAFETY: from `prepare`, before Discord's threads run; the detour has the
    // Settings layer render's sret signature.
-   match unsafe {
-      image.hook_entry(
+   if let Some(orig) = unsafe {
+      crate::hook_sret::<SettingsLayerFn>(
+         image,
+         |pro| pro.frame,
          func,
-         pro.pattern,
-         pro.len,
          settings_layer_detour as *const () as usize,
+         "desktop modal: Settings layer hook failed",
       )
    } {
-      Ok(trampoline) => {
-         // SAFETY: `trampoline` replays the prologue of `func`.
-         let _ = ORIG_SETTINGS_LAYER
-            .set(unsafe { std::mem::transmute::<usize, SettingsLayerFn>(trampoline) });
-         log::info!("desktop modal: hooked Settings layer @ {func:#x}");
+      let _ = ORIG_SETTINGS_LAYER.set(orig);
+      log::info!("desktop modal: hooked Settings layer @ {func:#x}");
+   }
+}
+
+fn install_transitions(image: &Image<'static>) {
+   let anim = if crate::X86_CODE {
+      desktop::animation_frame(image)
+   } else {
+      phoenix_sigs::macos::animation_frame(image)
+   };
+   match anim {
+      Ok(addr) => {
+         // SAFETY: resolved GPUI `animation_frame(window, app)` with C/Rust ABI.
+         let _ = ANIMATION_FRAME.set(unsafe {
+            std::mem::transmute::<usize, AnimationFrameFn>(addr)
+         });
+         log::info!("desktop modal: resolved animation_frame @ {addr:#x}");
       },
-      Err(err) => log::warn!("desktop modal: Settings layer hook failed: {err}"),
+      Err(err) => log::info!("desktop modal: animation_frame unavailable ({err}), using timer"),
+   }
+
+   if !crate::X86_CODE {
+      match phoenix_sigs::macos::scale_fade(image) {
+         Ok(sf) => {
+            match sret_wrap(sf.into_any) {
+               Ok(into_any) => {
+                  // SAFETY: resolved `ScaleFade::into_any_element` and layout
+                  // verified against Discord's binary by `sigs`.
+                  let _ = SCALE_FADE.set(unsafe {
+                     ScaleFadeSymbols {
+                        into_any:   std::mem::transmute::<usize, ScaleFadeIntoAnyFn>(into_any),
+                        caller_loc: sf.caller_loc as *const c_void,
+                        layout:     sf.layout,
+                     }
+                  });
+                  log::info!(
+                     "desktop modal: resolved ScaleFade @ {:#x} {:x?}",
+                     sf.into_any,
+                     sf.layout,
+                  );
+               },
+               Err(err) => log::warn!("desktop modal: ScaleFade thunk failed: {err}"),
+            }
+         },
+         Err(err) => log::info!("desktop modal: ScaleFade unavailable ({err}), fading opacity"),
+      }
    }
 }
 
@@ -1533,52 +2130,78 @@ unsafe extern "C" fn overlay_render_detour(
    };
    // SAFETY: always render Discord's own overlay stack first.
    let out = unsafe { orig(sret, workspace, arg3, window, cx) };
+   WINDOW_SEEN.store(true, Ordering::Release);
+   push_modal(sret, window, cx);
+   if !sret.is_null() && !settings_drawn_recently() {
+      let _ = std::panic::catch_unwind(|| {
+         if let Some(notices) = crate::notices::build() {
+            push_overlay(sret, notices);
+         }
+      });
+   }
+   out
+}
+
+/// Appends `div` to the overlays Discord rendered into `sret`.
+fn push_overlay(sret: *mut RawVecAny, div: RawDiv) {
+   let Some(msym) = MODAL_SYM.get() else {
+      return;
+   };
+   let mut any = MaybeUninit::<RawAnyElement>::uninit();
+   gpui::write_any(div, any.as_mut_ptr());
+   // SAFETY: `any` was initialized by `div_into_any` and `vec_push_any` is
+   // Discord's own `Vec::<AnyElement>::push`.
+   unsafe {
+      let mut any = any.assume_init();
+      (msym.vec_push_any)(sret, &raw mut any);
+   }
+}
+
+/// Whether Settings drew within [`SETTINGS_RECENT_MS`], drawing the overlays
+/// over itself. Redraws once that passes, in case it closed.
+fn settings_drawn_recently() -> bool {
+   let at = SETTINGS_AT.load(Ordering::Acquire);
+   if at == 0 || epoch_ms().saturating_sub(at) >= SETTINGS_RECENT_MS {
+      return false;
+   }
+   if !RECHECK.swap(true, Ordering::AcqRel) {
+      std::thread::spawn(|| {
+         std::thread::sleep(std::time::Duration::from_millis(SETTINGS_RECENT_MS + 100));
+         RECHECK.store(false, Ordering::Release);
+         force_redraw();
+      });
+   }
+   true
+}
+
+fn push_modal(sret: *mut RawVecAny, window: *mut c_void, cx: *mut c_void) {
    if !MODAL_OPEN.load(Ordering::Acquire) {
       IN_SETTINGS.store(false, Ordering::Release);
-      return out;
+      return;
    }
    // ponytail: closing Settings under an open modal hides the modal until
    // Settings opens again or the modal is replaced; nothing tells this render
    // apart from one where Settings only replays its last frame.
    if IN_SETTINGS.load(Ordering::Acquire) || sret.is_null() || cx.is_null() {
-      return out;
+      return;
    }
    // Settings rendering after this in the same frame would build the modal a
    // second time, so leave it to Settings while it was just on screen, and look
    // again once that has passed in case it closed.
    // ponytail: Settings left idle past this before a modal opens from a timer
    // still gets one frame with the modal built in both places.
-   let at = SETTINGS_AT.load(Ordering::Acquire);
-   if at != 0 && epoch_ms().saturating_sub(at) < SETTINGS_RECENT_MS {
-      if !RECHECK.swap(true, Ordering::AcqRel) {
-         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(SETTINGS_RECENT_MS + 100));
-            RECHECK.store(false, Ordering::Release);
-            force_redraw();
-         });
-      }
-      return out;
+   if settings_drawn_recently() {
+      return;
    }
 
    let _ = std::panic::catch_unwind(|| {
       // SAFETY: `[cx]` is `*mut App` inside `Context<Workspace>`.
       let app = unsafe { *(cx.cast::<*mut c_void>()) };
-      let Some(msym) = MODAL_SYM.get() else {
-         return;
-      };
-      let Some(scrim) = build_overlay(window, app) else {
-         return;
-      };
-      let mut scrim_any = MaybeUninit::<RawAnyElement>::uninit();
-      gpui::write_any(scrim, scrim_any.as_mut_ptr());
-      // SAFETY: `scrim_any` was initialized by `div_into_any` and
-      // `vec_push_any` is Discord's own `Vec::<AnyElement>::push`.
-      unsafe {
-         let mut scrim_any = scrim_any.assume_init();
-         (msym.vec_push_any)(sret, &raw mut scrim_any);
+      if let Some(scrim) = build_overlay(window, app) {
+         push_overlay(sret, scrim);
+         MODAL_RENDERED.store(true, Ordering::Release);
       }
    });
-   out
 }
 
 unsafe extern "C" fn settings_layer_detour(
@@ -1593,20 +2216,32 @@ unsafe extern "C" fn settings_layer_detour(
    // SAFETY: Discord's own render first, with its own arguments.
    let out = unsafe { orig(sret, layer, window, cx) };
    SETTINGS_AT.store(epoch_ms().max(1), Ordering::Release);
-   if !MODAL_OPEN.load(Ordering::Acquire) {
+   let modal = MODAL_OPEN.load(Ordering::Acquire);
+   if !modal {
       IN_SETTINGS.store(false, Ordering::Release);
-      return out;
    }
    if sret.is_null() || cx.is_null() {
       return out;
    }
-   IN_SETTINGS.store(true, Ordering::Release);
+   if modal {
+      IN_SETTINGS.store(true, Ordering::Release);
+   }
    let _ = std::panic::catch_unwind(|| {
       // SAFETY: `[cx]` is `*mut App` inside the layer's `Context`.
       let app = unsafe { *(cx.cast::<*mut c_void>()) };
-      let Some(scrim) = build_overlay(window, app) else {
-         return;
+      let scrim = if modal {
+         build_overlay(window, app)
+      } else {
+         None
       };
+      // Settings draws over the workspace's overlays, so banners go on it too.
+      let notices = crate::notices::build();
+      if scrim.is_none() && notices.is_none() {
+         return;
+      }
+      if scrim.is_some() {
+         MODAL_RENDERED.store(true, Ordering::Release);
+      }
       let Some(mut over) = gpui::raw_div() else {
          return;
       };
@@ -1623,7 +2258,10 @@ unsafe extern "C" fn settings_layer_detour(
          unsafe { ptr::write(sret, settings) };
          return;
       }
-      gpui::write_any(gpui::push_div(over, scrim), sret);
+      for layer in [scrim, notices].into_iter().flatten() {
+         over = gpui::push_div(over, layer);
+      }
+      gpui::write_any(over, sret);
    });
    out
 }
@@ -1705,13 +2343,16 @@ fn mono_span(text: &str, argb: u32) -> Option<RawDiv> {
    Some(d)
 }
 
-fn plain_text_div(text: &str, argb: u32, font_px: f32) -> Option<RawDiv> {
+/// `text` in `argb`, or without a color of its own when `None`, which takes
+/// the modal's, light or dark with Discord's theme.
+fn plain_text_div(text: &str, argb: Option<u32>, font_px: f32) -> Option<RawDiv> {
    let mut d = gpui::raw_div()?;
-   let hsla = argb_to_hsla(argb);
    gpui::style_div(&mut d, |s| {
       s.length(s.at.font_size, gpui_px(font_px));
       s.length(s.at.line_height, gpui_px(font_px + 5.0));
-      s.hsla(s.at.text_color, hsla);
+      if let Some(argb) = argb {
+         s.hsla(s.at.text_color, argb_to_hsla(argb));
+      }
    });
    let mut any = gpui::str_to_any(text)?;
    if !gpui::push_any(&mut d, &mut any) {
@@ -1815,7 +2456,7 @@ fn build_code_box(
          if let Some(span) = mono_span(line, COL_PLAIN) {
             box_div = gpui::push_div(box_div, span);
          }
-      } else if let Some(div) = plain_text_div(line, COL_PLAIN, 13.0) {
+      } else if let Some(div) = plain_text_div(line, Some(COL_PLAIN), 13.0) {
          box_div = gpui::push_div(box_div, div);
       }
    }
@@ -1831,7 +2472,7 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(8.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, COL_MUTED, 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
@@ -1844,6 +2485,8 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
                   &b.label,
                   if b.danger {
                      BtnVariant::Critical
+                  } else if b.primary {
+                     BtnVariant::Primary
                   } else {
                      BtnVariant::Secondary
                   },
@@ -1858,12 +2501,12 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(6.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, COL_MUTED, 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
             for line in text.lines() {
-               if let Some(d) = plain_text_div(line, COL_PLAIN, 13.5) {
+               if let Some(d) = plain_text_div(line, None, 13.5) {
                   block = gpui::push_div(block, d);
                }
             }
@@ -1878,7 +2521,7 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(6.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, COL_MUTED, 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
@@ -1893,6 +2536,25 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             }
             body = gpui::push_div(body, block);
          },
+         ModalSection::Switch {
+            id,
+            label,
+            description,
+            checked,
+            on_toggle,
+         } => {
+            let action = register_modal_action(ModalAction::Switch(Arc::clone(on_toggle)));
+            if let Some(row) = gpui::build_raw_switch(
+               id,
+               label,
+               description.as_deref(),
+               *checked,
+               &raw const MODAL_SWITCH_VTBL,
+               action,
+            ) {
+               body = gpui::push_div(body, row);
+            }
+         },
       }
    }
    Some(body)
@@ -1905,37 +2567,16 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
 fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
    let msym = MODAL_SYM.get()?;
 
-   // Snapshot active modal & take any one-shot `pending_init` text to push into
-   // the native GPUI `FieldState`.
-   let modal_snapshot = {
-      let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
-      let Some(active) = guard.as_mut() else {
-         MODAL_OPEN.store(false, Ordering::Release);
-         return None;
-      };
-      let snapshot = match active {
-         ActiveModal::Page { spec, .. } | ActiveModal::Choice { spec, .. } => {
-            Snapshot::Page(spec.clone())
-         },
-         ActiveModal::CodeEditor(ed) => {
-            Snapshot::CodeEditor(CodeEditorModal {
-               plugin:       ed.plugin.clone(),
-               pending_init: ed.pending_init.take(),
-               status:       ed.status.clone(),
-            })
-         },
-         ActiveModal::InstallUrl(inst) => {
-            Snapshot::InstallUrl(InstallUrlModal {
-               target:       inst.target.clone(),
-               pending_init: inst.pending_init.take(),
-               status:       inst.status.clone(),
-               busy:         inst.busy,
-            })
-         },
-      };
-      drop(guard);
-      snapshot
-   };
+   let RenderFrame {
+      snapshot: modal_snapshot,
+      progress,
+      animating,
+      interactive,
+      instance_id,
+   } = active_modal().render_frame(Instant::now())?;
+   if animating {
+      schedule_next_frame(window, app);
+   }
 
    MODAL_ACTIONS
       .lock()
@@ -1967,8 +2608,8 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          let mut body = gpui::v_stack(10.0);
          if let Some(ref mut b) = body {
             gpui::style_div(b, |s| s.length(s.at.size[0], W_FULL));
-            if let Some((msg, is_err)) = &ed.status
-               && let Some(st) = plain_text_div(msg, if *is_err { COL_ERROR } else { COL_OK }, 13.0)
+            if let Some((msg, color)) = ed.status.line()
+               && let Some(st) = plain_text_div(msg, Some(color), 13.0)
             {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), st);
             }
@@ -2007,7 +2648,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                }
             } else if let Some(msg) = plain_text_div(
                "Native TextArea could not be resolved on this Discord build.",
-               COL_ERROR,
+               Some(COL_ERROR),
                13.5,
             ) {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), msg);
@@ -2102,13 +2743,13 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                }
             } else if let Some(msg) = plain_text_div(
                "Native TextInput could not be resolved on this Discord build.",
-               COL_ERROR,
+               Some(COL_ERROR),
                13.5,
             ) {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), msg);
             }
-            if let Some((msg, is_err)) = &inst.status
-               && let Some(st) = plain_text_div(msg, if *is_err { COL_ERROR } else { COL_OK }, 13.0)
+            if let Some((msg, color)) = inst.status.line()
+               && let Some(st) = plain_text_div(msg, Some(color), 13.0)
             {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), st);
             }
@@ -2123,7 +2764,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          ) {
             footer.push(btn);
          }
-         if !inst.busy
+         if !matches!(inst.status, FieldStatus::Working(_))
             && let Some(btn) = make_modal_button(
                "sunbird-url-install",
                match inst.target {
@@ -2169,7 +2810,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
    m.put(at.on_close + 8, &raw const MODAL_CLOSE_VTBL);
    // SAFETY: `modal_child_div`, `modal_footer_button` and `modal_into_any`
    // take the `Modal` by value and return it through buffers that fit it.
-   let mut modal_any = unsafe {
+   let modal_any = unsafe {
       let mut next = RawModal::zeroed();
       (msym.modal_child_div)(&raw mut next, &raw mut m, &raw mut body_div);
       let mut m = next;
@@ -2185,8 +2826,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
       any.assume_init()
    };
 
-   // Build full-window scrim overlay (`position: absolute; inset: 0; flex;
-   // center; bg rgba(0,0,0,0.68)`).
+   let alpha = progress.clamp(0.0, 1.0);
    let mut scrim = gpui::raw_div()?;
    gpui::style_div(&mut scrim, |s| {
       s.set(s.at.position, POSITION_ABSOLUTE);
@@ -2195,17 +2835,32 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
       s.set(s.at.display, DISPLAY_FLEX);
       s.set(s.at.align_items, ALIGN_CENTER);
       s.set(s.at.justify_content, ALIGN_CENTER);
-      s.solid_background([0.0, 0.0, 0.0, 0.68]);
+      s.solid_background([0.0, 0.0, 0.0, 0.68 * alpha]);
    });
-   // The card wraps the modal at its own size, so a press inside it can be told
-   // apart from one on the scrim around it.
    let mut card = gpui::raw_div()?;
-   gpui::style_div(&mut card, |s| s.set(s.at.display, DISPLAY_FLEX));
-   if !gpui::push_any(&mut card, &mut modal_any) {
+   // Keep ScaleFade mounted at progress 1.0 once settled so layout does not shift.
+   let mut wrapped = match wrap_scale_fade(modal_any, progress, instance_id) {
+      Ok(scaled) => {
+         gpui::style_div(&mut card, |s| s.set(s.at.display, DISPLAY_FLEX));
+         scaled
+      },
+      Err(raw) => {
+         gpui::style_div(&mut card, |s| {
+            s.set(s.at.display, DISPLAY_FLEX);
+            if alpha < 1.0 {
+               s.float(s.at.opacity, alpha);
+            }
+         });
+         raw
+      },
+   };
+   if !gpui::push_any(&mut card, &mut wrapped) {
       return None;
    }
-   on_mouse_down(&mut scrim, &SCRIM_PRESS_VTBL);
-   on_mouse_down(&mut card, &CARD_PRESS_VTBL);
+   if interactive {
+      on_mouse_down(&mut scrim, &SCRIM_PRESS_VTBL);
+      on_mouse_down(&mut card, &CARD_PRESS_VTBL);
+   }
 
    Some(gpui::push_div(scrim, card))
 }

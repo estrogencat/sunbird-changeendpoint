@@ -8,9 +8,9 @@ use phoenix_hook::{
 
 use crate::Found;
 
-const ADOPT_ANCHOR: &[u8] = b"gateway connect adopted the early socket";
-const START_SEND_PANIC: &[u8] = b"assertion failed: this.state.is_none()";
-const START_SEND_SLOT_OFFSET: usize = 32;
+pub(crate) const ADOPT_ANCHOR: &[u8] = b"gateway connect adopted the early socket";
+pub(crate) const START_SEND_PANIC: &[u8] = b"assertion failed: this.state.is_none()";
+pub(crate) const START_SEND_SLOT_OFFSET: usize = 32;
 
 // WsMessage::Text(String) tag and payload offset in libdiscord_gateway::transport
 pub const WS_MESSAGE_TEXT_TAG: u64 = 2;
@@ -29,12 +29,18 @@ impl DesktopGatewaySend {
       }
 
       let anchor = crate::one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
-      let lea = *crate::desktop::lea_refs(image, anchor)
-         .first()
-         .ok_or("gateway adopt anchor is never loaded")?;
-      let (open_fn, open_end) = image
-         .function_bounds(lea)
-         .ok_or("gateway connect_adopting has no unwind entry")?;
+      let loads = crate::desktop::lea_refs(image, anchor);
+      if loads.is_empty() {
+         return Err("gateway adopt anchor is never loaded".to_owned());
+      }
+      let mut opens = loads
+         .into_iter()
+         .filter_map(|lea| image.function_bounds(lea))
+         .collect::<Vec<_>>();
+
+      opens.sort_unstable();
+      opens.dedup();
+      let (open_fn, open_end) = crate::one("gateway connect_adopting", &opens)?;
 
       let panic_addrs = image.find_bytes(START_SEND_PANIC);
       if panic_addrs.is_empty() {
@@ -98,7 +104,7 @@ fn rip_leas(image: &Image<'_>, start: usize, end: usize) -> Vec<usize> {
    out
 }
 
-fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option<usize> {
+pub(crate) fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option<usize> {
    if !vtable.is_multiple_of(8) {
       return None;
    }
@@ -170,7 +176,7 @@ fn parse_ok_tag(rhs: &str) -> Option<u64> {
    }
 }
 
-fn find_sink_slots(image: &Image<'_>, start_send: usize) -> Vec<usize> {
+pub(crate) fn find_sink_slots(image: &Image<'_>, start_send: usize) -> Vec<usize> {
    let mut slots = Vec::new();
    for slot in image.pointers_to(start_send) {
       let Some(vtable) = slot.checked_sub(START_SEND_SLOT_OFFSET) else {

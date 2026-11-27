@@ -13,9 +13,10 @@ use crate::{
    js::{
       Engine,
       Registry,
-      drain,
       http::response_object,
+      saw,
    },
+   permissions::Links,
    store,
 };
 
@@ -23,7 +24,7 @@ impl Engine {
    /// Settles promise `id` with what its worker thread produced, and runs what
    /// awaited it.
    pub fn settle(&self, id: u64, settlement: Settlement) {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let Some((resolve, reject)) = ctx
             .userdata::<Registry<'_>>()
             .and_then(|registry| registry.pending.borrow_mut().remove(&id))
@@ -31,7 +32,16 @@ impl Engine {
             return;
          };
          let value: rquickjs::Result<Result<Value<'_>, String>> = match settlement {
-            Settlement::Fetch(Ok(response)) | Settlement::Discord(Ok(response)) => {
+            Settlement::Fetch(Ok(response)) => {
+               response_object(&ctx, &response).map(|object| Ok(object.into_value()))
+            },
+            Settlement::Discord(Ok(response)) => {
+               // Discord's reply, so its URLs vouch for a plugin's rewrites as the
+               // app's own replies do. Not its errors, which quote back whatever
+               // value the plugin sent.
+               if (200..300).contains(&response.status) {
+                  saw(&ctx, &Links::scan(&String::from_utf8_lossy(&response.body)));
+               }
                response_object(&ctx, &response).map(|object| Ok(object.into_value()))
             },
             Settlement::Int(Ok(number)) => Ok(Ok(Value::new_int(ctx.clone(), number))),
@@ -63,7 +73,6 @@ impl Engine {
             log::error!("settling promise {id}: {err}");
          }
       });
-      drain(&self.runtime);
    }
 }
 

@@ -150,7 +150,7 @@ def extract_accessibility_ids(repo_root: Path) -> list[str]:
 
 
 def load_props_in(repo_root: Path) -> list[str]:
-    return re.findall(r'"([^"]+)"', (repo_root / "crates" / "ui" / "src" / "props.in").read_text("utf-8"))
+    return re.findall(r'"([^"]+)"', (repo_root / "crates" / "ui-mobile" / "src" / "props.in").read_text("utf-8"))
 
 
 WIRE_TYPE_HINTS: dict[str, list[str]] = {
@@ -331,11 +331,15 @@ def main() -> None:
         default=str(repo_root / "docs"),
         help="Output directory for JSON and Markdown reference files",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Only compare the APK's prop table with props.in, exiting 1 when a prop moved",
+    )
     args = parser.parse_args()
 
     apk_path = Path(args.apk)
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(apk_path) as zf:
         dex = zf.read("classes.dex")
@@ -363,6 +367,14 @@ def main() -> None:
         print(f"props.in index {shifted} is {props_in[shifted]!r}, the APK has {props_table[shifted]!r}: regenerate props.in")
     elif len(props_table) != len(props_in):
         print(f"the APK appends {len(props_table) - len(props_in)} props after props.in's {len(props_in)}")
+    if args.check:
+        # Props go by position, so only appended ones leave props.in's indices right.
+        if len(props_table) < len(props_in):
+            print(f"the APK has {len(props_table)} props, fewer than props.in's {len(props_in)}")
+        if shifted is not None or len(props_table) < len(props_in):
+            raise SystemExit(1)
+        print(f"props.in's {len(props_in)} props keep their indices")
+        return
 
     # Parse hh.jb modules, methods, and @events
     mod_re = re.compile(r"^([A-Z][A-Za-z0-9_]+) (\d+)$")
@@ -413,6 +425,7 @@ def main() -> None:
         "accessibilityIds": aids,
     }
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"phoenix-{args.version_code}.json"
     md_path = out_dir / f"phoenix-{args.version_code}.md"
     json_path.write_text(json.dumps(schema, indent=2) + "\n", encoding="utf-8")

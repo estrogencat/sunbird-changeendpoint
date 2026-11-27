@@ -1,8 +1,3 @@
-// @description Fixes Spacebar payloads that Phoenix cannot decode
-// @version 0.4.1
-// @author softgaypaws
-// @unlisted
-
 const seen = new Set();
 const decorations = phoenix.storage.get("decorations") ?? {};
 const listIds = new Map();

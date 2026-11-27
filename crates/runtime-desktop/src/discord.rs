@@ -462,6 +462,11 @@ unsafe extern "C" fn owned_bytes_drop(data: *mut (), _ptr: *const u8, _len: usiz
 // Vtable installation & detours
 // ---------------------------------------------------------------------------
 
+/// Whether [`install`] hooked Discord's HTTP send.
+pub fn hooked() -> bool {
+   INSTALLED.get().is_some()
+}
+
 /// Locates Desktop Phoenix's `ReqwestTransport` and `SendFuture` vtable slots
 /// and installs request/response interception.
 pub fn install(image: &Image<'static>) {
@@ -470,13 +475,25 @@ pub fn install(image: &Image<'static>) {
    } else {
       phoenix_sigs::macos::http_transport(image)
    };
-   let found = match found {
+   let mut found = match found {
       Ok(found) => found,
       Err(err) => {
          log::warn!("discord desktop: HTTP transport: {err}");
          return;
       },
    };
+   if !crate::X86_CODE
+      && found.host_alloc.is_none()
+      && let Some(alloc_or_oom) = crate::gpui::alloc_or_oom_addr()
+   {
+      match phoenix_sigs::macos::host_allocator(image, alloc_or_oom) {
+         Ok((alloc, dealloc)) => {
+            found.host_alloc = Some(alloc);
+            found.host_dealloc = Some(dealloc);
+         },
+         Err(err) => log::warn!("discord desktop: {err}, response bodies can't grow"),
+      }
+   }
    // Discord's API client calls `send` directly rather than through the
    // vtable, so `send` is hooked in place and the detour calls the trampoline.
    // It opens with the same register saves and `sub rsp` as a render frame.

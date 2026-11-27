@@ -267,30 +267,24 @@ pub mod writer {
 
    static WRITER: OnceLock<(SerializeFn, DeallocFn, usize)> = OnceLock::new();
 
-   /// Locates the writer off the startup path: finding the free scans all of
-   /// Discord's code, 0.7 s on 2233.
+   /// Locates the writer using the warm arm64 reference index during startup.
    #[cfg(target_os = "macos")]
-   pub fn install() {
-      std::thread::spawn(|| {
-         let found = phoenix_runtime::target()
-            .map_err(|err| err.to_string())
-            .and_then(|image| phoenix_sigs::macos::message_writer(&image));
-         match found {
-            Ok(found) => {
-               // SAFETY: shape-checked by `sigs`, with these Rust-ABI
-               // signatures, which arm64 passes like the C ABI.
-               let _ = WRITER.set(unsafe {
-                  (
-                     std::mem::transmute::<usize, SerializeFn>(found.serialize),
-                     std::mem::transmute::<usize, DeallocFn>(found.dealloc),
-                     found.message_id,
-                  )
-               });
-               log::info!("message json: {found:x?}");
-            },
-            Err(err) => log::warn!("message json: {err}, message actions read the cache"),
-         }
-      });
+   pub fn install(image: &phoenix_hook::image::Image<'_>) {
+      match phoenix_sigs::macos::message_writer(image) {
+         Ok(found) => {
+            // SAFETY: shape-checked by `sigs`, with these Rust-ABI
+            // signatures, which arm64 passes like the C ABI.
+            let _ = WRITER.set(unsafe {
+               (
+                  std::mem::transmute::<usize, SerializeFn>(found.serialize),
+                  std::mem::transmute::<usize, DeallocFn>(found.dealloc),
+                  found.message_id,
+               )
+            });
+            log::info!("message json: {found:x?}");
+         },
+         Err(err) => log::warn!("message json: {err}, message actions read the cache"),
+      }
    }
 
    /// # Safety

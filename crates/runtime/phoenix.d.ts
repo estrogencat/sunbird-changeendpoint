@@ -917,7 +917,8 @@ declare namespace Phoenix {
     /// Intercepts outgoing gateway frames for numeric opcode `op` (desktop only).
     /// Receives the frame's `d` payload; return a replacement payload, `false` to
     /// drop the frame, or nothing to pass the (possibly mutated) payload on.
-    /// Identify (2) and Resume (6) carry credentials and cannot be hooked.
+    /// Identify (2) and Resume (6) carry credentials and cannot be hooked. Other opcodes need
+    /// `hooks`.
     onSend<Op extends keyof GatewaySendPayloads>(
       op: Op,
       handler: (payload: GatewaySendPayloads[Op]) => GatewaySendPayloads[Op] | false | void
@@ -1009,6 +1010,7 @@ declare namespace Phoenix {
   }
 
   interface Api {
+    /// Holds every hook point with `gateway`, and none without.
     readonly gateway: Gateway;
     /// Observes a hook point after the client handled it.
     on<P>(sig: Sig<P>, listener: (payload: P) => void): void;
@@ -1019,26 +1021,85 @@ declare namespace Phoenix {
     /// Like `dispatch`, for use outside a gateway hook. The payload reaches the client's handler
     /// just before the next gateway event it handles, usually well under a second later.
     enqueue<P>(sig: Sig<P>, payload: Partial<P>): void;
+    /// Present with `messages`.
     readonly messages: Messages;
+    /// The raw view tree methods are present with `hooks`. Icon URLs must point at Discord's CDN
+    /// without `http`.
     readonly ui: Ui;
     readonly commands: Commands;
     readonly log: Log;
     readonly storage: Storage;
     readonly settings: Settings;
     /// Read-only SQL over Phoenix's own cache (`files/store/<account>/cache.sqlite`), at most
-    /// 10000 rows. Arguments bind to `?` as text.
+    /// 10000 rows. Arguments bind to `?` as text. Present with `gateway`.
     readonly stores: Stores;
     /// Runs when the plugin is turned off, reloaded or removed. Hooks and settings go away on their
     /// own, anything else the plugin started is its to undo here.
     onUnload(cleanup: () => void): void;
+    /// Reaches any host with `http`, and throws without it.
     fetch(url: string, init?: FetchInit): Promise<FetchResponse>;
     /// Discord's API through the app's own HTTP client, with the app's session headers. Paths are
     /// relative to the API base, like `/users/@me`. Rejects until the app has made a request of its
-    /// own.
+    /// own. Requests, `me`, `authorize` and interceptors need `discord`.
     readonly discord: Discord;
-    /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`).
+    /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`). Present with `hooks`.
     readonly bridge: Bridge;
+    /// `.theme.css` themes on Desktop Phoenix.
+    readonly themes?: Themes;
   }
+
+  interface InstalledTheme {
+    id: string;
+    name: string;
+    description?: string;
+    authors: string[];
+    active: boolean;
+  }
+
+  /// A theme sets `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--bg-elevated`,
+  /// `--accent-color`, `--text-normal`, `--text-muted`, `--ui-border-color`, `--radius-scale` and
+  /// `--override-nitro` in a `.theme.css` file. Unloading the plugin that applied one brings back
+  /// Discord's colors.
+  interface Themes {
+    /// Whether this Discord build's renderer could be themed.
+    supported(): boolean;
+    /// The `*.theme.css` files in the themes folder, by file name.
+    list(): InstalledTheme[];
+    /// Applies a theme from `list()`.
+    apply(id: string): void;
+    /// Applies stylesheet text, such as a bundled preset. Returns whether it themes anything.
+    setCss(css: string): boolean;
+    clear(): void;
+    openThemesDir(): void;
+  }
+
+  /// What `plugins/<name>/manifest.ts` exports as default. `web/tools/bundle-plugins.ts` writes it
+  /// as the `// @` lines that open the bundle, which the runtime and the site read without running
+  /// the plugin. A plugin installed from elsewhere can carry those lines by hand.
+  interface Manifest {
+    description: string;
+    version: string;
+    author: string;
+    /// Stays off until the user turns it on.
+    enabled?: false;
+    /// Shown on the site before the user installs it.
+    warning?: string;
+    /// Ships only in dev builds, never on the site or in its updates.
+    unlisted?: true;
+    /// The oldest Sunbird the plugin runs on, in the loader's dotted form like
+    /// `2026.11.27`. Updates needing a newer loader wait, and such a copy fails
+    /// to load, until Phoenix Unlock updates.
+    minSunbird?: string;
+    permissions?: Permission[];
+  }
+
+  /// What the plugin's `phoenix` object reaches. Anything left out is missing or refused.
+  /// - `gateway` every hook point and `stores`.
+  /// - `discord` any `phoenix.discord` request or interceptor, made as the user.
+  /// - `http` `fetch` to any host, and images and links Discord draws from any host.
+  /// - `messages` `phoenix.messages`, which reads and rewrites message and composer text.
+  /// - `hooks` `bridge`, the raw view tree and `gateway.onSend`, plus everything above.
+  type Permission = "gateway" | "discord" | "http" | "messages" | "hooks";
 
   interface Bridge {
     /// Invokes a native Phoenix host module method by its `hh.jb` numeric IDs (see
@@ -1360,13 +1421,15 @@ declare namespace Phoenix {
   interface NotifyOptions {
     title: string;
     body?: string;
-    /// A `res://` drawable URI (defaults to `res://ic_mana_puzzle_piece_plus`).
+    /// A `res://` drawable URI (defaults to `res://ic_mana_puzzle_piece_plus`). Not drawn on
+    /// desktop.
     icon?: Icon;
-    /// 32-bit ARGB color for the leading icon badge (defaults to Discord Blurple).
+    /// 32-bit ARGB color for the leading icon badge, a dot on desktop (defaults to Discord
+    /// Blurple).
     accent?: number;
     /// Auto-dismiss after this many milliseconds (defaults to 5000; pass 0 to stay until dismissed).
     durationMs?: number;
-    /// Runs when the notification banner is tapped.
+    /// Runs when the notification banner is tapped, or on desktop when its Open button is pressed.
     onPress?(): void;
   }
 
@@ -1374,7 +1437,9 @@ declare namespace Phoenix {
   /// land a moment after the screen they belong to. Everything goes away when the plugin is
   /// turned off.
   interface Ui {
-    /// In the chat header, left of search.
+    /// In the chat header, left of search. On Windows Desktop Phoenix, in the channel toolbar after the
+    /// member list button (where Discord shows one), with `label` as its tooltip and `icon` mapped
+    /// to Mana's icon of that name (`res://ic_mana_panel_open` is `PanelOpen`); `tint` is ignored.
     addHeaderButton(options: ButtonOptions): ButtonRemover;
     /// In the message box, left of the emoji button.
     addComposerButton(options: ButtonOptions): ButtonRemover;
@@ -1452,6 +1517,20 @@ declare namespace Phoenix {
     /// Message Requests row) until the returned function runs. The requests themselves stay
     /// listed. Desktop only.
     hideCount?(count: "friendRequests" | "messageRequests"): Remover;
+    /// Collapses the channel sidebar to the server rail until the returned function runs, the
+    /// way Discord's member list toggle hides members. The width the user dragged it to comes
+    /// back on restore. Available on Windows Desktop Phoenix builds with a recognized sidebar.
+    collapseChannels?(): Remover;
+    /// Runs `run` when `key` (one letter or digit) is pressed with the given modifiers while
+    /// Discord is focused, and keeps the key from Discord. `ctrl` or `alt` is required.
+    /// Desktop Phoenix on Windows only; a no-op elsewhere.
+    addShortcut?(options: {
+      key: string;
+      ctrl?: boolean;
+      shift?: boolean;
+      alt?: boolean;
+      run(): void;
+    }): Remover;
     /// Observes or intercepts any Phoenix view event (e.g. `"rowDoubleTap"`, `"press"`),
     /// filtered by event name in Rust. With `intercept: true`, return `false` to pass the event
     /// back to Phoenix; any other return consumes it.
@@ -1486,8 +1565,9 @@ declare namespace Phoenix {
     /// Mounts a raw Phoenix UI subtree onto `parentId` (or `"root"` for the root view). Returns a
     /// function that unmounts and deletes all created nodes.
     mount(parentId: number | "root", node: MountNode, options?: MountOptions): Remover;
-    /// Shows a native Discord in-app notification banner at the top of the screen. Returns a
-    /// function that dismisses it early.
+    /// Shows a native Discord in-app notification banner at the top of the screen, or in the
+    /// bottom right corner on desktop, under the plugin's name. Desktop shows the three newest at
+    /// once and the others after one is closed. Returns a function that dismisses it early.
     notify(options: NotifyOptions): () => void;
     /// Suppresses haptic feedback across the app (host `Haptics` calls and view haptic props on
     /// mobile; no-op on desktop). Absent on runtimes from before it. Call the returned function
@@ -1495,7 +1575,8 @@ declare namespace Phoenix {
     disableHaptics?(): Remover;
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
-    /// A short message at the bottom of the screen, or in a banner at the top on iOS.
+    /// A short message at the bottom of the screen, in a banner at the top on iOS, or in a banner
+    /// in the bottom right corner on desktop.
     toast(text: string): void;
   }
 

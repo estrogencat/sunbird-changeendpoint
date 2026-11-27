@@ -8,6 +8,9 @@
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- --no-runtime
 #   curl -fsSL https://assets.sunbird.tools/plugins/sunbird-linux.sh | sh -s -- --uninstall
 #
+# The launcher runs a newer copy of this with --launcher-only, which rewrites
+# the launcher and the desktop entries and keeps the loader it has.
+#
 # SUNBIRD_SITE points it at a local server for testing.
 set -eu
 
@@ -18,16 +21,25 @@ entry=$data/applications/sunbird.desktop
 gate_entry=$data/applications/sunbird-gate-only.desktop
 
 if [ "${1:-}" = --uninstall ]; then
-   rm -rf "$home" "$entry" "$gate_entry"
+   # The login entry Sunbird's settings add (`crates/ui-desktop/src/linux.rs`).
+   rm -rf "$home" "$entry" "$gate_entry" "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/sunbird.desktop"
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
 
-no_runtime=
-while [ "${1:-}" = --no-runtime ] || [ "${1:-}" = --gate-only ]; do
-   no_runtime=1
+no_runtime= launcher_only=
+while :; do
+   case ${1:-} in
+      --no-runtime | --gate-only) no_runtime=1 ;;
+      --launcher-only) launcher_only=1 ;;
+      *) break ;;
+   esac
    shift
 done
+# A refresh keeps the menu entry starting without the runtime if it did.
+if [ -n "$launcher_only" ] && grep -q '^Exec=.* --no-runtime' "$entry" 2>/dev/null; then
+   no_runtime=1
+fi
 
 # What the site serves is loaded into Discord, so only https, or plain http to
 # this machine for testing.
@@ -85,14 +97,41 @@ q() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 mkdir -p "$home" "$data/applications"
 # The launcher brings the loader up to the site's version before each start,
 # and keeps the one it has when offline. Each run downloads to its own file, so
-# two starts at once never load a half-written one.
-cat >"$home/sunbird" <<EOF
+# two starts at once never load a half-written one. It is written beside and
+# renamed into place, since a running launcher may be what rewrites it.
+cat >"$home/sunbird.new" <<EOF
 #!/bin/sh
 home=$(q "$home")
 site=$(q "$site")
+discord=$(q "$discord")
 fetch() { curl -fsSL --proto $proto --proto-redir =https "\$@" 2>/dev/null; }
-version=\$(fetch --max-time 5 "\$site/version.json" |
-   sed -n 's/.*"loader": *"\([^"]*\)".*/\1/p')
+# CRC-32 as version.json lists it: gzip's trailer holds it, little-endian.
+crc32() { gzip -c <"\$1" | tail -c8 | od -An -N4 -tu4 | tr -d ' \\n'; }
+# Sunbird's settings write this into the runtime's home; a loader that is
+# already here is kept when they turn updates off. --update always checks.
+conf="\${LIBDISCORD_DATA_DIR:-\${XDG_DATA_HOME:-\$HOME/.local/share}/discord-phoenix}/sunbird/launcher.conf"
+manifest= version=
+if [ "\${1:-}" = --update ] || [ ! -f "\$home/libphoenix.so" ] ||
+   ! grep -qx 'auto_update=false' "\$conf" 2>/dev/null; then
+   manifest=\$(fetch --max-time 5 "\$site/version.json")
+   version=\$(printf '%s\\n' "\$manifest" | sed -n 's/.*"loader": *"\([^"]*\)".*/\1/p')
+fi
+# A changed installer on the site rewrites this launcher, and the new one
+# carries on with this start. Any failure keeps this one.
+crc=\$(printf '%s\\n' "\$manifest" | sed -n 's/.*"sunbird-linux.sh": *\([0-9]*\).*/\1/p')
+if [ -n "\$crc" ] && [ "\${1:-}" != --update ] && [ -z "\${SUNBIRD_SELF_UPDATED:-}" ] &&
+   ! grep -qx 'auto_update=false' "\$conf" 2>/dev/null &&
+   [ "\$crc" != "\$(cat "\$home/installer.crc" 2>/dev/null)" ]; then
+   tmp=\$(mktemp "\$home/installer.XXXXXX")
+   if fetch --max-time 30 -o "\$tmp" "\$site/plugins/sunbird-linux.sh" &&
+      [ "\$(head -c 9 "\$tmp")" = '#!/bin/sh' ] && [ "\$(crc32 "\$tmp")" = "\$crc" ] &&
+      SUNBIRD_SITE=\$site sh "\$tmp" --launcher-only "\$discord" >/dev/null 2>&1; then
+      rm -f "\$tmp"
+      exec env SUNBIRD_SELF_UPDATED=1 "\$home/sunbird" "\$@"
+   fi
+   rm -f "\$tmp"
+fi
+unset SUNBIRD_SELF_UPDATED
 if [ -n "\$version" ] && [ "\$version" != "\$(cat "\$home/version" 2>/dev/null)" ]; then
    tmp=\$(mktemp "\$home/libphoenix.so.XXXXXX")
    if fetch --max-time 60 -o "\$tmp" "\$site/plugins/libphoenix-linux-x86_64.so"; then
@@ -109,7 +148,6 @@ while [ "\${1:-}" = --no-runtime ] || [ "\${1:-}" = --gate-only ]; do
 done
 # A second Discord hands off to the running one and exits, so one running
 # without Sunbird is restarted with it.
-discord=$(q "$discord")
 pids= sunbird=
 for p in /proc/[0-9]*; do
    if [ "\$(readlink "\$p/exe" 2>/dev/null)" = "\$discord" ] ||
@@ -131,7 +169,16 @@ fi
    export LD_PRELOAD="\$home/libphoenix.so\${LD_PRELOAD:+:\$LD_PRELOAD}"
 exec "\$discord" "\$@"
 EOF
-chmod +x "$home/sunbird"
+chmod +x "$home/sunbird.new"
+mv -f "$home/sunbird.new" "$home/sunbird"
+# The launcher compares this with the site's installer to know when to
+# replace itself. A piped install has no file to hash, so its first start
+# fetches the installer once.
+if [ "${0#*/}" != "$0" ] && [ -f "$0" ]; then
+   gzip -c <"$0" | tail -c8 | od -An -N4 -tu4 | tr -d ' \n' >"$home/installer.crc"
+else
+   rm -f "$home/installer.crc"
+fi
 
 exec_args=
 [ -n "$no_runtime" ] && exec_args=" --no-runtime"
@@ -158,6 +205,11 @@ Terminal=false
 Categories=Network;InstantMessaging;
 EOF
 command -v update-desktop-database >/dev/null && update-desktop-database "$data/applications" || true
+
+if [ -n "$launcher_only" ] && [ -f "$home/libphoenix.so" ]; then
+   echo "Sunbird's launcher is refreshed."
+   exit 0
+fi
 
 # First download now, so a missing network shows up here rather than as a
 # Discord without Sunbird.

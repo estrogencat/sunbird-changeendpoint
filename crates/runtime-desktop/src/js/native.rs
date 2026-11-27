@@ -112,13 +112,33 @@ impl From<&x86::CodeRef> for Site {
    }
 }
 
-/// Code references from x86-64 decoding, none when Discord's code is arm64,
-/// where decoding it as x86 would only list noise.
-fn x86_refs(refs: impl FnOnce() -> Vec<x86::CodeRef>) -> Vec<Site> {
-   if !X86_CODE {
-      return Vec::new();
+/// Code references targeting `addr`, using x86-64 or arm64 decoding.
+fn code_refs(image: &Image<'_>, addr: usize, literal: bool) -> Vec<Site> {
+   if X86_CODE {
+      let refs = if literal {
+         x86::literal_loads(image, addr)
+      } else {
+         x86::code_refs(image, addr..addr + 1)
+      };
+      return refs.iter().take(MAX_LIST).map(Site::from).collect();
    }
-   refs().iter().take(MAX_LIST).map(Site::from).collect()
+   let range = addr..addr + 1;
+   phoenix_hook::arm64::code_refs(image, std::slice::from_ref(&range))
+      .into_iter()
+      .take(MAX_LIST)
+      .map(|(site, _)| {
+         let func = image.function_containing(site).unwrap_or(site);
+         let text = image
+            .read(site, 4)
+            .and_then(|bytes| phoenix_hook::arm64::disasm(bytes, site, 1).into_iter().next())
+            .map_or_else(String::new, |(_, text)| text);
+         Site {
+            at:   place(site),
+            func: place(func),
+            text,
+         }
+      })
+      .collect()
 }
 
 /// The console's `phoenix.native`.
@@ -159,7 +179,7 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             .map(|at| {
                Found {
                   at:    place(at),
-                  loads: x86_refs(|| x86::literal_loads(image, at)),
+                  loads: code_refs(image, at, true),
                }
             })
             .collect::<Vec<_>>();
@@ -177,7 +197,7 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
          let image = image().ok_or_else(|| Exception::throw_internal(&ctx, "not started"))?;
          let addr = parse(&ctx, &addr)?;
          let refs = Refs {
-            code:     x86_refs(|| x86::code_refs(image, addr..addr + 1)),
+            code:     code_refs(image, addr, false),
             pointers: image
                .pointers_to(addr)
                .into_iter()
@@ -205,14 +225,17 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
       Function::new(
          ctx.clone(),
          |ctx: Ctx<'js>, addr: Value<'js>, count: Opt<usize>| {
-            if !X86_CODE {
-               return Err(Exception::throw_internal(
-                  &ctx,
-                  "phoenix.native.dis decodes x86-64, and this Discord is arm64",
-               ));
-            }
             let addr = parse(&ctx, &addr)?;
             let count = count.0.unwrap_or(20).min(500);
+            if !X86_CODE {
+               let code = Os::read_memory(addr, count * 4).unwrap_or_default();
+               return Ok::<_, rquickjs::Error>(
+                  phoenix_hook::arm64::disasm(&code, addr, count)
+                     .into_iter()
+                     .map(|(at, text)| format!("{}  {text}", place(at)))
+                     .collect::<Vec<_>>(),
+               );
+            }
             let code = Os::read_memory(addr, count * 16).unwrap_or_default();
             Ok::<_, rquickjs::Error>(
                x86::disasm(&code, addr, count)

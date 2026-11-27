@@ -26,6 +26,12 @@ use std::{
    time::Duration,
 };
 
+pub use phoenix_wire::names::{
+   Event,
+   Field,
+   Method,
+   Module,
+};
 use phoenix_wire::{
    DispatchEvent,
    HostCall,
@@ -39,153 +45,6 @@ use crate::bridge::{
    self,
    Action,
 };
-
-/// A host module's method, named `Module.method`.
-#[derive(Clone, Copy)]
-pub enum Method {
-   NetworkingRequest,
-   LinkingOpenUrl,
-   SystemOverlayToast,
-   ClipboardSetString,
-   MediaPickerPick,
-   MediaPickerRead,
-   MediaPickerRelease,
-   TimingSet,
-}
-
-impl Method {
-   const ALL: [Self; 8] = [
-      Self::NetworkingRequest,
-      Self::LinkingOpenUrl,
-      Self::SystemOverlayToast,
-      Self::ClipboardSetString,
-      Self::MediaPickerPick,
-      Self::MediaPickerRead,
-      Self::MediaPickerRelease,
-      Self::TimingSet,
-   ];
-
-   const fn name(self) -> &'static str {
-      match self {
-         Self::NetworkingRequest => "Networking.request",
-         Self::LinkingOpenUrl => "Linking.openURL",
-         Self::SystemOverlayToast => "SystemOverlay.toast",
-         Self::ClipboardSetString => "Clipboard.setString",
-         Self::MediaPickerPick => "MediaPicker.pick",
-         Self::MediaPickerRead => "MediaPicker.read",
-         Self::MediaPickerRelease => "MediaPicker.release",
-         Self::TimingSet => "Timing.set",
-      }
-   }
-
-   fn module(self) -> &'static str {
-      let name = self.name();
-      name.split_once('.').map_or(name, |(module, _)| module)
-   }
-}
-
-/// A host event Phoenix's Java side dispatches to the guest.
-#[derive(Clone, Copy)]
-pub enum Event {
-   Http,
-   Picked,
-   Read,
-   Timer,
-   Ws,
-}
-
-impl Event {
-   const ALL: [Self; 5] = [Self::Http, Self::Picked, Self::Read, Self::Timer, Self::Ws];
-
-   const fn name(self) -> &'static str {
-      match self {
-         Self::Http => "@http",
-         Self::Picked => "@picked",
-         Self::Read => "@read",
-         Self::Timer => "@timer",
-         Self::Ws => "@ws",
-      }
-   }
-}
-
-/// A field of a host call's or event's arguments.
-#[derive(Clone, Copy)]
-pub enum Field {
-   Id,
-   Error,
-   Method,
-   Url,
-   Headers,
-   Status,
-   Text,
-   Kind,
-   Max,
-   Extensions,
-   Files,
-   Handle,
-   Handles,
-   Name,
-   Denied,
-   Delay,
-}
-
-impl Field {
-   const ALL: [Self; 16] = [
-      Self::Id,
-      Self::Error,
-      Self::Method,
-      Self::Url,
-      Self::Headers,
-      Self::Status,
-      Self::Text,
-      Self::Kind,
-      Self::Max,
-      Self::Extensions,
-      Self::Files,
-      Self::Handle,
-      Self::Handles,
-      Self::Name,
-      Self::Denied,
-      Self::Delay,
-   ];
-
-   const fn name(self) -> &'static str {
-      match self {
-         Self::Id => "id",
-         Self::Error => "error",
-         Self::Method => "method",
-         Self::Url => "url",
-         Self::Headers => "headers",
-         Self::Status => "status",
-         Self::Text => "text",
-         Self::Kind => "kind",
-         Self::Max => "max",
-         Self::Extensions => "extensions",
-         Self::Files => "files",
-         Self::Handle => "handle",
-         Self::Handles => "handles",
-         Self::Name => "name",
-         Self::Denied => "denied",
-         Self::Delay => "delay",
-      }
-   }
-}
-
-/// A host module whose calls phoenix matches by module number alone.
-#[derive(Clone, Copy)]
-pub enum Module {
-   Haptics,
-}
-
-impl Module {
-   const ALL: [Self; 1] = [Self::Haptics];
-
-   const fn name(self) -> &'static str {
-      match self {
-         Self::Haptics => "Haptics",
-      }
-   }
-}
 
 /// The numbers, laid out as the module and method of each [`Method`], then
 /// each [`Event`], then each [`Field`], then each [`Module`], `None` where the
@@ -244,7 +103,7 @@ pub fn table() -> Option<&'static Table> {
 pub fn load() -> Result<(), LoadError> {
    let path = base_apk()?;
    let map = Map::open(&path).map_err(|source| LoadError::Io { path, source })?;
-   let names = names();
+   let names = phoenix_wire::names::all();
    let numbers = patcher::host_names(map.bytes(), &names).map_err(LoadError::Names)?;
    keep(&names, numbers);
    Ok(())
@@ -254,21 +113,9 @@ pub fn load() -> Result<(), LoadError> {
 #[cfg(target_os = "ios")]
 pub fn load() -> Result<(), LoadError> {
    let state = phoenix_runtime::state().ok_or(LoadError::NotStarted)?;
-   let names = names();
+   let names = phoenix_wire::names::all();
    keep(&names, phoenix_sigs::ios::host_names(&state.image, &names));
    Ok(())
-}
-
-/// The names [`Table`] holds, in its order.
-fn names() -> Vec<&'static str> {
-   let mut names = Vec::new();
-   for method in Method::ALL {
-      names.extend([method.module(), method.name()]);
-   }
-   names.extend(Event::ALL.map(Event::name));
-   names.extend(Field::ALL.map(Field::name));
-   names.extend(Module::ALL.map(Module::name));
-   names
 }
 
 /// Whether an `invoke` frame starting with `head` targets `module`.

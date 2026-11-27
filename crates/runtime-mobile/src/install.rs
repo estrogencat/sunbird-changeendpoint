@@ -107,6 +107,113 @@ pub fn open(apk: &Path) -> Result<(), String> {
    }
 }
 
+/// Opens `url` in this app itself, so another app that takes the same links
+/// never offers to.
+pub fn open_in_app(url: &str) -> Result<(), String> {
+   let env = jvm::env().ok_or("no JNI env")?;
+   let url = CString::new(url).map_err(|err| err.to_string())?;
+   // SAFETY: `env` is this thread's, and every reference made here is local
+   // to the frame popped below. Each call's exception is checked before its
+   // result is used.
+   unsafe {
+      if jni!(env, PushLocalFrame, 16) != 0 {
+         return Err(failure(env, "out of local references"));
+      }
+      let result = application(env).and_then(|app| {
+         let uri_class = URI.find(env)?;
+         let parse = jvm::static_method(env, uri_class, c"parse", signature!((STRING) -> URI))?;
+         let uri = checked(
+            env,
+            jni!(
+               env,
+               CallStaticObjectMethodA,
+               uri_class,
+               parse,
+               [jvalue {
+                  l: jni!(env, NewStringUTF, url.as_ptr()),
+               }]
+               .as_ptr()
+            ),
+            "could not parse the link",
+         )?;
+         let app_class = jni!(env, GetObjectClass, app);
+         let package_name = method(env, app_class, c"getPackageName", signature!(() -> STRING))?;
+         let package = checked(
+            env,
+            jni!(env, CallObjectMethodA, app, package_name, ptr::null()),
+            "no package name",
+         )?;
+         let intent_class = INTENT.find(env)?;
+         let intent_init = method(
+            env,
+            intent_class,
+            c"<init>",
+            signature!((STRING, URI) -> void),
+         )?;
+         let intent = checked(
+            env,
+            jni!(
+               env,
+               NewObjectA,
+               intent_class,
+               intent_init,
+               [
+                  jvalue {
+                     l: jni!(env, NewStringUTF, c"android.intent.action.VIEW".as_ptr()),
+                  },
+                  jvalue { l: uri },
+               ]
+               .as_ptr()
+            ),
+            "could not make an Intent",
+         )?;
+         let set_package = method(
+            env,
+            intent_class,
+            c"setPackage",
+            signature!((STRING) -> INTENT),
+         )?;
+         jni!(
+            env,
+            CallObjectMethodA,
+            intent,
+            set_package,
+            [jvalue { l: package }].as_ptr()
+         );
+         let add_flags = method(env, intent_class, c"addFlags", signature!((int) -> INTENT))?;
+         jni!(
+            env,
+            CallObjectMethodA,
+            intent,
+            add_flags,
+            [jvalue {
+               i: FLAG_ACTIVITY_NEW_TASK,
+            }]
+            .as_ptr()
+         );
+         let start = method(
+            env,
+            app_class,
+            c"startActivity",
+            signature!((INTENT) -> void),
+         )?;
+         jni!(
+            env,
+            CallVoidMethodA,
+            app,
+            start,
+            [jvalue { l: intent }].as_ptr()
+         );
+         if jni!(env, ExceptionCheck) {
+            return Err(failure(env, "the link did not open"));
+         }
+         Ok(())
+      });
+      jni!(env, PopLocalFrame, ptr::null_mut());
+      result
+   }
+}
+
 /// The app's `Application`.
 ///
 /// # Safety

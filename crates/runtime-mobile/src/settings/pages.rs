@@ -4,20 +4,34 @@ use phoenix_runtime::{
    PluginInfo,
    update::Catalog,
 };
-use phoenix_ui_mobile::Prop;
+use phoenix_ui_mobile::{
+   Prop,
+   templates,
+};
 use phoenix_wire::Value;
 
 use crate::settings::{
-   COLOR_ACCENT,
-   COLOR_ERROR,
-   COLOR_STRING,
-   COLOR_WARN,
    Field,
    ICON_CONSOLE,
    ICON_FILE,
    ICON_PLUGIN,
    ICON_RELOAD,
    Press,
+   cards::{
+      BLURPLE,
+      GREEN,
+      badge,
+      bar,
+      card,
+      column,
+      divider,
+      grow,
+      heading,
+      label,
+      line,
+      pill,
+      row,
+   },
    console::log_line,
    rows::{
       InputKind,
@@ -27,7 +41,11 @@ use crate::settings::{
       text_field,
       value_row,
    },
-   tree::Tree,
+   theme::Color,
+   tree::{
+      Tree,
+      text,
+   },
 };
 
 pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
@@ -39,23 +57,23 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
          .enumerate()
          .map(|(index, plugin)| {
             let subtitle = plugin
-               .error
-               .as_deref()
+               .state
+               .error()
                .map(|error| format!("Failed: {error}"))
                .or_else(|| plugin.header.description.clone());
             switch_row(
                Some(ICON_PLUGIN),
                &plugin.name,
                subtitle.as_deref(),
-               plugin.enabled,
+               plugin.state.is_on(),
                Press::OpenPlugin(index),
                Press::Toggle(index),
             )
          })
          .collect()
    };
-   let enabled = plugins.iter().filter(|plugin| plugin.enabled).count();
-   update_section()
+   let enabled = plugins.iter().filter(|plugin| plugin.state.is_on()).count();
+   updates_section()
       .into_iter()
       .chain([
          section("Plugins", rows),
@@ -71,7 +89,11 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
             // iOS hooks nothing inline: it swaps the bridge's vtable slots.
             value_row(
                "Hook library",
-               if cfg!(target_os = "ios") { "vtable slot swap" } else { "ShadowHook" },
+               if cfg!(target_os = "ios") {
+                  "vtable slot swap"
+               } else {
+                  "ShadowHook"
+               },
             ),
             value_row("Enabled", &format!("{enabled} of {}", plugins.len())),
          ]),
@@ -79,69 +101,159 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
       .collect()
 }
 
-fn update_section() -> Option<Tree> {
-   let update_found = phoenix_runtime::update::found();
-   let update_status = phoenix_runtime::update::status();
-   let update_busy = phoenix_runtime::update::busy();
-   (update_found.is_some() || update_status.is_some()).then(|| {
-      let mut update_rows = Vec::new();
-      if let Some(update) = &update_found {
-         let what = if update_busy {
-            update_status
-               .clone()
-               .unwrap_or_else(|| "Updating...".to_owned())
-         } else {
-            match (&update.loader, update.plugins.len()) {
-               (Some(version), 0) => format!("Install update ({version})"),
-               (Some(version), n) => {
-                  format!(
-                     "Install update ({version}) + {n} plugin{}",
-                     if n == 1 { "" } else { "s" }
-                  )
-               },
-               (None, _) => format!("Update plugins now: {}", update.plugins.join(", ")),
-            }
-         };
-         let mut row = button_row(
-            &what,
-            ICON_RELOAD,
-            (!update_busy).then_some(Press::ApplyUpdate),
-            !update_busy,
-         );
-         if let Some(label) = row.kids.first_mut().and_then(|row| row.kids.get_mut(1)) {
-            let color = if update_busy {
-               COLOR_ACCENT
-            } else {
-               COLOR_STRING
-            };
-            label.set(Prop::COLOR, Some(Value::I64(color)));
-         }
-         update_rows.push(row);
+/// One card for what can update: Sunbird and its plugins, and on Android
+/// Discord itself.
+fn updates_section() -> Option<Tree> {
+   let mut items = sunbird_item().into_iter().collect::<Vec<_>>();
+   if let Some(discord) = discord_item() {
+      if !items.is_empty() {
+         items.push(divider());
       }
-      if let Some(status) = &update_status
-         && (!update_busy || update_found.is_none())
-      {
-         let mut line = log_line(&[(status.clone(), COLOR_WARN)]);
-         line.set(Prop::FONT_FAMILY, None);
-         line.set(Prop::FONT_SIZE, Some(Value::F64(13.0)));
-         line.set(Prop::LINE_HEIGHT, Some(Value::F64(18.0)));
-         update_rows.push(line);
+      items.push(discord);
+   }
+   if items.is_empty() {
+      return None;
+   }
+   let mut header = Tree::from_template(&templates().header);
+   header.set(Prop::TEXT, Some(text("Updates")));
+   Some(column(0.0, vec![header, card(items)]))
+}
+
+fn sunbird_item() -> Option<Tree> {
+   let found = phoenix_runtime::update::found();
+   let status = phoenix_runtime::update::status();
+   let busy = phoenix_runtime::update::busy();
+   let Some(update) = found else {
+      // The line can be a success or a failure, so it gets the old warning
+      // color under a neutral heading.
+      let status = status?;
+      return Some(column(12.0, vec![
+         heading(
+            badge(Color::Muted.argb(), 44.0, ICON_RELOAD),
+            "Sunbird",
+            phoenix_runtime::update::VERSION,
+            None,
+         ),
+         line(&status, Color::Warn.argb()),
+      ]));
+   };
+   let title = update.loader.as_ref().map_or_else(
+      || "Plugin updates".to_owned(),
+      |version| format!("Sunbird {version}"),
+   );
+   let subtitle = if busy {
+      status.unwrap_or_else(|| "Updating...".to_owned())
+   } else {
+      let plugins = summary(&update.plugins);
+      match (&update.loader, plugins) {
+         (Some(_), Some(plugins)) => format!("New loader, and {plugins}"),
+         (Some(_), None) => "A new loader, installed in-app".to_owned(),
+         (None, plugins) => plugins.unwrap_or_default(),
       }
-      // Plugins update in place, so the site's full download is only for a
-      // loader.
-      if update_found
-         .as_ref()
-         .is_some_and(|update| update.loader.is_some())
-      {
-         update_rows.push(button_row(
-            "Open download page",
-            ICON_FILE,
-            Some(Press::OpenSite),
-            true,
-         ));
-      }
-      section("Update available", update_rows)
-   })
+   };
+   let trailing = if busy {
+      label("Updating", 14.0, 700, BLURPLE)
+   } else {
+      pill("Update", Press::ApplyUpdate)
+   };
+   let mut kids = vec![heading(
+      badge(GREEN, 44.0, ICON_RELOAD),
+      &title,
+      &subtitle,
+      Some(trailing),
+   )];
+   // Plugins update in place, so the site's full download is only for a
+   // loader.
+   if update.loader.is_some() && !busy {
+      kids.push(row(8.0, vec![
+         grow(label(
+            "Or get the full download from the site",
+            13.0,
+            400,
+            Color::Muted.argb(),
+         )),
+         pill("Site", Press::OpenSite),
+      ]));
+   }
+   if let Some(status) = phoenix_runtime::update::status().filter(|_| !busy) {
+      kids.push(line(&status, Color::Warn.argb()));
+   }
+   Some(column(12.0, kids))
+}
+
+/// "a, b and 3 more have updates".
+fn summary(plugins: &[String]) -> Option<String> {
+   match plugins {
+      [] => None,
+      [one] => Some(format!("{one} has an update")),
+      [first, second] => Some(format!("{first} and {second} have updates")),
+      [first, second, rest @ ..] => {
+         Some(format!(
+            "{first}, {second} and {} more have updates",
+            rest.len()
+         ))
+      },
+   }
+}
+
+/// Discord's own update, with its progress while it runs.
+fn discord_item() -> Option<Tree> {
+   #[cfg(target_os = "android")]
+   {
+      use crate::discord_update::State;
+      let (title, subtitle, progress, pill_text) = match crate::discord_update::state() {
+         State::Current => return None,
+         State::Available(build) => {
+            (
+               format!("Discord {}", build.version_name),
+               format!(
+                  "Checked for Sunbird \u{00B7} {} MB",
+                  crate::discord_update::download_size(&build) >> 20
+               ),
+               None,
+               "View",
+            )
+         },
+         State::Running(build, progress) => {
+            let step = progress
+               .steps
+               .get(progress.at)
+               .map_or_default(|step| step.label.clone());
+            (
+               format!("Discord {}", build.version_name),
+               format!("{step} \u{00B7} {}%", progress.percent()),
+               Some(progress.fraction()),
+               "View",
+            )
+         },
+         State::Failed { build, .. } => {
+            (
+               format!("Discord {}", build.version_name),
+               "The update failed".to_owned(),
+               None,
+               "Retry",
+            )
+         },
+         State::Handed(build) => {
+            (
+               format!("Discord {}", build.version_name),
+               "Ready to install".to_owned(),
+               None,
+               "Install",
+            )
+         },
+      };
+      let mut kids = vec![heading(
+         badge(BLURPLE, 44.0, ICON_RELOAD),
+         &title,
+         &subtitle,
+         Some(pill(pill_text, Press::OpenDiscordUpdate)),
+      )];
+      kids.extend(progress.map(|fraction| bar(fraction, 6.0, BLURPLE)));
+      Some(column(12.0, kids))
+   }
+   #[cfg(not(target_os = "android"))]
+   None
 }
 
 /// The site's plugins, each with a switch that installs or uninstalls it.
@@ -156,7 +268,10 @@ fn listed_rows(plugins: &[PluginInfo]) -> Vec<Tree> {
          )];
       },
       Catalog::Failed(err) => {
-         let mut line = log_line(&[(format!("The plugin list did not load: {err}"), COLOR_ERROR)]);
+         let mut line = log_line(&[(
+            format!("The plugin list did not load: {err}"),
+            Color::Error.argb(),
+         )]);
          line.set(Prop::FONT_FAMILY, None);
          return vec![line];
       },
@@ -168,7 +283,7 @@ fn listed_rows(plugins: &[PluginInfo]) -> Vec<Tree> {
       .map(|(index, plugin)| {
          let on = plugins
             .iter()
-            .any(|other| other.name == plugin.name && (other.installed || other.enabled));
+            .any(|other| other.name == plugin.name && (other.installed || other.state.is_on()));
          let subtitle = plugin.warning.as_ref().map_or_else(
             || plugin.description.clone(),
             |warning| format!("{} \u{26A0} {warning}", plugin.description),

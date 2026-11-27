@@ -41,11 +41,15 @@ use phoenix_runtime::{
       Listed,
    },
 };
-use phoenix_sigs::desktop::{
-   self,
-   GpuiLayout,
-   StyleOffsets,
-   layout,
+use phoenix_sigs::{
+   desktop::{
+      self,
+      GpuiLayout,
+      StyleOffsets,
+      layout,
+   },
+   index::Index,
+   locate,
 };
 
 use crate::modal::{
@@ -187,6 +191,8 @@ pub struct RcFnVtbl {
 
 // SAFETY: vtables contain only function pointers and plain integers.
 unsafe impl Sync for RcFnVtbl {}
+// SAFETY: as above, nothing in it is tied to a thread.
+unsafe impl Send for RcFnVtbl {}
 
 static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
@@ -265,6 +271,9 @@ struct GpuiSymbols {
    div_child_div:    DivChildDivFn,
    div_child_button: DivChildBtnFn,
    div_into_any:     DivIntoAnyFn,
+   /// Raw Discord address of `Div::into_any_element` (before `sret_caller`
+   /// wrapping on arm64), for sibling locators like `crate::modal`.
+   div_into_any_raw: usize,
    div_push_any:     Option<DivPushAnyFn>,
    str_into_any:     Option<StrIntoAnyFn>,
    text_block:       TextBlockFn,
@@ -307,11 +316,17 @@ struct UiState {
    filter:           PluginFilter,
    expanded_plugins: HashSet<String>,
    open_select:      Option<(String, String)>,
-   cat_desktop_open: bool,
-   cat_partial_open: bool,
-   cat_mobile_open:  bool,
    servers_open:     Option<String>,
    servers_confirm:  Option<String>,
+   open_groups:      HashSet<CatalogGroup>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum CatalogGroup {
+   Desktop,
+   Partial,
+   Other,
 }
 
 impl Default for UiState {
@@ -321,11 +336,9 @@ impl Default for UiState {
          filter:           PluginFilter::All,
          expanded_plugins: HashSet::new(),
          open_select:      None,
-         cat_desktop_open: true,
-         cat_partial_open: false,
-         cat_mobile_open:  false,
          servers_open:     None,
          servers_confirm:  None,
+         open_groups:      HashSet::from([CatalogGroup::Desktop]),
       }
    }
 }
@@ -350,8 +363,10 @@ enum Action {
       key:    String,
       value:  String,
    },
-   ToggleCatalogGroup(u8),
+   ToggleCatalogGroup(CatalogGroup),
    ToggleStaff,
+   ToggleAutoStart,
+   ToggleAutoUpdate,
    ReloadAll,
    OpenDevTools,
    CheckUpdates,
@@ -419,6 +434,18 @@ unsafe fn switch_callback(
          Action::ServersToggle => servers_tab::toggle(on),
          Action::ServerActivity(key) => servers_tab::activity(key, on),
          Action::ServerTweak(tweak) => servers_tab::tweak(tweak, on),
+         Action::ToggleAutoStart | Action::ToggleAutoUpdate => {
+            let config = crate::config::update(|config| {
+               if matches!(action, Action::ToggleAutoStart) {
+                  config.auto_start = on;
+               } else {
+                  config.auto_update = on;
+               }
+            });
+            // The login entry is the registry or a file, so it is written off
+            // Discord's UI thread.
+            std::thread::spawn(move || crate::config::save_or_report(config));
+         },
          Action::TogglePlugin(name) => phoenix_runtime::set_enabled(&name, on),
          Action::ToggleSetting { plugin, key } => {
             phoenix_runtime::set_setting(&plugin, &key, Chosen::Switch(on));
@@ -482,10 +509,8 @@ unsafe extern "C" fn button_callback(
          },
          Action::ToggleCatalogGroup(group) => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
-            match group {
-               0 => ui.cat_desktop_open = !ui.cat_desktop_open,
-               1 => ui.cat_partial_open = !ui.cat_partial_open,
-               _ => ui.cat_mobile_open = !ui.cat_mobile_open,
+            if !ui.open_groups.remove(&group) {
+               ui.open_groups.insert(group);
             }
          },
          Action::ReloadAll => phoenix_runtime::reload_all(),
@@ -551,20 +576,26 @@ unsafe extern "C" fn button_callback(
    });
 }
 
+/// Whether [`locate`] resolved the builders.
+pub fn located() -> bool {
+   SYMBOLS.get().is_some()
+}
+
 /// Resolves Discord's native GPUI / Mana widget builders from unique string
 /// anchors. Safe to call from `DllMain` (`prepare()`).
-pub fn locate(image: &Image<'static>) -> bool {
+pub fn locate(image: &Image<'static>, ix: &Index<'_>) -> bool {
    if SYMBOLS.get().is_some() {
       return true;
    }
 
    let found = if crate::X86_CODE {
-      desktop::gpui(image).and_then(|gpui| {
+      locate::gpui::gpui(ix).and_then(|gpui| {
          let layout = desktop::gpui_layouts(image, &gpui)?;
-         Ok((gpui, layout))
+         let raw = gpui.div_into_any;
+         Ok((gpui, layout, raw))
       })
    } else {
-      arm64_builders(image)
+      arm64_builders(image, ix)
    };
    let (
       desktop::Gpui {
@@ -587,6 +618,7 @@ pub fn locate(image: &Image<'static>) -> bool {
          ..
       },
       found_layout,
+      div_into_any_raw,
    ) = match found {
       Ok(found) => found,
       Err(err) => {
@@ -607,6 +639,7 @@ pub fn locate(image: &Image<'static>) -> bool {
          div_child_div:    std::mem::transmute::<usize, DivChildDivFn>(div_child_div),
          div_child_button: std::mem::transmute::<usize, DivChildBtnFn>(div_child_button),
          div_into_any:     std::mem::transmute::<usize, DivIntoAnyFn>(div_into_any),
+         div_into_any_raw,
          div_push_any:     div_push_any
             .map(|addr| std::mem::transmute::<usize, DivPushAnyFn>(addr)),
          str_into_any:     str_into_any
@@ -630,13 +663,17 @@ pub fn locate(image: &Image<'static>) -> bool {
    true
 }
 
-/// The arm64 builders ([`phoenix_sigs::macos::gpui`]) with every one that
-/// returns through `x8` swapped for an `image::sret_caller` thunk, so they
+/// The arm64 builders ([`phoenix_sigs::locate::gpui::gpui`]) with every one
+/// that returns through `x8` swapped for an `image::sret_caller` thunk, so they
 /// are called the x86 way, result slot first, like the types here say.
 #[cfg(target_os = "macos")]
-fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
-   let gpui = phoenix_sigs::macos::gpui(image)?;
+fn arm64_builders(
+   image: &Image<'_>,
+   ix: &Index<'_>,
+) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
+   let gpui = locate::gpui::gpui(ix)?;
    let layout = phoenix_sigs::macos::gpui_layouts(image, &gpui)?;
+   let raw = gpui.div_into_any;
    let thunk = |addr: usize| {
       phoenix_hook::image::sret_caller(addr).ok_or_else(|| "no memory for a thunk".to_owned())
    };
@@ -655,11 +692,14 @@ fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), Stri
       action_row: thunk(gpui.action_row)?,
       ..gpui
    };
-   Ok((thunked, layout))
+   Ok((thunked, layout, raw))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
+fn arm64_builders(
+   _image: &Image<'_>,
+   _ix: &Index<'_>,
+) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
    Err("no arm64 builders off macOS".to_owned())
 }
 
@@ -681,6 +721,11 @@ pub fn host_alloc(size: usize, align: usize) -> Option<*mut u8> {
 /// The `GpuiLayout` decoded from this `Discord.exe`.
 pub fn layout() -> Option<&'static GpuiLayout> {
    SYMBOLS.get().map(|sym| &sym.layout)
+}
+
+/// Discord's `alloc_or_oom`, once the builders are located.
+pub fn alloc_or_oom_addr() -> Option<usize> {
+   SYMBOLS.get().map(|sym| sym.alloc_or_oom as usize)
 }
 
 /// A `Div`'s `StyleRefinement`, written through the decoded field offsets.
@@ -914,33 +959,16 @@ impl Builder {
       checked: bool,
       action: Action,
    ) -> RawDiv {
-      let at = &self.sym.layout.switch;
-      let id_static = intern(id);
-      let mut sw = RawSwitch::zeroed();
-      // SAFETY: creates a native Mana `Switch` in a buffer that fits it.
-      unsafe {
-         (self.sym.switch_new)(
-            &raw mut sw,
-            id_static.as_ptr(),
-            id_static.len(),
-            u8::from(checked),
-         );
-      }
-      // The defaults these overwrite are static `SharedString`s and `None`,
-      // which own nothing.
-      sw.put(at.label, SharedString::from_str(label));
-      if let Some(desc) = description
-         && !desc.is_empty()
-      {
-         sw.put(at.description, SharedString::from_str(desc));
-      }
-      sw.put(at.on_change, self.alloc_rc_action(action));
-      sw.put(at.on_change + 8, &raw const SWITCH_FN_VTBL);
-
-      let mut out = RawDiv::zeroed();
-      // SAFETY: moves the `Switch` into its `Div`.
-      unsafe { (self.sym.switch_into_div)(&raw mut out, &raw mut sw) };
-      out
+      let rc_ptr = self.alloc_rc_action(action);
+      new_switch(
+         self.sym,
+         id,
+         label,
+         description,
+         checked,
+         &raw const SWITCH_FN_VTBL,
+         rc_ptr,
+      )
    }
 
    #[expect(clippy::too_many_arguments, reason = "one per GPUI row part")]
@@ -1019,7 +1047,7 @@ impl Builder {
 /// Returns the resolved address of `Div::into_any_element` for sibling desktop
 /// locators (`crate::modal`).
 pub fn div_into_any_addr() -> Option<usize> {
-   SYMBOLS.get().map(|s| s.div_into_any as usize)
+   SYMBOLS.get().map(|s| s.div_into_any_raw)
 }
 
 pub fn raw_div() -> Option<RawDiv> {
@@ -1079,6 +1107,69 @@ pub fn build_raw_button(
    let sym = SYMBOLS.get()?;
    let rc_ptr = alloc_rc_u64(action_id)?;
    Some(new_button(sym, id, label, variant, size, vtbl, rc_ptr))
+}
+
+/// A Mana `Switch` row whose `on_change` calls `vtbl` with `action_id`, for
+/// switches outside the settings page (`crate::modal`).
+pub fn build_raw_switch(
+   id: &str,
+   label: &str,
+   description: Option<&str>,
+   checked: bool,
+   vtbl: *const RcFnVtbl,
+   action_id: u64,
+) -> Option<RawDiv> {
+   let sym = SYMBOLS.get()?;
+   let rc_ptr = alloc_rc_u64(action_id)?;
+   Some(new_switch(
+      sym,
+      id,
+      label,
+      description,
+      checked,
+      vtbl,
+      rc_ptr,
+   ))
+}
+
+/// A native Mana `Switch` in its `Div`, with our `Rc<dyn Fn(bool)>`
+/// `on_change`.
+fn new_switch(
+   sym: &GpuiSymbols,
+   id: &str,
+   label: &str,
+   description: Option<&str>,
+   checked: bool,
+   vtbl: *const RcFnVtbl,
+   rc_ptr: *mut RcInner,
+) -> RawDiv {
+   let at = &sym.layout.switch;
+   let id_static = intern(id);
+   let mut sw = RawSwitch::zeroed();
+   // SAFETY: creates a native Mana `Switch` in a buffer that fits it.
+   unsafe {
+      (sym.switch_new)(
+         &raw mut sw,
+         id_static.as_ptr(),
+         id_static.len(),
+         u8::from(checked),
+      );
+   }
+   // The defaults these overwrite are static `SharedString`s and `None`,
+   // which own nothing.
+   sw.put(at.label, SharedString::from_str(label));
+   if let Some(desc) = description
+      && !desc.is_empty()
+   {
+      sw.put(at.description, SharedString::from_str(desc));
+   }
+   sw.put(at.on_change, rc_ptr);
+   sw.put(at.on_change + 8, vtbl);
+
+   let mut out = RawDiv::zeroed();
+   // SAFETY: moves the `Switch` into its `Div`.
+   unsafe { (sym.switch_into_div)(&raw mut out, &raw mut sw) };
+   out
 }
 
 /// A native Mana `Button` with our `variant`, `size` and `Rc<dyn Fn>` click
@@ -1354,7 +1445,12 @@ static SVG: OnceLock<SvgSymbols> = OnceLock::new();
 
 /// Resolves the `Svg` builders, after [`locate`].
 pub fn locate_svg(image: &Image<'static>) {
-   let found = match desktop::svg_builders(image) {
+   let located = if crate::X86_CODE {
+      desktop::svg_builders(image)
+   } else {
+      arm64_svg_builders(image)
+   };
+   let found = match located {
       Ok(found) => found,
       Err(err) => {
          log::warn!("desktop gpui: {err}, icons fall back to text");
@@ -1381,6 +1477,26 @@ pub fn locate_svg(image: &Image<'static>) {
    };
    let _ = SVG.set(symbols);
    log::info!("desktop gpui: resolved Svg builders {found:x?}");
+}
+
+#[cfg(target_os = "macos")]
+fn arm64_svg_builders(image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   let svg = phoenix_sigs::macos::svg_builders(image)?;
+   let thunk = |addr: usize| {
+      phoenix_hook::image::sret_caller(addr)
+         .ok_or_else(|| "no memory for an Svg thunk".to_owned())
+   };
+   Ok(desktop::SvgBuilders {
+      new: thunk(svg.new)?,
+      path: thunk(svg.path)?,
+      into_any: thunk(svg.into_any)?,
+      ..svg
+   })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm64_svg_builders(_image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   Err("no arm64 Svg builders off macOS".to_owned())
 }
 
 /// Whether icons can be drawn.
@@ -1581,21 +1697,19 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       .unwrap_or_else(PoisonError::into_inner)
       .clear();
 
-   let (tab, filter, expanded_plugins, open_select, cat_desktop, cat_partial, cat_mobile) = {
+   let (tab, filter, expanded_plugins, open_select, open_groups) = {
       let ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
       (
          ui.tab,
          ui.filter,
          ui.expanded_plugins.clone(),
          ui.open_select.clone(),
-         ui.cat_desktop_open,
-         ui.cat_partial_open,
-         ui.cat_mobile_open,
+         ui.open_groups.clone(),
       )
    };
 
    let plugins = phoenix_runtime::plugins();
-   let enabled_count = plugins.iter().filter(|p| p.enabled).count();
+   let enabled_count = plugins.iter().filter(|p| p.state.is_on()).count();
    let disabled_count = plugins.len().saturating_sub(enabled_count);
 
    let mut root = b.v_stack(16.0);
@@ -1676,7 +1790,7 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       },
       Tab::Catalog => {
          let installed: HashSet<String> = plugins.iter().map(|p| p.name.clone()).collect();
-         root = render_catalog_tab(&b, root, &installed, cat_desktop, cat_partial, cat_mobile);
+         root = render_catalog_tab(&b, root, &installed, &open_groups);
       },
       Tab::Servers => {
          root = servers_tab::render(&b, root);
@@ -1790,8 +1904,8 @@ fn render_plugins_tab(
       .filter(|p| {
          match filter {
             PluginFilter::All => true,
-            PluginFilter::Enabled => p.enabled,
-            PluginFilter::Disabled => !p.enabled,
+            PluginFilter::Enabled => p.state.is_on(),
+            PluginFilter::Disabled => !p.state.is_on(),
          }
       })
       .collect();
@@ -1812,7 +1926,7 @@ fn render_plugins_tab(
       let is_open = expanded.contains(&plugin.name);
       let compat = DesktopCompat::of(&plugin.name);
       let badge = b.compat_badge(compat);
-      let mut card = b.card(10.0, 14.0, 8.0, if plugin.enabled { 0.22 } else { 0.14 });
+      let mut card = b.card(10.0, 14.0, 8.0, if plugin.state.is_on() { 0.22 } else { 0.14 });
 
       let mut title = plugin.header.version.as_ref().map_or_else(
          || plugin.name.clone(),
@@ -1842,7 +1956,13 @@ fn render_plugins_tab(
             DesktopCompat::Unverified => desc_parts.push("Unverified on desktop".to_owned()),
          }
       }
-      if let Some(err) = &plugin.error {
+      if plugin.permissions.is_empty() {
+         desc_parts.push("No permissions".to_owned());
+      } else {
+         let labels = plugin.permissions.iter().map(|permission| permission.label());
+         desc_parts.push(format!("Reaches {}", labels.collect::<Vec<_>>().join(", ")));
+      }
+      if let Some(err) = plugin.state.error() {
          desc_parts.push(format!("Error: {err}"));
       }
       let desc = desc_parts.join(" · ");
@@ -1853,12 +1973,12 @@ fn render_plugins_tab(
             &format!("sunbird-plugin-{}", plugin.name),
             &title,
             (!desc.is_empty()).then_some(desc.as_str()),
-            plugin.enabled,
+            plugin.state.is_on(),
             Action::TogglePlugin(plugin.name.clone()),
          ),
       );
 
-      let has_settings = plugin.enabled && !plugin.settings.is_empty();
+      let has_settings = plugin.state.is_on() && !plugin.settings.is_empty();
       let mut buttons = b.h_row(8.0, false);
       if has_settings {
          let lbl = if is_open {
@@ -1887,7 +2007,7 @@ fn render_plugins_tab(
          BtnSize::Small,
          Action::EditPluginCode(plugin.name.clone()),
       );
-      if plugin.enabled && plugin.installed {
+      if plugin.state.is_on() && plugin.installed {
          buttons = b.push_button(
             buttons,
             &format!("sunbird-reload-{}", plugin.name),
@@ -1897,7 +2017,7 @@ fn render_plugins_tab(
             Action::ReloadPlugin(plugin.name.clone()),
          );
       }
-      if !plugin.enabled && plugin.installed {
+      if !plugin.state.is_on() && plugin.installed {
          buttons = b.push_button(
             buttons,
             &format!("sunbird-remove-{}", plugin.name),
@@ -2078,7 +2198,7 @@ fn render_plugins_tab(
 fn render_catalog_group(
    b: &Builder,
    mut root: RawDiv,
-   group_id: u8,
+   group: CatalogGroup,
    title: &str,
    subtitle: &str,
    items: &[&Listed],
@@ -2097,13 +2217,13 @@ fn render_catalog_group(
    section = b.push_div(
       section,
       b.action_row(
-         &format!("sunbird-cat-group-{group_id}"),
+         &format!("sunbird-cat-group-{}", group as u8),
          title,
          subtitle,
          &btn_lbl,
          BtnVariant::Secondary,
          BtnSize::Small,
-         Action::ToggleCatalogGroup(group_id),
+         Action::ToggleCatalogGroup(group),
       ),
    );
    if open {
@@ -2153,9 +2273,7 @@ fn render_catalog_tab(
    b: &Builder,
    mut root: RawDiv,
    installed: &HashSet<String>,
-   desktop_open: bool,
-   partial_open: bool,
-   mobile_open: bool,
+   open_groups: &HashSet<CatalogGroup>,
 ) -> RawDiv {
    root = b.push_div(
       root,
@@ -2233,32 +2351,32 @@ fn render_catalog_tab(
          root = render_catalog_group(
             b,
             root,
-            0,
+            CatalogGroup::Desktop,
             "Desktop Ready",
             "Confirmed working on Desktop Phoenix.",
             &desktop,
             installed,
-            desktop_open,
+            open_groups.contains(&CatalogGroup::Desktop),
          );
          root = render_catalog_group(
             b,
             root,
-            1,
+            CatalogGroup::Partial,
             "Partial Desktop Support",
             "Core hooks work on desktop; some features are still pending or unconfirmed.",
             &partial,
             installed,
-            partial_open,
+            open_groups.contains(&CatalogGroup::Partial),
          );
          root = render_catalog_group(
             b,
             root,
-            2,
+            CatalogGroup::Other,
             "Mobile Only & Unverified",
             "Targets Android Phoenix's UI tree or has not been confirmed on desktop yet.",
             &other,
             installed,
-            mobile_open,
+            open_groups.contains(&CatalogGroup::Other),
          );
       },
    }
@@ -2309,7 +2427,52 @@ fn render_general_tab(b: &Builder, mut root: RawDiv) -> RawDiv {
    );
    root = b.push_div(root, dev_card);
 
-   // Card 2: Updates
+   // Card 2: how the launcher starts Sunbird (`launcher.conf`)
+   let config = crate::config::load();
+   let mut start_card = b.card(12.0, 16.0, 8.0, 0.20);
+   start_card = b.push_div(
+      start_card,
+      b.switch_row(
+         "sunbird-auto-start",
+         "Start Sunbird on login",
+         Some("Open Discord with Sunbird when you sign in to your computer."),
+         config.auto_start,
+         Action::ToggleAutoStart,
+      ),
+   );
+   start_card = b.push_div(start_card, b.divider());
+   start_card = b.push_div(
+      start_card,
+      b.switch_row(
+         "sunbird-auto-update",
+         "Auto-update Sunbird on launch",
+         Some("Download the newest Sunbird loader each time the launcher starts Discord."),
+         config.auto_update,
+         Action::ToggleAutoUpdate,
+      ),
+   );
+   let failed = crate::health::snapshot().feature_failures();
+   if !failed.is_empty() {
+      let names = failed
+         .iter()
+         .map(|patch| patch.name)
+         .collect::<Vec<_>>()
+         .join(", ");
+      start_card = b.push_div(start_card, b.divider());
+      start_card = b.push_div(
+         start_card,
+         b.text_block(
+            "Patch Health",
+            &format!(
+               "Some features did not hook on this Discord build and are off: {names}. The rest \
+                of Sunbird works."
+            ),
+         ),
+      );
+   }
+   root = b.push_div(root, start_card);
+
+   // Card 3: Updates
    let (upd_desc, upd_btn, upd_var, upd_act) = updates_card_state();
 
    let mut upd_card = b.card(10.0, 16.0, 8.0, 0.20);

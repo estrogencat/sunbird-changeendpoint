@@ -1,0 +1,113 @@
+name: discord
+# Offers the tracker's latest Discord alpha as the in-app Discord update once
+# the release the site serves works with it: every split is signed with
+# Discord's certificate, every locator finds its target (`sigscan check`),
+# props.in keeps its indices and the host name table numbers every name the
+# runtime uses. A passing build goes into web/discord.json through a pull
+# request the bot opens and auto-merge lands; phones read that file from main.
+#
+# The bot is a GitHub App: its client ID is the BOT_CLIENT_ID repository
+# variable and its key the BOT_PRIVATE_KEY secret. Auto-merge only takes its
+# pull requests while the app is manic-bot.
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: discord
+  cancel-in-progress: false
+env:
+  TRACKER: https://tracker.vendetta.rocks/tracker
+  # SHA-256 of the certificate Discord signs its Android app with.
+  DISCORD_CERT: 3c39d23cf9367849a5c699395647fe0e5bfea5a1f1f40d8c717ddc70f8bfa113
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: latest
+        run: |
+          alpha=$(curl -fsS "$TRACKER/index" | jq -r .latest.alpha)
+          ready=$(jq -r '.android.versionCode // 0' web/discord.json 2>/dev/null || echo 0)
+          release=$(git describe --tags --abbrev=0)
+          echo "tracker alpha $alpha, ready $ready, release $release"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          if [ "$alpha" -gt "$ready" ]; then
+            echo "version=$alpha" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.latest.outputs.version != ''
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      # Users run the release's loader, so its locators and props.in decide.
+      # The checkers come from this commit, which the release may predate: the
+      # scripts, and the patcher whose host name list is this commit's (a
+      # superset of what the release needs).
+      - if: steps.latest.outputs.version != ''
+        env:
+          RELEASE: ${{ steps.latest.outputs.release }}
+        run: |
+          nix develop --command cargo build --locked --release -p patcher
+          cp target/release/patcher scripts/verify-discord.sh scripts/extract-schema.py "$RUNNER_TEMP/"
+          git checkout --quiet "$RELEASE"
+          cp "$RUNNER_TEMP/extract-schema.py" scripts/extract-schema.py
+      - if: steps.latest.outputs.version != ''
+        run: nix develop --command cargo build --locked --release -p sigscan
+      - if: steps.latest.outputs.version != ''
+        name: download and verify
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          RELEASE: ${{ steps.latest.outputs.release }}
+          PATCHER: ${{ runner.temp }}/patcher
+        run: nix develop --command bash "$RUNNER_TEMP/verify-discord.sh"
+      - if: steps.latest.outputs.version != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: discord
+          path: discord.json
+          if-no-files-found: error
+  publish:
+    needs: verify
+    if: needs.verify.outputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: discord
+          path: ${{ runner.temp }}
+      # Only the Android build is CI's; the desktop builds are kept by hand.
+      - run: |
+          jq --slurpfile android "$RUNNER_TEMP/discord.json" '.android = $android[0]' web/discord.json > "$RUNNER_TEMP/merged.json"
+          mv "$RUNNER_TEMP/merged.json" web/discord.json
+      - env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          branch="discord/$VERSION"
+          id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git switch --create "$branch"
+          git add web/discord.json
+          git commit --message "web: offer discord $VERSION"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
+          if [ "$(gh pr view "$branch" --json state --jq .state 2>/dev/null)" != OPEN ]; then
+            gh pr create --head "$branch" --base main --title "web: offer discord $VERSION" \
+              --body "Discord $VERSION passed the release's checks: Discord's certificate on every split, \`sigscan check\`, props.in and the host name table. Phones offer it as an update once this lands."
+          fi

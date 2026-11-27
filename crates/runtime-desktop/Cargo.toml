@@ -6,6 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [target.'cfg(any(windows, target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
+crc32fast          = { workspace = true }
 flub               = { workspace = true }
 log                = { workspace = true }
 phoenix-hook       = { workspace = true }

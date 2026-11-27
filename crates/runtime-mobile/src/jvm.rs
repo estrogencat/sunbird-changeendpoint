@@ -7,6 +7,8 @@
 use std::{
    ffi::{
       CStr,
+      c_char,
+      c_int,
       c_void,
    },
    ptr,
@@ -240,7 +242,11 @@ pub fn vm() -> *mut JavaVM {
          }
       }
       if symbol.is_null() {
-         return ptr::null_mut();
+         symbol = art_symbol(b"JNI_GetCreatedJavaVMs");
+         if symbol.is_null() {
+            return ptr::null_mut();
+         }
+         log::info!("jvm: JNI_GetCreatedJavaVMs found in libart's symbol table");
       }
 
       let get_created = std::mem::transmute::<*mut c_void, GetCreatedVms>(symbol);
@@ -251,6 +257,193 @@ pub fn vm() -> *mut JavaVM {
       VM.store(vm, Ordering::Release);
       vm
    }
+}
+
+/// The address of `name` in the loaded `libart.so`, read from its dynamic
+/// symbol table, or null.
+///
+/// Before Android 12 (API 31) `libnativehelper.so` is not a public library
+/// and libart lives outside the app's linker namespace, so neither `dlsym`
+/// nor `dlopen` reaches `JNI_GetCreatedJavaVMs`. `dl_iterate_phdr` still
+/// reports every loaded library, whatever its namespace.
+fn art_symbol(name: &'static [u8]) -> *mut c_void {
+   struct Search {
+      name:  &'static [u8],
+      found: Option<usize>,
+   }
+
+   unsafe extern "C" fn visit(
+      info: *mut libc::dl_phdr_info,
+      _size: usize,
+      out: *mut c_void,
+   ) -> c_int {
+      // SAFETY: the loader passes a valid record, and `out` is the Search
+      // below.
+      let (info, search) = unsafe { (&*info, &mut *out.cast::<Search>()) };
+      // SAFETY: dlpi_name is NUL-terminated when present.
+      if info.dlpi_name.is_null()
+         || !unsafe { CStr::from_ptr(info.dlpi_name) }
+            .to_bytes()
+            .ends_with(b"/libart.so")
+      {
+         return 0;
+      }
+      // SAFETY: libart stays loaded for the life of the process, and the
+      // loader reported its headers.
+      search.found = unsafe { dynamic_symbol(info, search.name) };
+      1
+   }
+
+   let mut search = Search { name, found: None };
+   // SAFETY: `visit` only touches `search` through the pointer it is handed.
+   unsafe { libc::dl_iterate_phdr(Some(visit), (&raw mut search).cast()) };
+   search
+      .found
+      .map_or(ptr::null_mut(), |addr| addr as *mut c_void)
+}
+
+#[cfg(target_pointer_width = "64")]
+#[repr(C)]
+struct Sym {
+   name:   u32,
+   _info:  u8,
+   _other: u8,
+   shndx:  u16,
+   value:  usize,
+   _size:  u64,
+}
+
+#[cfg(target_pointer_width = "32")]
+#[repr(C)]
+struct Sym {
+   name:   u32,
+   value:  usize,
+   _size:  u32,
+   _info:  u8,
+   _other: u8,
+   shndx:  u16,
+}
+
+/// Looks `name` up through the module's GNU or `SysV` hash table.
+///
+/// # Safety
+///
+/// `info` describes a loaded module whose dynamic section, hash tables, and
+/// symbol and string tables are mapped and well formed.
+unsafe fn dynamic_symbol(info: &libc::dl_phdr_info, name: &[u8]) -> Option<usize> {
+   const DT_NULL: isize = 0;
+   const DT_HASH: isize = 4;
+   const DT_STRTAB: isize = 5;
+   const DT_SYMTAB: isize = 6;
+   const DT_GNU_HASH: isize = 0x6FFF_FEF5;
+
+   let bias = usize::try_from(info.dlpi_addr).ok()?;
+   if info.dlpi_phdr.is_null() {
+      return None;
+   }
+   // SAFETY: the loader reports dlpi_phnum headers at dlpi_phdr.
+   let headers =
+      unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
+   let dynamic = headers
+      .iter()
+      .find(|header| header.p_type == libc::PT_DYNAMIC)?;
+
+   // Bionic leaves the dynamic section's addresses unrelocated, so each one
+   // is an offset from the load bias.
+   let (mut sysv, mut gnu, mut strings, mut symbols) = (0, 0, 0, 0);
+   let mut entry = (bias + usize::try_from(dynamic.p_vaddr).ok()?) as *const [usize; 2];
+   loop {
+      // SAFETY: PT_DYNAMIC is mapped and ends with a DT_NULL entry, each one a
+      // pointer-sized tag and value.
+      let [tag, value] = unsafe { entry.read() };
+      match tag.cast_signed() {
+         DT_NULL => break,
+         DT_HASH => sysv = bias + value,
+         DT_GNU_HASH => gnu = bias + value,
+         DT_STRTAB => strings = bias + value,
+         DT_SYMTAB => symbols = bias + value,
+         _ => {},
+      }
+      // SAFETY: the entry just read was not DT_NULL, so another follows.
+      entry = unsafe { entry.add(1) };
+   }
+   if strings == 0 || symbols == 0 {
+      return None;
+   }
+
+   let defined = |index: u32| {
+      // SAFETY: the hash table only holds indices into the symbol table, and
+      // each symbol's name is a NUL-terminated offset into the string table.
+      let (symbol, symbol_name) = unsafe {
+         let symbol = &*(symbols as *const Sym).add(index as usize);
+         (
+            symbol,
+            CStr::from_ptr((strings + symbol.name as usize) as *const c_char),
+         )
+      };
+      (symbol.shndx != 0 && symbol.value != 0 && symbol_name.to_bytes() == name)
+         .then(|| bias + symbol.value)
+   };
+
+   if gnu != 0 {
+      let hash = name.iter().fold(5381u32, |hash, &byte| {
+         hash.wrapping_mul(33).wrapping_add(u32::from(byte))
+      });
+      let table = gnu as *const u32;
+      // SAFETY: a GNU hash table is four words (bucket count, first hashed
+      // symbol, bloom word count, bloom shift), the pointer-sized bloom
+      // words, the buckets, then one chain word per hashed symbol, the last
+      // of each chain with bit 0 set.
+      unsafe {
+         let (bucket_count, first, bloom_words) = (*table, *table.add(1), *table.add(2));
+         if bucket_count == 0 {
+            return None;
+         }
+         let buckets = table.add(4 + bloom_words as usize * (size_of::<usize>() / 4));
+         let chains = buckets.add(bucket_count as usize);
+         let mut index = *buckets.add((hash % bucket_count) as usize);
+         if index < first {
+            return None;
+         }
+         loop {
+            let chained = *chains.add((index - first) as usize);
+            if chained | 1 == hash | 1
+               && let Some(found) = defined(index)
+            {
+               return Some(found);
+            }
+            if chained & 1 != 0 {
+               return None;
+            }
+            index += 1;
+         }
+      }
+   }
+
+   if sysv != 0 {
+      let hash = name.iter().fold(0u32, |hash, &byte| {
+         let hash = (hash << 4).wrapping_add(u32::from(byte));
+         (hash ^ ((hash & 0xF000_0000) >> 24)) & 0x0FFF_FFFF
+      });
+      let table = sysv as *const u32;
+      // SAFETY: a SysV hash table is the bucket count, the chain count, the
+      // buckets, then the chains, with index 0 ending a chain.
+      unsafe {
+         let (bucket_count, chain_count) = (*table, *table.add(1));
+         if bucket_count == 0 {
+            return None;
+         }
+         let chains = table.add(2 + bucket_count as usize);
+         let mut index = *table.add(2 + (hash % bucket_count) as usize);
+         while index != 0 && index < chain_count {
+            if let Some(found) = defined(index) {
+               return Some(found);
+            }
+            index = *chains.add(index as usize);
+         }
+      }
+   }
+   None
 }
 
 /// The current thread's `JNIEnv`, attaching the thread if needed. Attached

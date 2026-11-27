@@ -224,7 +224,7 @@ static ICON_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 
 /// A plugin's icon as a Mana icon id: `res://ic_mana_angle_brackets` is
 /// `AngleBrackets`. Without an icon, the puzzle piece mobile shows too.
-fn map_icon(icon: Option<&str>) -> Option<u16> {
+pub fn map_icon(icon: Option<&str>) -> Option<u16> {
    let Some(names) = ICON_NAMES.get() else {
       return legacy_icon(icon?);
    };
@@ -502,13 +502,10 @@ fn append_plugin_actions(
          message: message_id,
          channel: channel_id,
       });
-      let rc_ptr = if crate::X86_CODE {
-         let Some(rc_ptr) = gpui::alloc_rc_u64(token) else {
-            continue;
-         };
-         rc_ptr
-      } else {
-         gpui::pinned_rc_u64(token)
+      let Some(rc_ptr) = gpui::alloc_rc_u64(token)
+         .or_else(|| (!crate::X86_CODE).then(|| gpui::pinned_rc_u64(token)))
+      else {
+         continue;
       };
       let label_ss = SharedString::from_str(&action.label);
       let id_str = gpui::intern_str(&format!("sunbird-msg-action-{}", action.id));
@@ -639,8 +636,8 @@ mod arm64 {
       let _ = ORIG.set(orig);
       // SAFETY: the thunks take the constructors' arguments the x86 way, result
       // slot first, and `vec_push` is plain.
-      unsafe {
-         let _ = MENU_SYMS.set(MenuSymbols {
+      let mut syms = unsafe {
+         MenuSymbols {
             orig_build:        None,
             msg_ptr_offset:    0,
             msg_id_offset:     menu.message_id_offset,
@@ -648,13 +645,18 @@ mod arm64 {
             props_new:         std::mem::transmute::<usize, super::PropsNewFn>(props_new),
             with_id:           std::mem::transmute::<usize, super::WithIdFn>(with_id),
             with_icon:         std::mem::transmute::<usize, super::WithIconFn>(with_icon),
-            with_color:        None,
+            with_color:        menu
+               .with_color
+               .and_then(sret_caller)
+               .map(|func| std::mem::transmute::<usize, super::WithColorFn>(func)),
             vec_push:          std::mem::transmute::<usize, super::VecPushFn>(menu.vec_push),
             separator_tag:     menu.separator_tag,
             layout:            menu.layout,
             id_offset:         None,
-         });
-      }
+         }
+      };
+      syms.id_offset = super::inline_id_offset(&syms);
+      let _ = MENU_SYMS.set(syms);
       let _ = IDS.set((menu.message_id_offset, menu.channel_id_offset, menu.message));
       log::info!("desktop context menu: hooked MessageContextMenu {menu:x?}");
    }
@@ -674,13 +676,11 @@ mod arm64 {
       f3: f64,
    ) -> RawMenuVec {
       let orig = *ORIG.get().expect("the detour only runs once ORIG is set");
+      let active = ACTIVE_COUNT.load(Ordering::Acquire) > 0;
+      let wanted = active || crate::double_click::pending();
       // The input is consumed by the builder, so its ids are read first.
-      let ids = match (
-         IDS.get(),
-         input.is_null(),
-         ACTIVE_COUNT.load(Ordering::Acquire),
-      ) {
-         (Some(&(id_at, channel_at, message_at)), false, 1..) => {
+      let ids = match (IDS.get(), input.is_null(), wanted) {
+         (Some(&(id_at, channel_at, message_at)), false, true) => {
             // SAFETY: `input` is the live `MessageContextMenu` input, whose
             // ids and `&Message` the builder loads from these offsets.
             let (id, channel, message) = unsafe {
@@ -693,7 +693,7 @@ mod arm64 {
                      .read_unaligned(),
                )
             };
-            if snowflake(id) && !message.is_null() {
+            if active && snowflake(id) && !message.is_null() {
                // SAFETY: the input holds the live `&Message` the menu is for.
                unsafe { super::remember_message(message, id) };
             }
@@ -704,9 +704,16 @@ mod arm64 {
       // SAFETY: forwards every register to the original builder.
       let mut out = unsafe { orig(input, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3) };
       if let (Some((message, channel)), Some(syms)) = (ids, MENU_SYMS.get()) {
-         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            append_plugin_actions(syms, &raw mut out, message, channel);
-         }));
+         if let Some(item) = crate::double_click::take_press(message) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+               super::press_item(syms, &raw mut out, &item, a2 as *mut c_void, a5 as *mut c_void);
+            }));
+         }
+         if active {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+               append_plugin_actions(syms, &raw mut out, message, channel);
+            }));
+         }
       }
       out
    }

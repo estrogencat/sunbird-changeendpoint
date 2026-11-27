@@ -163,6 +163,25 @@ trait DesktopHost {
 
    /// Starts the tray and hotkeys after [`config`] is set.
    fn start_tray() {}
+
+   /// Shows a native warning box and waits until it is dismissed.
+   fn alert(_title: &str, _body: &str) {}
+
+   /// Asks a native yes or no question and waits for it, true for yes.
+   fn confirm(_title: &str, _body: &str) -> bool {
+      false
+   }
+
+   /// The installed Sunbird launcher that starts Discord with the loader:
+   /// `sunbird.exe`, the Linux `sunbird` script, or `Sunbird.app`.
+   fn launcher() -> Option<PathBuf> {
+      None
+   }
+
+   /// Starts [`Self::launcher`] when the user logs in, or stops doing so.
+   fn set_autostart(_enabled: bool) -> Result<(), Error> {
+      Err(Error::Unsupported)
+   }
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -190,6 +209,36 @@ pub const DEVTOOLS_SHORTCUT: &str = if cfg!(target_os = "macos") {
 } else {
    "Ctrl+Shift+I"
 };
+
+/// A letter or digit pressed with Control or Alt while Discord's main window
+/// is focused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Shortcut {
+   /// `A`-`Z` or `0`-`9`.
+   pub key:   u8,
+   pub ctrl:  bool,
+   pub shift: bool,
+   pub alt:   bool,
+}
+
+/// Whether this OS reports [`Shortcut`]s.
+pub const SHORTCUTS: bool = cfg!(windows);
+
+static SHORTCUT_HANDLER: OnceLock<fn(Shortcut) -> bool> = OnceLock::new();
+
+/// Sends [`Shortcut`]s to `handler`, which returns whether it took the key so
+/// Discord never sees it. It runs on Discord's UI thread, so it must not wait.
+/// Only the first handler set counts.
+pub fn set_shortcut_handler(handler: fn(Shortcut) -> bool) {
+   let _ = SHORTCUT_HANDLER.set(handler);
+}
+
+#[cfg(windows)]
+fn take_shortcut(shortcut: Shortcut) -> bool {
+   SHORTCUT_HANDLER
+      .get()
+      .is_some_and(|handler| handler(shortcut))
+}
 
 /// Opens the Sunbird `DevTools` / Runtime Console in the default browser
 /// ([`DEVTOOLS_SHORTCUT`] while Discord Phoenix is focused).
@@ -231,10 +280,51 @@ pub fn open_url(url: &str) -> Result<(), Error> {
    Os::open(url)
 }
 
+type InApp = Box<dyn Fn(&str, Option<&str>) -> bool + Send + Sync>;
+
+static IN_APP: OnceLock<InApp> = OnceLock::new();
+
+/// Sends [`toast`] and [`notify`] to `show`, which draws them inside Discord
+/// and returns false when it cannot, leaving them to the OS.
+pub fn show_in_app(show: impl Fn(&str, Option<&str>) -> bool + Send + Sync + 'static) {
+   let _ = IN_APP.set(Box::new(show));
+}
+
+fn in_app(title: &str, body: Option<&str>) -> bool {
+   IN_APP.get().is_some_and(|show| show(title, body))
+}
+
+/// Shows a native warning box titled `title` and blocks until it is
+/// dismissed, so call it off Discord's UI thread.
+pub fn alert(title: &str, body: &str) {
+   log::warn!("[alert] {title}: {body}");
+   Os::alert(title, body);
+}
+
+/// Asks a native yes or no question and blocks for the answer, true for yes
+/// (false when the OS has no way to ask). Call it off Discord's UI thread.
+#[must_use]
+pub fn confirm(title: &str, body: &str) -> bool {
+   Os::confirm(title, body)
+}
+
+/// The installed Sunbird launcher, when there is one.
+#[must_use]
+pub fn launcher() -> Option<PathBuf> {
+   Os::launcher()
+}
+
+/// Adds or removes the OS entry that starts Sunbird's launcher at login.
+pub fn set_autostart(enabled: bool) -> Result<(), Error> {
+   Os::set_autostart(enabled)
+}
+
 /// Shows a short desktop toast / notification message.
 pub fn toast(message: &str) {
    log::info!("[toast] {message}");
-   Os::notify("Sunbird", message);
+   if !in_app(message, None) {
+      Os::notify("Sunbird", message);
+   }
 }
 
 /// Shows a titled desktop notification.
@@ -242,11 +332,15 @@ pub fn notify(title: &str, body: Option<&str>) {
    match body {
       Some(body) if !body.is_empty() => {
          log::info!("[notify] {title}: {body}");
-         Os::notify(title, body);
+         if !in_app(title, Some(body)) {
+            Os::notify(title, body);
+         }
       },
       _ => {
          log::info!("[notify] {title}");
-         Os::notify("Sunbird", title);
+         if !in_app(title, None) {
+            Os::notify("Sunbird", title);
+         }
       },
    }
 }

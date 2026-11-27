@@ -111,7 +111,10 @@ pub enum Insn {
 pub mod cond {
    pub const EQ: u8 = 0;
    pub const NE: u8 = 1;
+   pub const HS: u8 = 2;
+   pub const LO: u8 = 3;
    pub const HI: u8 = 8;
+   pub const LS: u8 = 9;
 }
 
 const fn sign_extend(value: u32, bits: u32) -> isize {
@@ -287,6 +290,126 @@ pub fn decode_at(image: &Image<'_>, addr: usize) -> Option<Insn> {
    image.read_u32(addr).map(|word| decode(word, addr))
 }
 
+/// Decodes up to `count` arm64 instructions starting at `pc` into `(addr, text)`.
+#[must_use]
+pub fn disasm(code: &[u8], pc: usize, count: usize) -> Vec<(usize, String)> {
+   code
+      .as_chunks::<4>()
+      .0
+      .iter()
+      .take(count)
+      .enumerate()
+      .map(|(i, &bytes)| {
+         let addr = pc + i * 4;
+         let word = u32::from_le_bytes(bytes);
+         (addr, format_insn(word, addr))
+      })
+      .collect()
+}
+
+fn format_insn(word: u32, pc: usize) -> String {
+   let x = |r: Reg, wide: bool| {
+      match (r, wide) {
+         (31, true) => "xzr".to_owned(),
+         (31, false) => "wzr".to_owned(),
+         (_, true) => format!("x{r}"),
+         (_, false) => format!("w{r}"),
+      }
+   };
+   let sp = |r: Reg| {
+      if r == 31 {
+         "sp".to_owned()
+      } else {
+         format!("x{r}")
+      }
+   };
+   let cond_name = |c: u8| {
+      match c {
+         0 => "eq",
+         1 => "ne",
+         2 => "hs",
+         3 => "lo",
+         4 => "mi",
+         5 => "pl",
+         6 => "vs",
+         7 => "vc",
+         8 => "hi",
+         9 => "ls",
+         10 => "ge",
+         11 => "lt",
+         12 => "gt",
+         13 => "le",
+         14 => "al",
+         _ => "nv",
+      }
+   };
+   match decode(word, pc) {
+      Insn::Adrp { rd, page } => format!("adrp {}, {page:#x}", x(rd, true)),
+      Insn::AddImm { rd, rn, imm } => format!("add {}, {}, #{imm:#x}", sp(rd), sp(rn)),
+      Insn::CmpImm { rn, imm, wide } => format!("cmp {}, #{imm:#x}", x(rn, wide)),
+      Insn::Load {
+         rt,
+         rn,
+         offset,
+         size,
+      } => {
+         let (op, wide) = match size {
+            1 => ("ldrb", false),
+            2 => ("ldrh", false),
+            4 => ("ldr", false),
+            _ => ("ldr", true),
+         };
+         format!("{op} {}, [{}, #{offset:#x}]", x(rt, wide), sp(rn))
+      },
+      Insn::Store {
+         rt,
+         rn,
+         offset,
+         size,
+      } => {
+         let (op, wide) = match size {
+            1 => ("strb", false),
+            2 => ("strh", false),
+            4 => ("str", false),
+            _ => ("str", true),
+         };
+         format!("{op} {}, [{}, #{offset:#x}]", x(rt, wide), sp(rn))
+      },
+      Insn::MovZ { rd, imm, wide } => format!("mov {}, #{imm:#x}", x(rd, wide)),
+      Insn::MovN { rd, imm, wide } => format!("movn {}, #{imm:#x}", x(rd, wide)),
+      Insn::MovReg { rd, rm, wide } => format!("mov {}, {}", x(rd, wide), x(rm, wide)),
+      Insn::Cset { rd, cond } => format!("cset {}, {}", x(rd, false), cond_name(cond)),
+      Insn::Bl { target } => format!("bl {target:#x}"),
+      Insn::B { target } => format!("b {target:#x}"),
+      Insn::BCond { cond, target } => format!("b.{} {target:#x}", cond_name(cond)),
+      Insn::Cbz {
+         rt,
+         nonzero,
+         target,
+      } => {
+         let op = if nonzero { "cbnz" } else { "cbz" };
+         format!("{op} x{rt}, {target:#x}")
+      },
+      Insn::Tbz {
+         rt,
+         bit,
+         nonzero,
+         target,
+      } => {
+         let op = if nonzero { "tbnz" } else { "tbz" };
+         format!("{op} x{rt}, #{bit}, {target:#x}")
+      },
+      Insn::Writeback { rt, rn, imm, load } => {
+         let op = if load { "ldr" } else { "str" };
+         format!("{op} x{rt}, [{}, #{imm:#x}]!", sp(rn))
+      },
+      Insn::Ret => "ret".to_owned(),
+      Insn::Br { rn } => format!("br {}", x(rn, true)),
+      Insn::Blr { rn } => format!("blr {}", x(rn, true)),
+      Insn::Other(w) => format!(".word {w:#010x}"),
+   }
+}
+
 /// The decoded body of the function holding `addr`, from its start.
 #[must_use]
 pub fn function(image: &Image<'_>, addr: usize) -> Option<(usize, Vec<(usize, Insn)>)> {
@@ -299,6 +422,172 @@ pub fn function(image: &Image<'_>, addr: usize) -> Option<(usize, Vec<(usize, In
 /// the pair close but schedule other instructions between them.
 const PAIR_REACH: usize = 12;
 
+/// Words each worker thread scans when building the reference index.
+const CHUNK_WORDS: usize = 1 << 21;
+
+/// Frees the cached arm64 reference index once startup locators have finished.
+pub fn release_ref_index() {
+   *REF_INDEX
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+struct RefIndex {
+   base:       usize,
+   exec_bytes: usize,
+   // packed `((target - base) << 32) | (site - base)`, sorted for binary search
+   refs:       Vec<u64>,
+}
+
+static REF_INDEX: std::sync::Mutex<Option<RefIndex>> = std::sync::Mutex::new(None);
+
+fn exec_summary(image: &Image<'_>) -> Option<(usize, usize, usize)> {
+   let base = image.segments.iter().map(|seg| seg.addr).min()?;
+   let mut exec_bytes = 0usize;
+   let mut max_end = base;
+   for seg in &image.segments {
+      if seg.executable {
+         exec_bytes = exec_bytes.saturating_add(seg.bytes.len());
+      }
+      max_end = max_end.max(seg.addr.saturating_add(seg.bytes.len()));
+   }
+   // Only cache real binaries; small test images scan directly.
+   if exec_bytes < (1 << 20) || max_end.saturating_sub(base) > u32::MAX as usize {
+      return None;
+   }
+   Some((base, exec_bytes, max_end))
+}
+
+fn with_index<T>(image: &Image<'_>, f: impl FnOnce(&RefIndex) -> T) -> Option<T> {
+   let (base, exec_bytes, max_end) = exec_summary(image)?;
+   let mut guard = REF_INDEX
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+   let matches = guard
+      .as_ref()
+      .is_some_and(|idx| idx.base == base && idx.exec_bytes == exec_bytes);
+   if !matches {
+      let mut refs = build_ref_index(image, base, max_end)?;
+      refs.sort_unstable();
+      *guard = Some(RefIndex {
+         base,
+         exec_bytes,
+         refs,
+      });
+   }
+   Some(f(guard.as_ref()?))
+}
+
+fn indexed_ranges(image: &Image<'_>, targets: &[Range<usize>]) -> Option<Vec<(usize, usize)>> {
+   with_index(image, |idx| {
+      let mut out = Vec::new();
+      for range in targets {
+         if range.is_empty() || range.end <= idx.base {
+            continue;
+         }
+         let low = u64::try_from(range.start.saturating_sub(idx.base))
+            .unwrap_or(u64::MAX)
+            .min(u64::from(u32::MAX));
+         let high = u64::try_from((range.end - 1).saturating_sub(idx.base))
+            .unwrap_or(u64::MAX)
+            .min(u64::from(u32::MAX));
+         let start = idx.refs.partition_point(|&r| (r >> 32) < low);
+         let end = idx.refs.partition_point(|&r| (r >> 32) <= high);
+         out.extend(idx.refs[start..end].iter().map(|&r| {
+            (
+               idx.base + (r & 0xFFFF_FFFF) as usize,
+               idx.base + (r >> 32) as usize,
+            )
+         }));
+      }
+      out
+   })
+}
+
+/// Scans `words[from..to]` (warming `adrp` pages up to `PAIR_REACH` words
+/// early) and invokes `on_ref(site, target)` for every `adrp` pair and direct
+/// branch in `[from, to)`.
+fn scan_chunk_refs(
+   segment_addr: usize,
+   words: &[[u8; 4]],
+   from: usize,
+   to: usize,
+   mut on_ref: impl FnMut(usize, usize),
+) {
+   // The last `adrp` each register got, by its instruction index.
+   let mut pages = [(usize::MAX, 0usize); 32];
+   let warm = from.saturating_sub(PAIR_REACH);
+   for (offset, &raw) in words[warm..to].iter().enumerate() {
+      let index = warm + offset;
+      let pc = segment_addr + index * 4;
+      let word = u32::from_le_bytes(raw);
+      let paired = |rn: Reg, imm: usize| {
+         let (at, page) = pages[usize::from(rn)];
+         (at != usize::MAX && index - at <= PAIR_REACH).then(|| page.wrapping_add(imm))
+      };
+      let target = match decode(word, pc) {
+         Insn::Adrp { rd, page } => {
+            pages[usize::from(rd)] = (index, page);
+            None
+         },
+         Insn::AddImm { rn, imm, .. } => paired(rn, imm),
+         Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => paired(rn, offset),
+         Insn::Bl { target } | Insn::B { target } => Some(target),
+         _ => None,
+      };
+      if index >= from
+         && let Some(target) = target
+      {
+         on_ref(pc, target);
+      }
+   }
+}
+
+fn build_ref_index(image: &Image<'_>, base: usize, max_end: usize) -> Option<Vec<u64>> {
+   let mut all = Vec::new();
+   for segment in image.segments.iter().filter(|segment| segment.executable) {
+      let words = segment.bytes.as_chunks::<4>().0;
+      let chunks = words.len().div_ceil(CHUNK_WORDS);
+      let parts: Option<Vec<Vec<u64>>> = std::thread::scope(|scope| {
+         #[expect(
+            clippy::needless_collect,
+            reason = "spawn every chunk worker before joining"
+         )]
+         let handles: Vec<_> = (0..chunks)
+            .map(|chunk| {
+               scope.spawn(move || {
+                  let start = chunk * CHUNK_WORDS;
+                  let end = (start + CHUNK_WORDS).min(words.len());
+                  let mut found = Vec::new();
+                  scan_chunk_refs(segment.addr, words, start, end, |pc, target| {
+                     if target >= base
+                        && target < max_end
+                        && pc >= base
+                        && let (Ok(t_rva), Ok(s_rva)) =
+                           (u32::try_from(target - base), u32::try_from(pc - base))
+                     {
+                        found.push((u64::from(t_rva) << 32) | u64::from(s_rva));
+                     }
+                  });
+                  found
+               })
+            })
+            .collect();
+         handles
+            .into_iter()
+            .map(|handle| handle.join().ok())
+            .collect()
+      });
+      let parts = parts?;
+      let total: usize = parts.iter().map(Vec::len).sum();
+      all.reserve(total);
+      for part in parts {
+         all.extend(part);
+      }
+   }
+   Some(all)
+}
+
 /// `(site, target)` for every `adrp` pair (`add` or load) and direct branch in
 /// executable code that lands in one of `targets`. The site is the pair's
 /// second instruction.
@@ -306,6 +595,12 @@ const PAIR_REACH: usize = 12;
 /// `targets` are sorted and disjoint, so many anchors cost one pass.
 #[must_use]
 pub fn code_refs(image: &Image<'_>, targets: &[Range<usize>]) -> Vec<(usize, usize)> {
+   if targets.is_empty() {
+      return Vec::new();
+   }
+   if let Some(found) = indexed_ranges(image, targets) {
+      return found;
+   }
    let wanted = |target: &usize| {
       targets
          .get(targets.partition_point(|range| range.end <= *target))
@@ -316,44 +611,21 @@ pub fn code_refs(image: &Image<'_>, targets: &[Range<usize>]) -> Vec<(usize, usi
    for segment in image.segments.iter().filter(|segment| segment.executable) {
       let words = segment.bytes.as_chunks::<4>().0;
       let chunk = words.len().div_ceil(threads).max(PAIR_REACH);
-      // Each thread starts `PAIR_REACH` words early so the `adrp`s before its
-      // first word are known, and reports only its own words.
-      let scan = |from: usize| {
-         // The last `adrp` each register got, by its instruction index.
-         let mut pages = [(usize::MAX, 0usize); 32];
-         let mut found = Vec::new();
-         let to = (from + chunk).min(words.len());
-         let start = from.saturating_sub(PAIR_REACH);
-         for (offset, &raw) in words[start..to].iter().enumerate() {
-            let index = start + offset;
-            let pc = segment.addr + index * 4;
-            let word = u32::from_le_bytes(raw);
-            let paired = |rn: Reg, imm: usize| {
-               let (at, page) = pages[usize::from(rn)];
-               (at != usize::MAX && index - at <= PAIR_REACH).then(|| page.wrapping_add(imm))
-            };
-            let target = match decode(word, pc) {
-               Insn::Adrp { rd, page } => {
-                  pages[usize::from(rd)] = (index, page);
-                  None
-               },
-               Insn::AddImm { rn, imm, .. } => paired(rn, imm),
-               Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => paired(rn, offset),
-               Insn::Bl { target } | Insn::B { target } => Some(target),
-               _ => None,
-            };
-            if index >= from
-               && let Some(target) = target.filter(wanted)
-            {
-               found.push((pc, target));
-            }
-         }
-         found
-      };
       std::thread::scope(|scope| {
          let handles: Vec<_> = (0..words.len())
             .step_by(chunk)
-            .map(|from| scope.spawn(move || scan(from)))
+            .map(|from| {
+               scope.spawn(move || {
+                  let to = (from + chunk).min(words.len());
+                  let mut part = Vec::new();
+                  scan_chunk_refs(segment.addr, words, from, to, |pc, target| {
+                     if wanted(&target) {
+                        part.push((pc, target));
+                     }
+                  });
+                  part
+               })
+            })
             .collect();
          for handle in handles {
             found.extend(handle.join().unwrap_or_default());
@@ -375,6 +647,20 @@ pub fn absolute_jump(to: usize) -> [u8; JUMP_LEN] {
    jump[4..8].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
    jump[8..].copy_from_slice(&(to as u64).to_le_bytes());
    jump
+}
+
+/// `ldr x3, #16; ldr x16, #20; br x16; nop; .quad fallback; .quad detour`:
+/// jumps to `detour` with `fallback` in `x3`, preserving `x0..=x2`.
+#[must_use]
+pub fn pass_x3_stub(detour: usize, fallback: usize) -> [u8; 32] {
+   let mut stub = [0; 32];
+   stub[..4].copy_from_slice(&0x5800_0083u32.to_le_bytes());
+   stub[4..8].copy_from_slice(&0x5800_00B0u32.to_le_bytes());
+   stub[8..12].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
+   stub[12..16].copy_from_slice(&0xD503_201Fu32.to_le_bytes());
+   stub[16..24].copy_from_slice(&(fallback as u64).to_le_bytes());
+   stub[24..32].copy_from_slice(&(detour as u64).to_le_bytes());
+   stub
 }
 
 /// `code`, the instructions displaced from `from`, rewritten to run anywhere:
@@ -485,4 +771,99 @@ pub fn sret_callee(detour: usize) -> Vec<u8> {
       .collect::<Vec<u8>>();
    code.extend(absolute_jump(detour));
    code
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn relocates_branches_to_their_absolute_targets() {
+      // bl +0x100 at 0x1000, then a plain `mov x29, sp`.
+      let code = [0x9400_0040u32, 0x9100_03FD]
+         .iter()
+         .flat_map(|word| word.to_le_bytes())
+         .collect::<Vec<u8>>();
+      let moved = relocate(&code, 0x1000).expect("movable");
+      let words = moved
+         .as_chunks::<4>()
+         .0
+         .iter()
+         .map(|&word| u32::from_le_bytes(word))
+         .collect::<Vec<u32>>();
+      assert_eq!(words, [
+         0x5800_0070,
+         0xD63F_0200,
+         0x1400_0003,
+         0x1100,
+         0,
+         0x9100_03FD
+      ]);
+      // `adr x0, #0` has no absolute form here.
+      assert_eq!(relocate(&0x1000_0000u32.to_le_bytes(), 0), None);
+   }
+
+   #[test]
+   fn sret_thunks_reach_their_targets() {
+      let caller = sret_caller(0x1234_5678_9ABC);
+      let ldr = caller
+         .as_chunks::<4>()
+         .0
+         .iter()
+         .position(|&word| u32::from_le_bytes(word) == 0x5800_00D0)
+         .expect("loads its target");
+      assert_eq!(caller.len() % 8, 0);
+      assert_eq!(&caller[ldr * 4 + 24..], 0x1234_5678_9ABCu64.to_le_bytes());
+      let entry = sret_callee(0x42);
+      assert_eq!(&entry[entry.len() - 8..], 0x42u64.to_le_bytes());
+      assert_eq!(
+         u32::from_le_bytes(entry[28..32].try_into().unwrap()),
+         mov(0, 8)
+      );
+   }
+
+   #[test]
+   fn decodes_writeback_loads() {
+      // ldr q0, [x3, #0xb8]!
+      assert_eq!(decode(0x3CCB_8C60, 0), Insn::Writeback {
+         rt:   0,
+         rn:   3,
+         imm:  0xB8,
+         load: true,
+      });
+      // ldr w8, [x3, #0xe8]!
+      assert_eq!(decode(0xB84E_8C68, 0), Insn::Writeback {
+         rt:   8,
+         rn:   3,
+         imm:  0xE8,
+         load: true,
+      });
+   }
+
+   #[test]
+   fn decodes_the_forms_locators_match() {
+      assert_eq!(decode(0xD65F_03C0, 0), Insn::Ret);
+      assert_eq!(decode(0x7100_081F, 0), Insn::CmpImm {
+         rn:   0,
+         imm:  2,
+         wide: false,
+      });
+      assert_eq!(decode(0x1A9F_07E0, 0), Insn::Cset {
+         rd:   0,
+         cond: cond::NE,
+      });
+      assert_eq!(decode(0x1A9F_17E0, 0), Insn::Cset {
+         rd:   0,
+         cond: cond::EQ,
+      });
+      assert_eq!(decode(0x5280_0040, 0), Insn::MovZ {
+         rd:   0,
+         imm:  2,
+         wide: false,
+      });
+      // bl -0x30a8 at 0x10000.
+      assert_eq!(decode(0x97FF_F3D6, 0x10000), Insn::Bl {
+         target: 0x10000 - 0x30A8,
+      });
+   }
 }

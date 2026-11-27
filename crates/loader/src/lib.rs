@@ -3,10 +3,10 @@
 //! `LD_PRELOAD` on Linux and `DYLD_INSERT_LIBRARIES` on macOS.
 //!
 //! On Unix the constructor runs once the host library is mapped and relocated.
-//! Desktop hooks Discord synchronously, from `DllMain` or the constructor, then
-//! starts on a thread so startup never runs under the OS loader lock. Plugins
-//! come from the bundle stored beside this library (when present) plus
-//! `$PHOENIX_HOME/plugins`.
+//! Desktop hooks Discord synchronously, from an APC queued by `DllMain` or the
+//! constructor, then starts on a thread so startup never runs under the OS
+//! loader lock. Plugins come from the bundle stored beside this library (when
+//! present) plus `$PHOENIX_HOME/plugins`.
 
 use std::{
    env,
@@ -48,12 +48,34 @@ pub unsafe extern "system" fn DllMain(
    #[link(name = "kernel32")]
    unsafe extern "system" {
       fn DisableThreadLibraryCalls(module: *mut std::ffi::c_void) -> i32;
+      fn GetCurrentThread() -> *mut std::ffi::c_void;
+      fn QueueUserAPC(
+         function: unsafe extern "system" fn(usize),
+         thread: *mut std::ffi::c_void,
+         data: usize,
+      ) -> u32;
+   }
+
+   // Indexing joins threads, which block on the loader lock DllMain holds
+   // until it returns. The injector loads this library from an APC on
+   // Discord's suspended main thread, so an APC queued here runs right after
+   // LoadLibraryW returns, still before Discord's entry point.
+   unsafe extern "system" fn hook(_: usize) {
+      desktop();
    }
 
    if reason == DLL_PROCESS_ATTACH {
       // SAFETY: `module` is the HINSTANCE handed to DllMain.
       unsafe { DisableThreadLibraryCalls(module) };
-      desktop();
+      // SAFETY: `hook` lives as long as the process (this library is never
+      // unloaded), and the pseudo handle names the calling thread.
+      if unsafe { QueueUserAPC(hook, GetCurrentThread(), 0) } == 0 {
+         logging();
+         log::error!(
+            "phoenix could not queue its hooks: {}",
+            std::io::Error::last_os_error()
+         );
+      }
    }
    1
 }
@@ -95,15 +117,18 @@ extern "C" fn init() {
 fn desktop() {
    logging();
    if env::var_os("SUNBIRD_GATE_ONLY").is_some() {
-      match phoenix_runtime_desktop::open_gate_only() {
-         Ok(()) => log::info!("SUNBIRD_GATE_ONLY: only the access gate is open"),
-         Err(err) => log::error!("phoenix could not open the access gate: {err}"),
+      match panic::catch_unwind(AssertUnwindSafe(phoenix_runtime_desktop::open_gate_only)) {
+         Ok(Ok(())) => log::info!("SUNBIRD_GATE_ONLY: only the access gate is open"),
+         Ok(Err(err)) => log::error!("phoenix could not open the access gate: {err}"),
+         Err(_) => log::error!("phoenix panicked while opening the access gate"),
       }
       return;
    }
    let started = std::time::Instant::now();
-   if let Err(err) = phoenix_runtime_desktop::prepare() {
-      log::error!("phoenix could not hook Discord: {err}");
+   match panic::catch_unwind(AssertUnwindSafe(phoenix_runtime_desktop::prepare)) {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => log::error!("phoenix could not hook Discord: {err}"),
+      Err(_) => log::error!("phoenix panicked while hooking Discord"),
    }
    log::info!("hooked Discord in {:?}", started.elapsed());
    let _ = std::thread::Builder::new()
@@ -582,12 +607,21 @@ fn logging() {
 /// this library's own path because `/mnt/expand` is not listable), then
 /// secondary-user `/data/user/<uid>/<pkg>/files`, falling back to
 /// `/data/data/<pkg>/files`.
-#[cfg(all(unix, not(any(target_os = "ios", target_os = "linux"))))]
+#[cfg(all(
+   unix,
+   not(any(target_os = "ios", target_os = "linux", target_os = "macos"))
+))]
 fn android_files_dir(package: &str, user: u32, lib_path: Option<&str>) -> PathBuf {
    android_files_dir_with(package, user, lib_path, std::path::Path::is_dir)
 }
 
-#[cfg(any(test, all(unix, not(any(target_os = "ios", target_os = "linux")))))]
+#[cfg(any(
+   test,
+   all(
+      unix,
+      not(any(target_os = "ios", target_os = "linux", target_os = "macos"))
+   )
+))]
 fn android_files_dir_with(
    package: &str,
    user: u32,

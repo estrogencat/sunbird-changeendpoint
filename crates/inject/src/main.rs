@@ -10,8 +10,9 @@
 //!
 //! Without a DLL argument it installs itself to `%LOCALAPPDATA%\Sunbird` with
 //! Start Menu and Desktop shortcuts, and fetches the site's newest
-//! `phoenix.dll` there before each launch. Discord's own files stay untouched,
-//! so its updates never undo Sunbird. `--uninstall` removes both.
+//! `phoenix.dll` there before each launch, replacing itself first when the
+//! site ships a newer launcher. Discord's own files stay untouched, so its
+//! updates never undo Sunbird. `--uninstall` removes both.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -123,6 +124,11 @@ mod windows {
          size: *mut u32,
       ) -> i32;
       fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+   }
+
+   #[link(name = "advapi32")]
+   unsafe extern "system" {
+      fn RegDeleteKeyValueW(key: isize, sub_key: *const u16, value: *const u16) -> i32;
    }
 
    #[link(name = "user32")]
@@ -307,10 +313,52 @@ mod windows {
       }
    }
 
+   /// `--wait-pid <pid>`, which an in-app restart passes so this starts
+   /// Discord only once the old one is gone.
+   fn wait_pid(
+      args: &mut std::iter::Peekable<impl Iterator<Item = OsString>>,
+   ) -> misstep::Result<Option<u32>> {
+      if args.next_if(|arg| arg == "--wait-pid").is_none() {
+         return Ok(None);
+      }
+      let pid = args
+         .next()
+         .and_then(|pid| pid.to_str()?.parse::<u32>().ok())
+         .context("--wait-pid needs a process id")?;
+      Ok(Some(pid))
+   }
+
+   /// Waits up to `timeout` for process `pid` to exit. One already gone, or
+   /// one this can't open, doesn't wait.
+   fn wait_for_exit(pid: u32, timeout: Duration) {
+      const SYNCHRONIZE: u32 = 0x0010_0000;
+      // SAFETY: opens by pid, checked for null below.
+      let process = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+      if process.is_null() {
+         return;
+      }
+      let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+      // SAFETY: opened with SYNCHRONIZE above, and closed once.
+      unsafe {
+         WaitForSingleObject(process, millis);
+         CloseHandle(process);
+      }
+   }
+
+   /// Set for the launcher a self-update starts, so it doesn't update again.
+   const SELF_UPDATED: &str = "SUNBIRD_SELF_UPDATED";
+
    pub fn run() -> misstep::Result<()> {
       let local = PathBuf::from(env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unset")?);
       let home = local.join("Sunbird");
+      let self_updated = env::var_os(SELF_UPDATED).is_some();
+      // SAFETY: the launcher is single-threaded. Removed so Discord and the
+      // launcher an in-app restart starts don't inherit it.
+      unsafe { env::remove_var(SELF_UPDATED) };
       let mut args = env::args_os().skip(1).peekable();
+      if let Some(pid) = wait_pid(&mut args)? {
+         wait_for_exit(pid, Duration::from_secs(15));
+      }
       if args.peek().is_some_and(|arg| arg == "--uninstall") {
          uninstall(&local, &home);
          return Ok(());
@@ -346,9 +394,12 @@ mod windows {
       } else {
          home.join("sunbird.exe")
       };
-      let dll = match &explicit {
-         Some(path) => PathBuf::from(path),
-         None => install(&local, &home)?,
+      let dll = if let Some(path) = &explicit {
+         PathBuf::from(path)
+      } else if let Some(dll) = install(&local, &home, self_updated)? {
+         dll
+      } else {
+         return Ok(());
       };
       let dll = dll.canonicalize()?;
       args.next_if(|arg| arg == "--");
@@ -520,28 +571,131 @@ mod windows {
    }
 
    /// Copies this launcher into `home`, adds its shortcuts once, and brings
-   /// `phoenix.dll` up to the site's version. A failed update keeps the DLL
-   /// already there, so Sunbird still starts offline.
-   fn install(local: &Path, home: &Path) -> misstep::Result<PathBuf> {
+   /// the launcher and `phoenix.dll` up to the site's versions. A failed
+   /// update keeps what is already there, so Sunbird still starts offline.
+   /// `None` when a newer launcher took over the start.
+   fn install(local: &Path, home: &Path, self_updated: bool) -> misstep::Result<Option<PathBuf>> {
       fs::create_dir_all(home)?;
       let launcher = home.join("sunbird.exe");
+      // What the last self-update moved aside, once that launcher exited.
+      let _ = fs::remove_file(home.join("sunbird.exe.old"));
       let me = env::current_exe()?;
       let copied = !same_file(&me, &launcher);
       if copied {
          fs::copy(&me, &launcher).context("copying the launcher")?;
-      }
-      let dll = home.join("phoenix.dll");
-      if let Err(err) = update(home, &dll)
-         && !dll.is_file()
-      {
-         return Err(err.context("downloading phoenix.dll"));
-      }
-      // Missing shortcuts never stop Discord from starting, and a shortcut the
-      // user deleted stays deleted until they run the installer again.
-      if copied {
+         // Missing shortcuts never stop Discord from starting, and a shortcut
+         // the user deleted stays deleted until they run the installer again.
          let _ = crate::shortcuts::sync(local, &launcher, false);
       }
-      Ok(dll)
+      let dll = home.join("phoenix.dll");
+      let auto = auto_update(local);
+      // A missing DLL is always downloaded, whatever the setting says.
+      if dll.is_file() && !auto {
+         return Ok(Some(dll));
+      }
+      let updated = site().and_then(|site| {
+         let manifest =
+            crate::http::text(&format!("{site}/version.json"), Duration::from_secs(10))?;
+         // A failed self-update never stops Discord from starting with this
+         // launcher.
+         if auto
+            && !self_updated
+            && let Some(expected) = launcher_crc(&manifest)
+            && self_update(&site, &launcher, expected).unwrap_or(false)
+         {
+            return Ok(false);
+         }
+         update(&site, &manifest, home, &dll).map(|()| true)
+      });
+      match updated {
+         Ok(false) => Ok(None),
+         Err(err) if !dll.is_file() => Err(err.context("downloading phoenix.dll")),
+         _ => Ok(Some(dll)),
+      }
+   }
+
+   /// Replaces `launcher` with the site's when its CRC-32 is not `expected`,
+   /// and starts the new one with this one's arguments. True once it runs.
+   fn self_update(site: &str, launcher: &Path, expected: u32) -> misstep::Result<bool> {
+      if crc32fast::hash(&fs::read(launcher)?) == expected {
+         return Ok(false);
+      }
+      let fresh = launcher.with_file_name(format!("sunbird.exe.{}.new", std::process::id()));
+      let url = format!("{site}/plugins/sunbird-windows-x86_64.exe");
+      let installed = crate::http::download(&url, &fresh, Duration::from_secs(60)).and_then(|()| {
+         if !is_launcher(&fs::read(&fresh)?, expected) {
+            misstep::bail!("the downloaded sunbird.exe is not the one version.json lists");
+         }
+         Ok(replace(launcher, &fresh)?)
+      });
+      if installed.is_err() {
+         let _ = fs::remove_file(&fresh);
+      }
+      installed?;
+      Command::new(launcher)
+         .args(env::args_os().skip(1))
+         .env(SELF_UPDATED, "1")
+         .spawn()?;
+      Ok(true)
+   }
+
+   /// Whether `bytes` are a PE image with CRC-32 `expected`.
+   fn is_launcher(bytes: &[u8], expected: u32) -> bool {
+      bytes.starts_with(b"MZ") && crc32fast::hash(bytes) == expected
+   }
+
+   /// `launcher_crcs["sunbird-windows-x86_64.exe"]` from `version.json`.
+   fn launcher_crc(manifest: &str) -> Option<u32> {
+      const KEY: &str = "\"sunbird-windows-x86_64.exe\"";
+      let rest = manifest[manifest.find(KEY)? + KEY.len()..]
+         .trim_start()
+         .strip_prefix(':')?
+         .trim_start();
+      let end = rest
+         .find(|c: char| !c.is_ascii_digit())
+         .unwrap_or(rest.len());
+      rest[..end].parse().ok()
+   }
+
+   /// Puts `fresh` in place of `dest`. Windows lets a running launcher or a
+   /// mapped DLL be renamed but not overwritten, so `dest` moves aside to
+   /// `.old`, and back when `fresh` can't take its place.
+   fn replace(dest: &Path, fresh: &Path) -> io::Result<()> {
+      let mut old = dest.as_os_str().to_owned();
+      old.push(".old");
+      let old = PathBuf::from(old);
+      let _ = fs::remove_file(&old);
+      let moved = dest.is_file();
+      if moved {
+         fs::rename(dest, &old)?;
+      }
+      if let Err(err) = fs::rename(fresh, dest) {
+         if moved {
+            let _ = fs::rename(&old, dest);
+         }
+         return Err(err);
+      }
+      // Fails while the old copy still runs; the next start removes it.
+      let _ = fs::remove_file(&old);
+      Ok(())
+   }
+
+   /// Whether `launcher.conf`, which Sunbird's settings write into its home
+   /// (`crates/runtime-desktop/src/config.rs`), leaves updates on.
+   fn auto_update(local: &Path) -> bool {
+      let conf = local
+         .join("DiscordPhoenix")
+         .join("sunbird")
+         .join("launcher.conf");
+      fs::read_to_string(conf).map_or(true, |text| auto_update_in(&text))
+   }
+
+   fn auto_update_in(conf: &str) -> bool {
+      !conf.lines().any(|line| {
+         line
+            .split_once('=')
+            .is_some_and(|(key, value)| key.trim() == "auto_update" && value.trim() == "false")
+      })
    }
 
    fn same_file(a: &Path, b: &Path) -> bool {
@@ -554,10 +708,8 @@ mod windows {
    /// Downloads `phoenix.dll` when the site's loader version differs from the
    /// one recorded beside it. A running Discord keeps the old DLL mapped,
    /// which Windows lets us rename but not overwrite.
-   fn update(home: &Path, dll: &Path) -> misstep::Result<()> {
-      let site = site()?;
-      let manifest = crate::http::text(&format!("{site}/version.json"), Duration::from_secs(10))?;
-      let version = loader_version(&manifest).context("version.json has no loader")?;
+   fn update(site: &str, manifest: &str, home: &Path, dll: &Path) -> misstep::Result<()> {
+      let version = loader_version(manifest).context("version.json has no loader")?;
       let stamp = home.join("version.txt");
       if dll.is_file() && fs::read_to_string(&stamp).is_ok_and(|have| have.trim() == version) {
          return Ok(());
@@ -586,24 +738,15 @@ mod windows {
          let _ = fs::remove_file(&fresh);
          misstep::bail!("the downloaded phoenix.dll is not a Windows loader");
       }
-      let old = home.join("phoenix.dll.old");
-      let _ = fs::remove_file(&old);
-      let replaced = if dll.is_file() {
-         fs::rename(dll, &old)?;
-         true
-      } else {
-         false
-      };
-      if let Err(install) = fs::rename(&fresh, dll) {
+      if let Err(install) = replace(dll, &fresh) {
          // A failed swap must not leave Sunbird without a DLL: the one moved
-         // aside goes back into place, and this launch carries on with it.
+         // aside went back into place, and this launch carries on with it.
          let _ = fs::remove_file(&fresh);
-         if replaced && fs::rename(&old, dll).is_ok() {
+         if dll.is_file() {
             return Ok(());
          }
          misstep::bail!("installing phoenix.dll failed: {install}");
       }
-      let _ = fs::remove_file(&old);
       fs::write(stamp, version)?;
       Ok(())
    }
@@ -629,7 +772,18 @@ mod windows {
    /// Removes the shortcuts and `home`. Files a running Discord or launcher
    /// still holds stay until they exit, and the user is told so.
    fn uninstall(local: &Path, home: &Path) {
+      /// `HKEY_CURRENT_USER`, a sign-extended predefined handle.
+      const HKEY_CURRENT_USER: isize = 0x8000_0001_u32.cast_signed() as isize;
       let _ = crate::shortcuts::sync(local, &home.join("sunbird.exe"), true);
+      // SAFETY: both strings are NUL-terminated and outlive the call. A
+      // value that isn't there is not an error worth reporting.
+      unsafe {
+         RegDeleteKeyValueW(
+            HKEY_CURRENT_USER,
+            wide(r"Software\Microsoft\Windows\CurrentVersion\Run").as_ptr(),
+            wide("Sunbird").as_ptr(),
+         );
+      }
       match fs::remove_dir_all(home) {
          Err(err) if err.kind() != io::ErrorKind::NotFound => {
             alert(&format!(
@@ -666,6 +820,89 @@ mod windows {
             Some("2026.11.23.2353-b51d77c")
          );
          assert_eq!(super::loader_version("{}"), None);
+      }
+
+      #[test]
+      fn reads_the_launcher_crc() {
+         let manifest = "{\n  \"loader\": \"1\",\n  \"launcher_crcs\": {\n    \
+                         \"sunbird-linux.sh\": 7,\n    \"sunbird-windows-x86_64.exe\": \
+                         3735928559\n  },\n  \"plugins\": {}\n}";
+         assert_eq!(super::launcher_crc(manifest), Some(0xDEAD_BEEF));
+         assert_eq!(super::launcher_crc("{\"loader\": \"1\"}"), None);
+         assert_eq!(
+            super::launcher_crc("{\"sunbird-windows-x86_64.exe\": \"x\"}"),
+            None
+         );
+      }
+
+      #[test]
+      fn checks_a_downloaded_launcher() {
+         // The standard CRC-32 check value.
+         assert_eq!(crc32fast::hash(b"123456789"), 0xCBF4_3926);
+         let exe = b"MZ\x90\0rest";
+         let crc = crc32fast::hash(exe);
+         assert!(super::is_launcher(exe, crc));
+         assert!(!super::is_launcher(exe, crc ^ 1));
+         assert!(!super::is_launcher(b"<html>", crc32fast::hash(b"<html>")));
+      }
+
+      #[test]
+      fn replaces_a_file_through_old() {
+         let dir = std::env::temp_dir().join(format!("sunbird-replace-{}", std::process::id()));
+         let _ = std::fs::remove_dir_all(&dir);
+         std::fs::create_dir_all(&dir).unwrap();
+         let dest = dir.join("sunbird.exe");
+         let fresh = dir.join("sunbird.exe.1.new");
+         std::fs::write(&dest, "old").unwrap();
+         std::fs::write(&fresh, "new").unwrap();
+         super::replace(&dest, &fresh).unwrap();
+         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
+         assert!(!fresh.exists() && !dir.join("sunbird.exe.old").exists());
+         // Without a fresh file it fails, and the current one goes back.
+         assert!(super::replace(&dest, &fresh).is_err());
+         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
+         std::fs::remove_dir_all(&dir).unwrap();
+      }
+
+      #[test]
+      fn reads_auto_update_from_launcher_conf() {
+         assert!(super::auto_update_in(""));
+         assert!(super::auto_update_in("onboarded=true\nauto_update=true\n"));
+         assert!(!super::auto_update_in(
+            "onboarded=true\nauto_start=true\nauto_update=false\n"
+         ));
+         assert!(!super::auto_update_in("auto_update = false\r\n"));
+      }
+
+      #[test]
+      fn takes_a_wait_pid() {
+         let args = |list: &[&str]| {
+            list
+               .iter()
+               .map(std::ffi::OsString::from)
+               .collect::<Vec<_>>()
+               .into_iter()
+               .peekable()
+         };
+         let mut given = args(&["--wait-pid", "4242", "--uninstall"]);
+         assert_eq!(super::wait_pid(&mut given).unwrap(), Some(4242));
+         assert_eq!(given.next().as_deref(), Some("--uninstall".as_ref()));
+         assert_eq!(super::wait_pid(&mut args(&["--", "x"])).unwrap(), None);
+         assert!(super::wait_pid(&mut args(&["--wait-pid", "nope"])).is_err());
+         assert!(super::wait_pid(&mut args(&["--wait-pid"])).is_err());
+      }
+
+      #[test]
+      fn waits_for_a_process_to_exit() {
+         let started = std::time::Instant::now();
+         super::wait_for_exit(u32::MAX, std::time::Duration::from_secs(15));
+         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+         let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 2 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+         super::wait_for_exit(child.id(), std::time::Duration::from_secs(15));
+         assert!(child.try_wait().unwrap().is_some());
       }
 
       #[test]

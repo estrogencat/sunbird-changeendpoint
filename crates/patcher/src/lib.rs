@@ -16,7 +16,7 @@ mod dex;
 pub mod frida;
 mod host;
 pub mod ios;
-mod manifest;
+pub mod manifest;
 mod sign;
 pub mod zip;
 
@@ -67,6 +67,15 @@ pub fn host_names(apk: &[u8], names: &[&str]) -> Result<Vec<Option<u16>>, Error>
       }
    }
    Ok(numbers)
+}
+
+/// The package, versionCode and text label in `apk`'s manifest.
+pub fn manifest_info(apk: &[u8]) -> Result<manifest::Info, Error> {
+   let record = zip::read(apk)?
+      .into_iter()
+      .find(|record| record.name == "AndroidManifest.xml")
+      .ok_or_else(|| Error::Manifest("no AndroidManifest.xml".into()))?;
+   manifest::read(&record.entry(apk).data()?)
 }
 
 /// The loader's name in the APK.

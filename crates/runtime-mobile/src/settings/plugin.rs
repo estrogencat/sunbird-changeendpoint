@@ -3,12 +3,12 @@
 use phoenix_runtime::{
    Control,
    PluginInfo,
+   PluginState,
 };
 use phoenix_ui_mobile::Prop;
 use phoenix_wire::Value;
 
 use crate::settings::{
-   COLOR_ERROR,
    Field,
    ICON_CONSOLE,
    ICON_PLUGIN,
@@ -24,25 +24,22 @@ use crate::settings::{
       text_field,
       value_row,
    },
+   theme::Color,
    tree::Tree,
 };
 
 pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
-   let subtitle = plugin
-      .error
-      .as_deref()
-      .map(|error| format!("Failed: {error}"));
-   let status = match (&plugin.error, plugin.enabled) {
-      (Some(_), _) => "failed",
-      (None, true) => "running",
-      (None, false) => "off",
+   let (subtitle, status) = match &plugin.state {
+      PluginState::Failed(error) => (Some(format!("Failed: {error}")), "failed"),
+      PluginState::On => (None, "running"),
+      PluginState::Off => (None, "off"),
    };
    let (rows, fields) = setting_controls(index, plugin);
    let mut sections = vec![section("", vec![switch_row(
       Some(ICON_PLUGIN),
       "Enabled",
       subtitle.as_deref(),
-      plugin.enabled,
+      plugin.state.is_on(),
       Press::Toggle(index),
       Press::Toggle(index),
    )])];
@@ -69,10 +66,10 @@ pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
       // `root > row > [icon, label]`, both in the danger color.
       if let Some(row) = uninstall.kids.first_mut() {
          if let Some(icon) = row.kids.get_mut(0) {
-            icon.set(Prop::TINT, Some(Value::I64(COLOR_ERROR)));
+            icon.set(Prop::TINT, Some(Value::I64(Color::Error.argb())));
          }
          if let Some(label) = row.kids.get_mut(1) {
-            label.set(Prop::COLOR, Some(Value::I64(COLOR_ERROR)));
+            label.set(Prop::COLOR, Some(Value::I64(Color::Error.argb())));
          }
       }
       actions.push(uninstall);
@@ -88,6 +85,16 @@ pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
       }
    }
    info.push(value_row("Status", status));
+   let permissions = if plugin.permissions.is_empty() {
+      vec![value_row("Reaches", "its own settings and storage only")]
+   } else {
+      plugin
+         .permissions
+         .iter()
+         .map(|permission| value_row(permission.label(), permission.summary()))
+         .collect()
+   };
+   sections.push(section("Permissions", permissions));
    sections.push(section("Info", info));
    sections
 }

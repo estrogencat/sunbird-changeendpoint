@@ -52,6 +52,7 @@
 
 !plugins/
 !plugins/*/
+!plugins/*/manifest.ts
 !plugins/*/src/
 !plugins/*/src/**/
 !plugins/*/src/**/*.ts
@@ -64,6 +65,7 @@
 !scripts/*.sh
 
 !web/
+!web/discord.json
 !web/tools/
 !web/tools/*.ts
 !web/plugins/

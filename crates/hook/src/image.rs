@@ -483,10 +483,10 @@ unsafe fn swap_code(
       })
       .collect();
    for &(page, prot) in restore {
-      let _ = protect(page, prot);
-      // SAFETY: `page` is mapped; this only drops stale instruction cache
-      // lines.
+      // SAFETY: `page` is mapped; drop stale instruction cache lines before
+      // restoring execute permission.
       unsafe { sys_icache_invalidate(page as *mut c_void, page_size) };
+      let _ = protect(page, prot);
    }
    Ok(previous)
 }
@@ -1224,6 +1224,72 @@ impl Image<'static> {
       _prologue_len: usize,
       detour: usize,
    ) -> Result<usize, crate::Error> {
+      // SAFETY: forwarded from the caller.
+      unsafe { self.hook_entry_with(addr, |_| Some(detour)) }
+   }
+
+   /// Like [`Self::hook_entry`], but jumps through a tiny stub that passes the
+   /// trampoline address in `x3` before branching to `detour` (preserving
+   /// `x0..=x2`), so a shared detour can forward to the specific hooked
+   /// function's original entry.
+   ///
+   /// # Safety
+   ///
+   /// `detour` expects the function's arguments in `x0..=x2` plus the
+   /// trampoline address in `x3`, and no thread runs the function's first bytes
+   /// while they are written.
+   pub unsafe fn hook_entry_with_fallback(
+      &self,
+      addr: usize,
+      detour: usize,
+   ) -> Result<usize, crate::Error> {
+      // SAFETY: forwarded from the caller.
+      unsafe {
+         self.hook_entry_with(addr, |trampoline| {
+            jit_copy(&crate::arm64::pass_x3_stub(detour, trampoline))
+         })
+      }
+   }
+
+   /// Like [`Self::hook_entry`] for a function returning through `x8`:
+   /// `detour` takes the return slot as its first argument, and so does the
+   /// returned original. Both thunks exist before the jump is written.
+   ///
+   /// # Safety
+   ///
+   /// `detour` has the function's ABI with the return slot moved first, and
+   /// no thread runs the function's first bytes while they are written.
+   pub unsafe fn hook_sret_entry(
+      &self,
+      addr: usize,
+      _prologue: Pattern,
+      _prologue_len: usize,
+      detour: usize,
+   ) -> Result<usize, crate::Error> {
+      let no_memory = || {
+         crate::Error::Attach {
+            backend: "inline",
+            target:  addr,
+            message: "no memory for the sret thunks".to_owned(),
+         }
+      };
+      let entry = sret_callee(detour).ok_or_else(no_memory)?;
+      let mut original = None;
+      // SAFETY: forwarded from the caller.
+      unsafe {
+         self.hook_entry_with(addr, |trampoline| {
+            original = sret_caller(trampoline);
+            original.map(|_| entry)
+         })
+      }?;
+      original.ok_or_else(no_memory)
+   }
+
+   unsafe fn hook_entry_with(
+      &self,
+      addr: usize,
+      make_entry: impl FnOnce(usize) -> Option<usize>,
+   ) -> Result<usize, crate::Error> {
       use crate::arm64::{
          self,
          Insn,
@@ -1244,7 +1310,10 @@ impl Image<'static> {
       if start != addr {
          return Err(refuse("not a function start"));
       }
-      let inside = addr + 1..addr + JUMP_LEN;
+      if body.len() * 4 < JUMP_LEN {
+         return Err(refuse("function shorter than the jump"));
+      }
+      let inside = addr..addr + JUMP_LEN;
       if body.iter().any(|&(_, insn)| {
          matches!(
             insn,
@@ -1261,8 +1330,9 @@ impl Image<'static> {
          .ok_or_else(|| refuse("a displaced instruction can't be moved"))?;
       code.extend(arm64::absolute_jump(addr + JUMP_LEN));
       let trampoline = jit_copy(&code).ok_or_else(|| refuse("no memory for the trampoline"))?;
+      let entry = make_entry(trampoline).ok_or_else(|| refuse("no memory for the detour stub"))?;
       // SAFETY: forwarded from the caller.
-      unsafe { self.write_code(addr, &arm64::absolute_jump(detour)) }?;
+      unsafe { self.write_code(addr, &arm64::absolute_jump(entry)) }?;
       Ok(trampoline)
    }
 }
@@ -1274,6 +1344,12 @@ pub fn sret_caller(target: usize) -> Option<usize> {
    jit_copy(&crate::arm64::sret_caller(target))
 }
 
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[must_use]
+pub const fn sret_caller(_target: usize) -> Option<usize> {
+   None
+}
+
 /// [`crate::arm64::sret_callee`] in executable memory, as a function pointer.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[must_use]
@@ -1281,33 +1357,69 @@ pub fn sret_callee(detour: usize) -> Option<usize> {
    jit_copy(&crate::arm64::sret_callee(detour))
 }
 
-/// `code` in fresh executable memory. `MAP_JIT` pages are the ones macOS lets a
-/// process write code into, one thread's view at a time.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[must_use]
+pub const fn sret_callee(_detour: usize) -> Option<usize> {
+   None
+}
+
+/// `code` in executable `MAP_JIT` memory, bump-allocated out of shared 16 KB
+/// slabs so hooks and sret thunks don't each burn a fresh page.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn jit_copy(code: &[u8]) -> Option<usize> {
-   // SAFETY: asks for a fresh anonymous mapping that replaces nothing.
-   let page = unsafe {
-      libc::mmap(
-         std::ptr::null_mut(),
-         code.len(),
-         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-         libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-         -1,
-         0,
-      )
+   use std::sync::{
+      Mutex,
+      PoisonError,
    };
-   if page == libc::MAP_FAILED {
-      return None;
+
+   const SLAB_SIZE: usize = 16 * 1024;
+   struct Slab {
+      base: usize,
+      used: usize,
+      cap:  usize,
    }
-   // SAFETY: `page` holds `code.len()` bytes, writable on this thread while
-   // JIT write protection is off, and executable again once it is back on.
+   static POOL: Mutex<Option<Slab>> = Mutex::new(None);
+
+   let aligned = (code.len() + 7) & !7;
+   let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+   let needs_new = pool
+      .as_ref()
+      .is_none_or(|slab| slab.used.saturating_add(aligned) > slab.cap);
+   if needs_new {
+      let cap = aligned.max(SLAB_SIZE);
+      // SAFETY: asks for a fresh anonymous mapping that replaces nothing.
+      let page = unsafe {
+         libc::mmap(
+            std::ptr::null_mut(),
+            cap,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+            -1,
+            0,
+         )
+      };
+      if page == libc::MAP_FAILED {
+         return None;
+      }
+      *pool = Some(Slab {
+         base: page as usize,
+         used: 0,
+         cap,
+      });
+   }
+   let slab = pool.as_mut()?;
+   let dst = (slab.base + slab.used) as *mut u8;
+   slab.used += aligned;
+   drop(pool);
+   // SAFETY: `dst` has `aligned >= code.len()` writable bytes inside our
+   // `MAP_JIT` slab while JIT write protection is toggled off on this thread.
    unsafe {
       libc::pthread_jit_write_protect_np(0);
-      std::ptr::copy_nonoverlapping(code.as_ptr(), page.cast::<u8>(), code.len());
+      std::ptr::copy_nonoverlapping(code.as_ptr(), dst, code.len());
       libc::pthread_jit_write_protect_np(1);
-      sys_icache_invalidate(page, code.len());
+      sys_icache_invalidate(dst.cast(), code.len());
    }
-   Some(page as usize)
+   Some(dst as usize)
 }
 
 impl Image<'_> {
@@ -1425,6 +1537,74 @@ impl Image<'_> {
          .segments
          .iter()
          .any(|segment| segment.executable && segment.contains(addr))
+   }
+
+   /// Every function the unwind table lists, as sorted `[start, end)`. A table
+   /// that stores starts only ends each function at the next start.
+   #[must_use]
+   pub fn functions(&self) -> Vec<(usize, usize)> {
+      let mut found = Vec::new();
+      let starts: Vec<usize> = if let Some(starts) = &self.function_starts {
+         starts.starts(self).to_vec()
+      } else if let Some((image_base, base, len)) = self.pdata {
+         let field = |at: usize| self.read_u32(at).map(|value| value as usize);
+         for index in 0..len / 12 {
+            if let (Some(start), Some(end)) =
+               (field(base + index * 12), field(base + index * 12 + 4))
+            {
+               found.push((image_base + start, image_base + end));
+            }
+         }
+         found.sort_unstable();
+         return found;
+      } else if let Some((base, len)) = self.arm_exidx {
+         (0..len / 8)
+            .filter_map(|index| {
+               let at = base + index * 8;
+               let prel31 = (self.read_u32(at)? << 1).cast_signed() >> 1;
+               at.checked_add_signed(prel31 as isize)
+            })
+            .collect()
+      } else if let Some(hdr) = self.eh_frame_hdr {
+         let word = |at: usize| Some(i32::from_ne_bytes(self.read(at, 4)?.try_into().ok()?));
+         let field = |at: usize| word(at).and_then(|rel| hdr.checked_add_signed(rel as isize));
+         let count = word(hdr + 8).and_then(|count| usize::try_from(count).ok());
+         for index in 0..count.unwrap_or(0) {
+            let (Some(start), Some(fde)) =
+               (field(hdr + 12 + index * 8), field(hdr + 16 + index * 8))
+            else {
+               continue;
+            };
+            if let Some(end) = self
+               .fde_range(fde, start)
+               .and_then(|len| start.checked_add(len))
+            {
+               found.push((start, end));
+            }
+         }
+         found.sort_unstable();
+         return found;
+      } else {
+         return found;
+      };
+      let section_end = |start: usize| {
+         self
+            .segments
+            .iter()
+            .find(|segment| segment.executable && segment.contains(start))
+            .map(|segment| segment.addr + segment.bytes.len())
+      };
+      let mut starts = starts;
+      starts.sort_unstable();
+      starts.dedup();
+      for (index, &start) in starts.iter().enumerate() {
+         let Some(limit) = section_end(start) else {
+            continue;
+         };
+         let end = starts.get(index + 1).copied().unwrap_or(limit).min(limit);
+         found.push((start, end));
+      }
+      found
    }
 
    /// Whether an unwind table starts a function at `addr`. Linkers often put
@@ -1772,5 +1952,20 @@ mod sret_thunk_tests {
       // SAFETY: the thunk takes `Native`'s shape and hands it to `x86_style`.
       let entered = unsafe { std::mem::transmute::<usize, Native>(entry) };
       assert_eq!(entered(1, 2, 3, 4, 5), Big([5, 4, 3, 2, 1, 7]));
+   }
+
+   #[test]
+   fn pass_x3_stub_forwards_args_and_fallback() {
+      const extern "C" fn receive(a: u64, b: u64, c: u64, fallback: usize) -> u64 {
+         a + b * 10 + c * 100 + (fallback as u64)
+      }
+      let stub = super::jit_copy(&crate::arm64::pass_x3_stub(
+         receive as *const () as usize,
+         0x1234_5678,
+      ))
+      .expect("jit");
+      // SAFETY: the stub preserves `x0..=x2` and supplies `fallback` in `x3`.
+      let call = unsafe { std::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> u64>(stub) };
+      assert_eq!(call(1, 2, 3), 1 + 20 + 300 + 0x1234_5678);
    }
 }

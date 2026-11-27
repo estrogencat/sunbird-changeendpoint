@@ -38,6 +38,7 @@ jobs:
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
       - env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ runner.os == 'macOS' && '13.0' || '' }}
         run: cargo +${{ matrix.toolchain }} build --locked --release -p phoenix-loader ${{ runner.os == 'Windows' && '-p phoenix-inject' || '' }}
       # The linker's signature loads, but AMFI logs a complaint about it.
       - if: runner.os == 'macOS'

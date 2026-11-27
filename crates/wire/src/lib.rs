@@ -9,6 +9,8 @@
 //!
 //! All integers are little-endian.
 
+pub mod names;
+
 use std::str::Utf8Error;
 
 const MAX_DEPTH: usize = 128;

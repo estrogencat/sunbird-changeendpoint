@@ -5,6 +5,10 @@ use std::{
    sync::{
       Mutex,
       PoisonError,
+      atomic::{
+         AtomicU32,
+         Ordering,
+      },
    },
 };
 
@@ -71,6 +75,15 @@ fn scrub(mut line: String) -> String {
    line
 }
 
+static PROBLEMS: AtomicU32 = AtomicU32::new(0);
+
+/// How many warnings and errors have been logged so far, so a caller during
+/// startup can tell whether a step it ran reported a problem.
+#[must_use]
+pub fn problems() -> u32 {
+   PROBLEMS.load(Ordering::Relaxed)
+}
+
 /// Logs through `L` and keeps a copy of each line.
 pub struct Tee<L>(pub L);
 
@@ -82,6 +95,9 @@ impl<L: Log> Log for Tee<L> {
    fn log(&self, record: &Record<'_>) {
       if !self.enabled(record.metadata()) {
          return;
+      }
+      if record.level() <= log::Level::Warn {
+         PROBLEMS.fetch_add(1, Ordering::Relaxed);
       }
       let text = scrub(record.args().to_string());
       self.0.log(

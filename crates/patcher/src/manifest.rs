@@ -1,8 +1,10 @@
-//! Binary `AndroidManifest.xml` edits for a merged APK. The split attributes
-//! go and Play Core's `com.android.vending.splits.required` turns false, so it
-//! installs on its own. A rename changes `package`, provider authorities,
-//! `com.discord.*` permissions and task affinities so it installs next to the
-//! original, and class names stay.
+//! Binary `AndroidManifest.xml` reads, and edits for a merged APK.
+//!
+//! The split attributes go and Play Core's
+//! `com.android.vending.splits.required` turns false, so it installs on its
+//! own. A rename changes `package`, provider authorities, `com.discord.*`
+//! permissions and task affinities so it installs next to the original, and
+//! class names stay.
 
 use std::collections::{
    HashMap,
@@ -35,10 +37,13 @@ const ATTR_VALUE: u32 = 0x0101_0024;
 const ATTR_LABEL: u32 = 0x0101_0001;
 const ATTR_AUTHORITIES: u32 = 0x0101_0018;
 const ATTR_TASK_AFFINITY: u32 = 0x0101_0012;
+const ATTR_VERSION_CODE: u32 = 0x0101_021B;
+const ATTR_VERSION_NAME: u32 = 0x0101_021C;
 
 const TYPE_REFERENCE: u8 = 0x01;
 const TYPE_STRING: u8 = 0x03;
 const TYPE_BOOLEAN: u8 = 0x12;
+const TYPE_INT_DEC: u8 = 0x10;
 const NO_STRING: u32 = 0xFFFF_FFFF;
 
 pub struct Patched {
@@ -49,14 +54,72 @@ pub struct Patched {
    pub added_permission: bool,
 }
 
-pub fn patch(source: &[u8], package: &str, label: Option<&str>) -> Result<Patched, Error> {
+/// What an installed APK's manifest says about the app.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Info {
+   pub package:      String,
+   pub version_code: u32,
+   pub version_name: String,
+   /// The `<application>` label when it is text, as [`patch`] writes one,
+   /// rather than a resource.
+   pub label:        Option<String>,
+}
+
+/// Reads [`Info`] from a binary `AndroidManifest.xml`.
+pub fn read(source: &[u8]) -> Result<Info, Error> {
    let bytes = Bytes(source);
+   let chunks = chunks(bytes, source.len())?;
+   let mut info = Info::default();
+   let mut pool = None;
+   let mut resource_ids = Vec::new();
+   for chunk in &chunks {
+      match chunk.kind(bytes)? {
+         RES_STRING_POOL => pool = Some(Pool::parse(chunk.bytes(bytes)?)?),
+         RES_XML_RESOURCE_MAP => {
+            resource_ids = (0..(chunk.size - 8) / 4)
+               .map(|id| bytes.u32(chunk.at + 8 + 4 * id))
+               .collect::<Result<Vec<u32>, Error>>()?;
+         },
+         RES_XML_START_ELEMENT => {
+            let strings = pool
+               .as_ref()
+               .ok_or_else(|| Error::Manifest("element before the string pool".into()))?;
+            let element = Element::parse(bytes, chunk.at, strings, &resource_ids)?;
+            for &attribute in &element.attributes {
+               let id = element.resource(attribute)?;
+               if element.is("manifest") {
+                  let name = element.string(bytes.u32(attribute + 4)?)?;
+                  if name.as_deref() == Some("package") {
+                     info.package = element.value(attribute)?.unwrap_or_default();
+                  } else if id == Some(ATTR_VERSION_CODE)
+                     && bytes.u8(attribute + 15)? == TYPE_INT_DEC
+                  {
+                     info.version_code = bytes.u32(attribute + 16)?;
+                  } else if id == Some(ATTR_VERSION_NAME) {
+                     info.version_name = element.value(attribute)?.unwrap_or_default();
+                  }
+               } else if element.is("application") && id == Some(ATTR_LABEL) {
+                  info.label = element.value(attribute)?;
+               }
+            }
+         },
+         _ => {},
+      }
+   }
+   if info.package.is_empty() || info.version_code == 0 {
+      return Err(Error::Manifest("no package or versionCode".into()));
+   }
+   Ok(info)
+}
+
+/// The chunks after the XML header, each checked to fit.
+fn chunks(bytes: Bytes<'_>, len: usize) -> Result<Vec<Chunk>, Error> {
    if bytes.u16(0)? != RES_XML {
       return Err(Error::Manifest("not a binary XML manifest".into()));
    }
    let mut chunks = Vec::new();
    let mut at = usize::from(bytes.u16(2)?);
-   while at < source.len() {
+   while at < len {
       let size = bytes.u32(at + 4)? as usize;
       if size < 8 {
          return Err(Error::Manifest(format!("chunk at {at:#x} has size {size}")));
@@ -65,6 +128,12 @@ pub fn patch(source: &[u8], package: &str, label: Option<&str>) -> Result<Patche
       chunks.push(Chunk { at, size });
       at += size;
    }
+   Ok(chunks)
+}
+
+pub fn patch(source: &[u8], package: &str, label: Option<&str>) -> Result<Patched, Error> {
+   let bytes = Bytes(source);
+   let chunks = chunks(bytes, source.len())?;
 
    let mut plan = Plan {
       package,
@@ -475,4 +544,33 @@ fn attributes(bytes: Bytes<'_>, chunk: usize) -> Result<Vec<usize>, Error> {
    }
    bytes.slice(first..first + count * width)?;
    Ok((0..count).map(|index| first + index * width).collect())
+}
+
+#[cfg(test)]
+mod tests {
+   /// `PHOENIX_BASE_APK=<base.apk> cargo test -p patcher -- --ignored`
+   #[test]
+   #[ignore = "needs a Discord base.apk"]
+   fn reads_what_a_rename_writes() {
+      let apk = std::fs::read(std::env::var("PHOENIX_BASE_APK").unwrap()).unwrap();
+      let original = crate::manifest_info(&apk).unwrap();
+      assert_eq!(original.package, super::ORIGINAL);
+      assert!(original.version_code > 0);
+      assert!(original.version_name.ends_with("Alpha"));
+      assert_eq!(original.label, None);
+
+      let record = crate::zip::read(&apk)
+         .unwrap()
+         .into_iter()
+         .find(|record| record.name == "AndroidManifest.xml")
+         .unwrap();
+      let source = record.entry(&apk).data().unwrap().into_owned();
+      let patched = super::patch(&source, "com.discord.phoenix", Some("Phoenix")).unwrap();
+      assert_eq!(super::read(&patched.data).unwrap(), super::Info {
+         package:      "com.discord.phoenix".to_owned(),
+         version_code: original.version_code,
+         version_name: original.version_name,
+         label:        Some("Phoenix".to_owned()),
+      });
+   }
 }

@@ -31,6 +31,8 @@ param(
    [string]$HotReload,
    [string]$Eval,
    [switch]$Logs,
+   [switch]$Health,
+   [switch]$ResetOnboarding,
    [switch]$Ops,
    [switch]$Events,
    [switch]$Tree,
@@ -110,6 +112,16 @@ if ($Logs) {
    Invoke-DebugGet "/logs"
    exit 0
 }
+if ($Health) {
+   Invoke-DebugGet "/health" | ConvertTo-Json -Depth 6
+   exit 0
+}
+if ($ResetOnboarding) {
+   $conf = Join-Path $env:LOCALAPPDATA "DiscordPhoenix\sunbird\launcher.conf"
+   Remove-Item $conf -ErrorAction SilentlyContinue
+   Write-Host "Removed $conf"
+   if (-not $Desktop) { exit 0 }
+}
 if ($Sigscan) {
    $tools = Join-Path (Split-Path $TargetDir -Parent) "wintools"
    if (Test-Path $tools) { $env:PATH = "$tools;$env:PATH" }
@@ -147,20 +159,13 @@ if ($Tree) {
 if ($HotReload) {
    $entry = Join-Path $RepoRoot "plugins\$HotReload\src\index.ts"
    if (-not (Test-Path $entry)) { throw "Plugin entry not found: $entry" }
-   $esbuild = Find-Esbuild
-   $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "phoenix-hot-$HotReload.js"
+   $env:ESBUILD = Find-Esbuild
+   $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "phoenix-hot"
+   $tmp = Join-Path $tmpDir "$HotReload.js"
    try {
-      $headerLines = Get-Content $entry | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-      $banner = @()
-      foreach ($line in $headerLines) {
-         if ($line.StartsWith("//")) { $banner += $line } else { break }
-      }
-      & $esbuild $entry --bundle --format=iife --target=es2020 --outfile=$tmp
+      & node (Join-Path $RepoRoot "web\tools\bundle-plugins.ts") --out $tmpDir $HotReload
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       $body = [System.IO.File]::ReadAllText($tmp)
-      if ($banner.Count -gt 0) {
-         $body = ($banner -join "`n") + "`n" + $body
-      }
       Forward-DebugShell
       $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4242/plugins/$HotReload" -Method Put -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "text/javascript; charset=utf-8" -Headers (Get-DebugHeaders)
       Write-Host "Hot-reloaded $HotReload`: $($resp | ConvertTo-Json -Compress)"
@@ -188,6 +193,9 @@ if ($Desktop) {
             Copy-Item (Get-Command as.exe).Source $tools -Force
          }
          $env:PATH = "$tools;$env:PATH"
+         if (-not (Get-Command gcc.exe -ErrorAction SilentlyContinue) -and (Test-Path "C:\Program Files\Git\mingw64\bin\gcc.exe")) {
+            $env:PATH = "$env:PATH;C:\Program Files\Git\mingw64\bin"
+         }
          $env:CARGO_TARGET_DIR = $TargetDir
          Write-Host "Building phoenix-loader and phoenix-inject (windows, profile=$profileName)..."
          $cargoArgs = @("+stable-x86_64-pc-windows-gnu", "build", "-p", "phoenix-loader", "-p", "phoenix-inject")

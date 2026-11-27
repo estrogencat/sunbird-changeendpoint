@@ -2,6 +2,7 @@
 //! accessories, and `phoenix.native` for the console.
 
 pub mod native;
+pub mod themes;
 pub mod ui;
 
 use std::{
@@ -9,6 +10,7 @@ use std::{
    collections::HashMap,
 };
 
+use phoenix_ui_desktop::Shortcut;
 use rquickjs::{
    Ctx,
    Function,
@@ -32,6 +34,9 @@ use crate::{
       DesktopMember,
    },
    members::Place,
+   shortcuts,
+   sidebar,
+   toolbar,
 };
 
 /// What plugins registered with the desktop UI, kept in the runtime's userdata
@@ -39,25 +44,33 @@ use crate::{
 #[derive(Default)]
 pub struct Desktop<'js> {
    /// `phoenix.ui.addMessageAccessory` callbacks.
-   pub accessories:   RefCell<Vec<DesktopAccessory<'js>>>,
+   pub accessories:    RefCell<Vec<DesktopAccessory<'js>>>,
    /// `phoenix.ui.addMemberDecoration` callbacks.
-   pub members:       RefCell<Vec<DesktopMember<'js>>>,
+   pub members:        RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageHeaderDecoration` callbacks.
-   pub headers:       RefCell<Vec<DesktopMember<'js>>>,
+   pub headers:        RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
-   pub actions:       RefCell<Vec<DesktopAction<'js>>>,
+   pub actions:        RefCell<Vec<DesktopAction<'js>>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
-   pub page_buttons:  RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   pub page_buttons:   RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   /// `phoenix.ui.notify` `onPress` callbacks, keyed by banner ID.
+   pub notices:        RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
-   pub emoji_pickers: RefCell<Vec<(u64, String)>>,
+   pub emoji_pickers:  RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.onEvent("rowDoubleTap")` handlers by id and plugin.
-   pub double_taps:   RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub double_taps:    RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
-   pub hides:         RefCell<Vec<(u64, String)>>,
+   pub hides:          RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.collapseChannels` holds by id and plugin.
+   pub collapses:      RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.addHeaderButton` handlers by id and plugin.
+   pub header_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
+   /// `phoenix.ui.addShortcut` handlers by id and plugin.
+   pub shortcuts:      RefCell<Vec<(u64, String, Shortcut, Function<'js>)>>,
    /// `phoenix.ui.hideCount` holds by id and plugin.
    #[cfg(target_arch = "x86_64")]
-   pub hidden_counts: RefCell<Vec<(u64, String, Count)>>,
+   pub hidden_counts:  RefCell<Vec<(u64, String, Count)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -76,8 +89,9 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, emoji pick handlers and hidden counts `name` registered and
-/// redraws Discord without them.
+/// callbacks, banners, emoji pick handlers, hidden counts, sidebar collapses,
+/// header buttons and shortcuts `name` registered and redraws Discord without
+/// them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -116,6 +130,11 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       .page_buttons
       .borrow_mut()
       .retain(|_, (_, plugin, _)| plugin != name);
+   registry
+      .notices
+      .borrow_mut()
+      .retain(|_, (plugin, _)| plugin != name);
+   crate::notices::remove_plugin(name);
 
    let mut pickers = registry.emoji_pickers.borrow_mut();
    pickers.retain(|(_, plugin)| plugin != name);
@@ -135,10 +154,42 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       !held
    });
 
+   registry.collapses.borrow_mut().retain(|(_, plugin)| {
+      let held = plugin == name;
+      if held {
+         sidebar::collapse(false);
+      }
+      !held
+   });
+
+   registry
+      .header_buttons
+      .borrow_mut()
+      .retain(|(id, plugin, _)| {
+         let held = plugin == name;
+         if held {
+            toolbar::remove(*id);
+         }
+         !held
+      });
+
+   registry
+      .shortcuts
+      .borrow_mut()
+      .retain(|(_, plugin, shortcut, _)| {
+         let held = plugin == name;
+         if held {
+            shortcuts::release(*shortcut);
+         }
+         !held
+      });
+
    #[cfg(target_arch = "x86_64")]
    {
       let mut hidden = registry.hidden_counts.borrow_mut();
       hidden.retain(|(_, plugin, _)| plugin != name);
       counts::hide(hidden.iter().map(|&(.., count)| count));
    }
+
+   themes::unload(name);
 }

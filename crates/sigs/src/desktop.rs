@@ -35,7 +35,6 @@ use phoenix_hook::{
 
 use crate::{
    Found,
-   StaffField,
    one,
 };
 
@@ -85,7 +84,7 @@ pub fn windows_restart_script(image: &Image<'_>) -> Found<usize> {
 
 /// A function entry [`Image::hook_entry`] can displace: whole instructions
 /// with no RIP-relative operand, at least 14 bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Prologue {
    pub pattern: Pattern,
    pub len:     usize,
@@ -114,6 +113,10 @@ pub struct Prologues {
    /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
    /// Win64, five on System V, up to the `jne`.
    pub emoji_check: Prologue,
+   /// READY's parse, [`ready_parse`]. Only seen on Win64 so far.
+   pub ready_parse: Option<Prologue>,
+   /// [`ready_text`], Win64 only.
+   pub ready_text:  Option<Prologue>,
 }
 
 impl Prologues {
@@ -148,6 +151,15 @@ impl Prologues {
                   pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
                   len:     14,
                },
+               // `push rbp; push rsi; sub rsp, imm32; lea rbp, [rsp + imm32]`.
+               ready_parse: Some(Prologue {
+                  pattern: Pattern::new("55 56 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
+                  len:     17,
+               }),
+               ready_text:  Some(Prologue {
+                  pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
+                  len:     15,
+               }),
             }
          },
          Abi::SysV => {
@@ -164,6 +176,8 @@ impl Prologues {
                   pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
                   len:     14,
                },
+               ready_parse: None,
+               ready_text:  None,
             }
          },
       }
@@ -208,15 +222,6 @@ fn test_self(register: Register) -> [Vec<u8>; 2] {
       1 => [vec![0x45, 0x84, modrm], vec![0x45, 0x85, modrm]],
       _ if number >= 4 => [vec![0x40, 0x84, modrm], vec![0x85, modrm]],
       _ => [vec![0x84, modrm], vec![0x85, modrm]],
-   }
-}
-
-/// `cmp r8, imm8` on a register's low byte.
-fn cmp_byte(register: Register, value: u8) -> Vec<u8> {
-   match reg(register) {
-      (number, 1) => vec![0x41, 0x80, 0xF8 | number, value],
-      (number, _) if number >= 4 => vec![0x40, 0x80, 0xF8 | number, value],
-      (number, _) => vec![0x80, 0xF8 | number, value],
    }
 }
 
@@ -314,6 +319,8 @@ fn literal(image: &Image<'_>, text: &[u8]) -> Vec<usize> {
 pub mod layout {
    /// Bytes reserved for a `gpui::Div`, which is moved by value everywhere.
    pub const DIV_CAP: usize = 0x100;
+   /// Bytes reserved for a `mana_gpui::components::motion::effects::ScaleFade`.
+   pub const SCALE_FADE_CAP: usize = 0x200;
    /// Bytes reserved for each other Mana struct (`Switch`, `Button`, `Modal`,
    /// `TextInput`, `TextArea`, `MenuItem`).
    pub const SCRATCH_CAP: usize = 0x800;
@@ -786,77 +793,24 @@ pub(crate) fn callees(image: &Image<'_>, start: usize, end: usize) -> Vec<usize>
    out
 }
 
-/// The function `ClientAccessGate` reads through, which the runtime makes
-/// answer "no gate". Its one small caller is `signed_in && access(..) != 2`.
-pub fn access_gate(image: &Image<'_>) -> Found<usize> {
-   // The `call`'s offset in each: SysV aligns the stack with `push rax` first.
-   let (caller, call) = match Abi::of(image) {
-      Abi::Win64 => {
-         (
-            Pattern::new("83 79 ?? 03 75 0C E8 ?? ?? ?? ?? 3C 02 0F 95 C0 EB 02 31 C0"),
-            6,
-         )
-      },
-      Abi::SysV => {
-         (
-            Pattern::new("83 7F ?? 03 75 ?? 50 E8 ?? ?? ?? ?? 3C 02 0F 95 C0 48 83 C4 08 C3"),
-            7,
-         )
-      },
-   };
-   let caller = one("access gate caller", &image.scan(caller))?;
-   let access = rel32_target(image, caller + call + 1).ok_or("access gate call does not decode")?;
-   if image.is_code(access) {
-      Ok(access)
-   } else {
-      Err(format!(
-         "access gate call at {:#x} leaves the code",
-         caller + call
-      ))
-   }
-}
-
-/// Phoenix's `getEmojiUnavailableReason`, `u8 f(&Emoji, &EmojiContext)`,
-/// where 0xFF is usable and 2 premium locked.
-#[derive(Clone, Copy, Debug)]
-pub struct EmojiCheck {
-   pub func:      usize,
-   /// `EmojiContext.intention`, 3 (`CHAT`) for the message box.
-   pub intention: usize,
-}
-
-/// The same leaf Android has, answering 3 for profiles first.
+/// Where the runtime makes the `surfaces` notification provider decline.
 ///
-/// `movzx r, byte [ctx + intention]; mov al, 3; mov r2, r; or r2, 2;
-/// cmp r2, 14; jne; ret`. The intention's offset is read back from the
-/// `movzx`, which must address the context argument.
-pub fn emoji_check(image: &Image<'_>) -> Found<EmojiCheck> {
-   let abi = Abi::of(image);
-   // And where the `movzx`'s ModRM sits.
-   let (check, modrm) = match abi {
-      Abi::Win64 => {
-         (
-            Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02 41 83 ?? 0E 75 01 C3"),
-            3,
-         )
-      },
-      Abi::SysV => {
-         (
-            Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E 75 01 C3"),
-            2,
-         )
-      },
-   };
-   let func = one("emoji check", &image.scan(check))?;
-   let (context, _) = reg(abi.arg(1));
-   match image.read(func + modrm, 2) {
-      Some(&[modrm, disp]) if modrm & 0xC7 == 0x40 | context => {
-         Ok(EmojiCheck {
-            func,
-            intention: usize::from(disp),
-         })
-      },
-      _ => Err(format!("emoji check at {func:#x} reads no context byte")),
+/// On System V, `client_access::enforced`'s start, to return false. On Win64,
+/// where that leaf is not confirmed, the `movzx eax, cl` in the predicate's
+/// kind mapping, to zero; the `cmove eax, esi` after it moves an `esi` zeroed
+/// on entry.
+pub fn notification_gate(image: &Image<'_>) -> Found<usize> {
+   /// `client_access::enforced`: `push rax; mov eax, state; add rax, [rdi];
+   /// mov rdi, rax; call read; mov al, [rax + flag]; xor al, 1; pop rcx; ret`.
+   const ENFORCED: Pattern = Pattern::new(
+      "50 B8 ?? ?? ?? ?? 48 03 07 48 89 C7 FF 15 ?? ?? ?? ?? 8A 80 ?? ?? ?? ?? 34 01 59 C3",
+   );
+   /// The predicate's kind-mapping; its `movzx eax, cl` is at offset 9.
+   const MAP: Pattern = Pattern::new("3C 01 B1 02 80 D9 00 3C 02 0F B6 C1 0F 44 C6");
+
+   match Abi::of(image) {
+      Abi::Win64 => Ok(one("notification gate", &image.scan(MAP))? + 9),
+      Abi::SysV => one("notification gate", &image.scan(ENFORCED)),
    }
 }
 
@@ -1048,11 +1002,12 @@ pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
 pub const MESSAGE_REQUESTS_BADGE: &[u8] = b"dm-message-requests-badge";
 
 /// What draws Phoenix's pending friend and message request counts.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PendingCounts {
    /// The DM list's row badge, `fn(out, id: &str, count: u32, _, _) -> out`,
-   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only.
-   pub badge:           usize,
+   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only. Linux
+   /// builds give each id its own copy of it.
+   pub badges:          Vec<usize>,
    /// `u32 f(&RelationshipStore)`, the incoming friend and game friend
    /// requests the DM list's Friends row and the inbox's Friends tab show.
    pub friend_requests: usize,
@@ -1064,11 +1019,15 @@ pub struct PendingCounts {
 pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
    let (friends_call, badge) = badge_call(image, FRIENDS_BADGE)?;
    let (_, requests_badge) = badge_call(image, MESSAGE_REQUESTS_BADGE)?;
-   if badge != requests_badge {
+   let badges = if badge == requests_badge {
+      vec![badge]
+   } else if same_shape(image, badge, requests_badge) {
+      vec![badge, requests_badge]
+   } else {
       return Err(format!(
          "the DM badges are drawn by {badge:#x} and {requests_badge:#x}"
       ));
-   }
+   };
    let friend_requests = count_source(image, friends_call)?;
    function_code(image, friend_requests, "friend requests count")?;
    if !counts_incoming(image, friend_requests) {
@@ -1077,9 +1036,28 @@ pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
       ));
    }
    Ok(PendingCounts {
-      badge,
+      badges,
       friend_requests,
    })
+}
+
+/// Whether `first` and `second` run the same instructions, whatever they
+/// branch to or call. Each copy of a generic calls its own copies of others.
+fn same_shape(image: &Image<'_>, first: usize, second: usize) -> bool {
+   let shape = |func: usize| {
+      function_code(image, func, "").map(|code| {
+         phoenix_hook::x86::disasm(code, func, usize::MAX)
+            .into_iter()
+            .map(|line| {
+               match line.target {
+                  Some(_) => line.text.split(' ').next().unwrap_or_default().to_owned(),
+                  None => line.text,
+               }
+            })
+            .collect::<Vec<String>>()
+      })
+   };
+   matches!((shape(first), shape(second)), (Ok(first), Ok(second)) if first == second)
 }
 
 /// `u32 f(&RelationshipStore)`, the number on the Home button.
@@ -1206,8 +1184,8 @@ fn count_source(image: &Image<'_>, site: usize) -> Found<usize> {
       let before = lines[..at].iter().rev().find(|prev| prev.text != "nop");
       return match before {
          Some(call) if call.text.starts_with("call ") => {
-            call
-               .target
+            call_target(image, &code[call.addr - func..], call.addr)
+               .map(|(_, target)| target)
                .ok_or_else(|| format!("call at {:#x} has no target", call.addr))
          },
          _ => Err(format!("{reg} at {:#x} is no call's result", line.addr)),
@@ -1255,106 +1233,34 @@ pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
    Err(format!("{func:#x} opens with less than a jump's bytes"))
 }
 
-/// Settings page 24's sidebar name, `Phoenix`, and the `PHOENIX` that ends
-/// its id, both relabeled in place.
-#[derive(Clone, Copy, Debug)]
-pub struct SettingsLabel {
-   pub name: usize,
-   pub id:   usize,
-   /// The `mov r9, imm64` translation key loaded after the id, which finds
-   /// `Phoenix` whatever the name says.
-   pub key:  Option<usize>,
+/// How the runtime sends a function's calls to a detour.
+#[derive(Clone, Debug)]
+pub enum HookPoint {
+   /// Its opening instructions move to a trampoline.
+   Entry(Prologue),
+   /// Its opening cannot move, and code only reaches it through these slots.
+   /// The function itself stays callable as the original.
+   Slots(Vec<usize>),
 }
 
-/// Page 24's label, from its one loader: `lea rax, [name]` with length 7,
-/// then a load of the id.
-///
-/// The id is `DESKTOP_PHOENIX` through Linux build 2233 and `PHOENIX` after
-/// it. COFF builds keep name and id as one literal, `PhoenixDESKTOP_PHOENIX`;
-/// ELF builds place them apart.
-pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
-   const NAME: &[u8] = b"Phoenix";
-   const ID: &[u8] = b"PHOENIX";
-   const PREFIX: &[u8] = b"DESKTOP_";
-   let suffixes = image.find_bytes(ID);
-   let ids: Vec<usize> = suffixes
-      .iter()
-      .filter_map(|&suffix| {
-         let start = suffix.checked_sub(PREFIX.len())?;
-         (image.read(start, PREFIX.len())? == PREFIX).then_some(start)
-      })
-      .chain(suffixes.iter().copied())
-      .collect();
-   let mut found: Vec<(usize, usize, Option<usize>)> = lea_refs_many(image, &ids)
-      .into_iter()
-      .flat_map(|(id, loads)| loads.into_iter().map(move |lea| (id, lea)))
-      .filter_map(|(id, lea)| {
-         let start = lea.checked_sub(0x30)?;
-         let window = image.read(start, 0x30)?;
-         let at = window
-            .windows(3)
-            .rposition(|w| w == lea_rip(Register::RAX))?;
-         let name = rel32_target(image, start + at + 3)?;
-         let suffix = if image.read(id, ID.len())? == ID {
-            id
-         } else {
-            id + PREFIX.len()
-         };
-         let key = (image.read(lea + 7, 2)? == [0x49, 0xB9]).then_some(lea + 9);
-         (image.read(name, NAME.len())? == NAME).then_some((name, suffix, key))
-      })
-      .collect();
-   found.sort_unstable();
-   found.dedup();
-   let (name, id, key) = one("settings label loader", &found)?;
-   Ok(SettingsLabel { name, id, key })
-}
-
-/// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
-/// lowers so page 24 is always shown.
-pub fn settings_visibility(image: &Image<'_>) -> Found<usize> {
-   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja
-   // ...`
-   let (guard, imm) = match Abi::of(image) {
-      Abi::Win64 => {
-         (
-            Pattern::new("0F B6 C9 B0 01 44 8D 41 F7 41 83 F8 0F 77"),
-            12,
-         )
-      },
-      Abi::SysV => (Pattern::new("40 0F B6 CF B0 01 8D 51 F7 83 FA 0F 77"), 11),
+/// [`entry_prologue`], or else the slots every call to `func` reads.
+pub fn hook_point(image: &Image<'_>, func: usize) -> Found<HookPoint> {
+   let entry = match entry_prologue(image, func) {
+      Ok(prologue) => return Ok(HookPoint::Entry(prologue)),
+      Err(err) => err,
    };
-   Ok(one("settings visibility guard", &image.scan(guard))? + imm)
-}
-
-/// `host::section`, which renders a settings page, and where its state keeps
-/// the active page.
-pub struct Section {
-   pub func:        usize,
-   pub page_offset: usize,
-}
-
-pub fn settings_section(image: &Image<'_>) -> Found<Section> {
-   /// `mov bl, [r15 + disp32]`, loading `self.active_page`.
-   const ACTIVE_PAGE_LOAD: Pattern = Pattern::new("41 8A 9F ?? ?? ?? ??");
-   let anchor = one("account-loading", &image.find_bytes(b"account-loading"))?;
-   let lea = one("account-loading load", &lea_refs(image, anchor))?;
-   let (func, _) = image
-      .function_bounds(lea)
-      .ok_or("settings section has no unwind entry")?;
-   if !prologues(image).frame.at(image, func) {
-      return Err("settings section prologue changed".to_owned());
+   if !image.rip_refs(func..func + 1).is_empty() {
+      return Err(entry);
    }
-   let head = image
-      .read(func, 0x160)
-      .ok_or("settings section is unmapped")?;
-   let page_offset = ACTIVE_PAGE_LOAD
-      .find_in(head)
+   let slots = image
+      .pointers_to(func)
       .into_iter()
-      .filter_map(|at| imm32(image, func + at + 3))
-      .find(|disp| (0x100..=0x2000).contains(disp))
-      .ok_or("settings section active page load not found")?;
-   Ok(Section { func, page_offset })
+      .filter(|&slot| !image.rip_refs(slot..slot + 1).is_empty())
+      .collect::<Vec<usize>>();
+   if slots.is_empty() {
+      return Err(format!("{entry}, and no code reads a pointer to it"));
+   }
+   Ok(HookPoint::Slots(slots))
 }
 
 /// Page 23's sidebar name, `Developer Options`, and the immediate holding its
@@ -1594,178 +1500,6 @@ pub struct Gpui {
    pub button_on_click:  usize,
 }
 
-/// The builders, from the Developer Mode row of page 16 and the
-/// `TesterUpdates` sign-in button, which call them in a fixed order.
-#[expect(clippy::too_many_lines, reason = "one block per builder call site")]
-pub fn gpui(image: &Image<'_>) -> Found<Gpui> {
-   let abi = Abi::of(image);
-   let dev = one(
-      "set-devmode",
-      &image.find_bytes(b"set-devmodeDeveloper Mode"),
-   )?;
-   let lea_dev = one("set-devmode load", &lea_refs(image, dev))?;
-   let before_dev = calls_in(image, lea_dev - 0x70, 0x70);
-   let after_dev = calls_in(image, lea_dev, 0x240);
-   if before_dev.len() < 3 || after_dev.len() < 9 {
-      return Err(format!(
-         "page 16 call counts changed ({}, {})",
-         before_dev.len(),
-         after_dev.len()
-      ));
-   }
-   let (div_new_call, div_new) = before_dev[0];
-   let caller_loc =
-      arg1_lea_before(image, abi, div_new_call).ok_or("div_new Location not found")?;
-   let switch_on_change = after_dev[7].1;
-   let alloc_or_oom = calls_in(image, switch_on_change, 0x50)
-      .first()
-      .ok_or("alloc_or_oom not found in Switch::on_change")?
-      .1;
-
-   let btn = one(
-      "tester-updates-sign-in",
-      &literal(image, b"tester-updates-sign-in"),
-   )?;
-   let lea_btn = one("tester-updates-sign-in load", &lea_refs(image, btn))?;
-   let after_btn = calls_in(image, lea_btn, 0x1D0);
-   if after_btn.len() < 6 {
-      return Err(format!(
-         "TesterUpdates call count changed ({})",
-         after_btn.len()
-      ));
-   }
-   // `ActionRow` is the callee that opens with `div_new` and `flex`,
-   // `Button::on_click` the call before it and `Div::into_any_element` the one
-   // after. ELF builds drop a temporary in between, so the order is all that
-   // holds.
-   let div_flex = before_dev[1].1;
-   let (row_at, ar_calls) = after_btn
-      .iter()
-      .enumerate()
-      .skip(1)
-      .find_map(|(at, &(_, callee))| {
-         let (start, end) = image.function_bounds(callee)?;
-         let calls = calls_in(image, start, end - start);
-         (calls.first().map(|&(_, first)| first) == Some(div_new)
-            && calls.iter().take(4).any(|&(_, callee)| callee == div_flex))
-         .then_some((at, calls))
-      })
-      .ok_or("ActionRow no longer calls div_new and flex first")?;
-   let action_row = after_btn[row_at].1;
-   let div_into_any = after_btn
-      .get(row_at + 1)
-      .ok_or("Div::into_any_element not found after ActionRow")?
-      .1;
-   // Two blocks, a `div_new` each, that end in `div_child_div`. The first
-   // builds its text column three calls before that; the second's child
-   // before it is the button.
-   let second = ar_calls[1..]
-      .iter()
-      .position(|&(_, callee)| callee == div_new)
-      .ok_or("ActionRow builds one Div")?
-      + 1;
-   let div_child_div = ar_calls[second - 1].1;
-   let last_child = ar_calls
-      .iter()
-      .rposition(|&(_, callee)| callee == div_child_div)
-      .filter(|&at| at > second + 1 && second >= 4)
-      .ok_or("ActionRow no longer adds its children with div_child_div")?;
-   let div_child_button = ar_calls[last_child - 1].1;
-   let text_block = ar_calls[second - 4].1;
-   // Every style setter fetches the style first, so `div_style_mut` is the
-   // first call most of the row's setters make.
-   let mut firsts: HashMap<usize, usize> = HashMap::new();
-   for &(_, callee) in &ar_calls[..second] {
-      if let Some(&(_, first)) = calls_in(image, callee, 0x40).first() {
-         *firsts.entry(first).or_default() += 1;
-      }
-   }
-   let mut ranked: Vec<(usize, usize)> = firsts
-      .into_iter()
-      .filter(|&(first, count)| first != div_new && count >= 2)
-      .map(|(first, count)| (count, first))
-      .collect();
-   ranked.sort_unstable_by(|a, b| b.cmp(a));
-   let div_style_mut = clear_winner("div_style_mut", &ranked, 2)?;
-
-   // `SmallVec::<[AnyElement; 2]>::push`, after `lea arg0, [div + 0x40]`.
-   let child_calls = calls_in(image, div_child_div, 0x60);
-   let div_push_any = (child_calls.len() >= 2
-      && image.read(div_child_div, 0x50).is_some_and(|code| {
-         (0..code.len()).any(|at| lea_disp8(&code[at..], abi.arg(0)) == Some(0x40))
-      }))
-   .then(|| child_calls[1].1);
-   // `SharedString::into_any_element`, beside `div_child_div`, drops the
-   // `SharedString` it moved: `cmp r8, 0xff; je ..; cmp r8, 0x19`, on whichever
-   // register the compiler loaded the tag into.
-   let tag_checks: Vec<(Vec<u8>, Vec<u8>)> = [
-      Register::RAX,
-      Register::RCX,
-      Register::RDX,
-      Register::RBX,
-      Register::RSI,
-      Register::RDI,
-      Register::R8,
-      Register::R9,
-      Register::R10,
-      Register::R11,
-      Register::R12,
-      Register::R13,
-      Register::R14,
-      Register::R15,
-   ]
-   .into_iter()
-   .map(|register| (cmp_byte(register, 0xFF), cmp_byte(register, 0x19)))
-   .collect();
-   let str_into_any = calls_in(image, div_child_div, 0x400)
-      .into_iter()
-      .map(|(_, target)| target)
-      .find(|&target| {
-         image.read(target, 0x100).is_some_and(|body| {
-            tag_checks.iter().any(|(none, arc)| {
-               body
-                  .windows(2 * none.len() + 2)
-                  .any(|w| w.starts_with(none) && w.ends_with(arc))
-            })
-         })
-      });
-
-   Ok(Gpui {
-      caller_loc,
-      div_new,
-      div_flex,
-      div_flex_col: before_dev[2].1,
-      div_style_mut,
-      div_child_div,
-      div_child_button,
-      div_into_any,
-      div_push_any,
-      str_into_any,
-      text_block,
-      switch_new: after_dev[0].1,
-      switch_into_div: after_dev[8].1,
-      button_new: after_btn[0].1,
-      action_row,
-      alloc_or_oom,
-      switch_label: after_dev[2].1,
-      switch_desc: after_dev[5].1,
-      switch_on_change,
-      button_on_click: after_btn[row_at - 1].1,
-   })
-}
-
-/// The target of the last `lea arg1, [rip + disp32]` in the 32 bytes before
-/// `call`.
-fn arg1_lea_before(image: &Image<'_>, abi: Abi, call: usize) -> Option<usize> {
-   let start = call.checked_sub(0x20)?;
-   let bytes = image.read(start, 0x20)?;
-   let lea = lea_rip(abi.arg(1));
-   (0..=bytes.len() - 7)
-      .rev()
-      .find(|&idx| bytes[idx..idx + 3] == lea)
-      .and_then(|idx| rel32_target(image, start + idx + 3))
-}
-
 /// `StyleRefinement` field offsets, read by name from its derived `Debug`.
 /// Edges are `[top, right, bottom, left]`, corners `[top_left, top_right,
 /// bottom_right, bottom_left]` and sizes `[width, height]`.
@@ -1779,6 +1513,7 @@ pub struct StyleOffsets {
    pub text_color:      usize,
    pub white_space:     usize,
    pub flex_shrink:     usize,
+   pub opacity:         usize,
    pub background:      usize,
    pub border_color:    usize,
    pub overflow_x:      usize,
@@ -1787,6 +1522,8 @@ pub struct StyleOffsets {
    pub display:         usize,
    pub align_items:     usize,
    pub justify_content: usize,
+   /// `Option<CursorStyle>`, the pointer shown over the element.
+   pub mouse_cursor:    usize,
    pub border_widths:   [usize; 4],
    pub corner_radii:    [usize; 4],
    pub padding:         [usize; 4],
@@ -1934,6 +1671,7 @@ pub(crate) fn style_from_fields(
       text_color: get("text.color")?,
       white_space: get("text.white_space")?,
       flex_shrink: get("flex_shrink")?,
+      opacity: get("opacity")?,
       background: get("background")?,
       border_color: get("border_color")?,
       overflow_x: get("overflow.x")?,
@@ -1942,6 +1680,7 @@ pub(crate) fn style_from_fields(
       display: get("display")?,
       align_items: get("align_items")?,
       justify_content: get("justify_content")?,
+      mouse_cursor: get("mouse_cursor")?,
       border_widths: edges("border_widths")?,
       corner_radii: [
          get("corner_radii.top_left")?,
@@ -1964,6 +1703,7 @@ pub(crate) fn style_from_fields(
       (style.text_color, 20),
       (style.white_space, 1),
       (style.flex_shrink, 8),
+      (style.opacity, 8),
       (style.background, 0x48),
       (style.border_color, 20),
       (style.overflow_x, 1),
@@ -1972,6 +1712,7 @@ pub(crate) fn style_from_fields(
       (style.display, 1),
       (style.align_items, 1),
       (style.justify_content, 1),
+      (style.mouse_cursor, 1),
    ];
    let lengths = [
       &style.border_widths[..],
@@ -2187,129 +1928,6 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
    })
 }
 
-/// `MessageRow::render`, and where its message keeps the id.
-pub struct MessageRow {
-   pub func:          usize,
-   pub msg_id_offset: usize,
-}
-
-/// The one function calling every helper that formats `message-content-{id}`.
-/// Builds since November 2026 keep two copies of the template, one per helper.
-pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
-   /// `lea rax, [rcx + disp32]`, the id the template formats.
-   const MSG_ID_LEA: Pattern = Pattern::new("48 8D 81 ?? ?? ?? ??");
-   let anchors = image.find_bytes(b"\x10message-content-\xc0\x00");
-   if anchors.is_empty() {
-      return Err("message-content template not found".to_owned());
-   }
-   let leas = anchors
-      .into_iter()
-      .flat_map(|anchor| lea_refs(image, anchor))
-      .collect::<Vec<_>>();
-   if leas.is_empty() {
-      return Err("nothing loads the message-content template".to_owned());
-   }
-   let msg_id_offset = leas
-      .iter()
-      .find_map(|&lea| {
-         let start = lea.saturating_sub(0x60);
-         let window = image.read(start, lea - start)?;
-         MSG_ID_LEA
-            .find_in(window)
-            .into_iter()
-            .rev()
-            .filter_map(|at| imm32(image, start + at + 3))
-            .find(|disp| (0x100..=0x2000).contains(disp))
-      })
-      .ok_or("message id load not found near the template")?;
-   let helpers = leas
-      .iter()
-      .filter_map(|&lea| Some(image.function_bounds(lea)?.0))
-      .collect::<HashSet<_>>();
-   let common = helpers
-      .iter()
-      .map(|&helper| callers(image, helper))
-      .filter(|parents| !parents.is_empty())
-      .reduce(|common, parents| common.intersection(&parents).copied().collect())
-      .unwrap_or_default();
-   let func = one(
-      "MessageRow::render",
-      &common.into_iter().collect::<Vec<_>>(),
-   )?;
-   if !prologues(image).row.at(image, func) {
-      return Err("MessageRow::render prologue changed".to_owned());
-   }
-   Ok(MessageRow {
-      func,
-      msg_id_offset,
-   })
-}
-
-/// `build_message_body`, and where its message and row colors sit.
-pub struct MessageBody {
-   pub func:              usize,
-   pub msg_id_offset:     usize,
-   pub row_colors_offset: usize,
-}
-
-/// The function `MessageRow::render` calls that loads the `message-edited-`
-/// template.
-pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> {
-   // `mov rcx, [arg0 + disp32]`, loading the message id.
-   let mut msg_id_mov = rm_disp8(0x8B, Register::RCX, Abi::of(image).arg(0));
-   msg_id_mov[2] += 0x40;
-   let anchor = one(
-      "message-edited template",
-      &image.find_bytes(b"\x0fmessage-edited-\xc0\x00"),
-   )?;
-   let mut found = lea_refs(image, anchor)
-      .into_iter()
-      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
-      .filter(|&func| prologues(image).row.at(image, func))
-      .filter(|&func| callers(image, func).contains(&render_row))
-      .collect::<Vec<_>>();
-   found.sort_unstable();
-   found.dedup();
-   let func = one("message body builder", &found)?;
-   let head = image
-      .read(func, 0x120)
-      .ok_or("message body builder is unmapped")?;
-   let msg_id_offset = head[..0x100]
-      .windows(3)
-      .enumerate()
-      .filter(|(_, w)| *w == msg_id_mov)
-      .filter_map(|(at, _)| imm32(image, func + at + 3))
-      .find(|disp| (0x100..=0x800).contains(disp))
-      .ok_or("message body id load not found")?;
-   // Three `mov r32, imm32` with consecutive `RowColors` field offsets
-   // `+0xc`, `+0x8` and `+0x4`. Newer builds take `lea r64, [arg1 + RowColors]`
-   // and pick the fields with `push imm8; pop`.
-   let arg1 = number(Abi::of(image).arg(1));
-   let row_colors_offset = head
-      .windows(15)
-      .enumerate()
-      .filter(|(_, w)| [w[0], w[5], w[10]].iter().all(|&op| op & 0xF8 == 0xB8))
-      .find_map(|(at, _)| {
-         let (a, c, d) = (
-            imm32(image, func + at + 1)?,
-            imm32(image, func + at + 6)?,
-            imm32(image, func + at + 11)?,
-         );
-         (a == c + 4 && c == d + 4 && (0x100..=0x400).contains(&d)).then(|| d - 4)
-      })
-      .or_else(|| {
-         mem_operands(head, 0x8D)
-            .find(|&(_, base, disp)| base == arg1 && (0x100..=0x400).contains(&disp))
-            .map(|(_, _, disp)| disp)
-      })
-      .ok_or("message body row colors not found")?;
-   Ok(MessageBody {
-      func,
-      msg_id_offset,
-      row_colors_offset,
-   })
-}
-
 /// A hex displacement as `disasm` prints it, like `1F8h`.
 fn hex_disp(text: &str) -> Option<usize> {
    usize::from_str_radix(text.strip_suffix('h')?, 16).ok()
@@ -2386,6 +2004,23 @@ fn slot_of(operand: &str, base: &str) -> Option<usize> {
       || disp.parse().ok(),
       |hex| usize::from_str_radix(hex, 16).ok(),
    )
+}
+
+/// [`slot_of`] for slots on either side of the base, like `[rbp-50h]`.
+fn signed_slot(operand: &str, base: &str) -> Option<isize> {
+   if let Some(slot) = slot_of(operand, base) {
+      return isize::try_from(slot).ok();
+   }
+   let disp = operand
+      .strip_prefix('[')?
+      .strip_suffix(']')?
+      .strip_prefix(base)?
+      .strip_prefix('-')?;
+   let disp = disp.strip_suffix('h').map_or_else(
+      || disp.parse::<isize>().ok(),
+      |hex| isize::from_str_radix(hex, 16).ok(),
+   )?;
+   Some(-disp)
 }
 
 /// The callee of the call `line` decodes: `call rel32`, or through a pointer
@@ -2860,8 +2495,9 @@ fn written(line: &phoenix_hook::x86::Line) -> Option<&str> {
    Some(operands.split_once(',')?.0)
 }
 
-/// Locates [`MessageHeader`]. `body` is [`message_body`]'s function, whose
-/// auto-moderation avatar fallback draws a node SVG leaf.
+/// Locates [`MessageHeader`]. `body` is the function
+/// [`crate::locate::message::message_body`] found, whose auto-moderation
+/// avatar fallback draws a node SVG leaf.
 ///
 /// Every row builder adds the name with `mov child,from; call child_node`,
 /// where `from`, a register or a frame slot, holds what one function called
@@ -2936,10 +2572,33 @@ fn header_builder(image: &Image<'_>, func: usize, anchor: usize) -> Found<(usize
       .iter()
       .position(|line| line.target == Some(anchor))
       .ok_or("header app tag load not decoded")?;
-   let slot = lines[template.saturating_sub(8)..template]
-      .iter()
+   let volatile: &[&str] = match abi {
+      Abi::Win64 => &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"],
+      Abi::SysV => &["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"],
+   };
+   // The id's address is stored into the format arguments from a register a
+   // `lea reg,[frame+slot]` set, right before the template or, on Windows
+   // gb71ec80, at the top of the builder into a callee-saved register.
+   let slot = (template.saturating_sub(8)..template)
       .rev()
-      .find_map(|line| slot_of(line.text.strip_prefix("lea rax,")?, &base))
+      .find_map(|at| {
+         let (dest, reg) = lines[at].text.strip_prefix("mov ")?.split_once(',')?;
+         if !dest.starts_with('[') {
+            return None;
+         }
+         let set = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| !(volatile.contains(&reg) && line.text.starts_with("call ")))
+            .find(|line| written(line) == Some(reg))?;
+         slot_of(
+            set.text
+               .strip_prefix("lea ")?
+               .strip_prefix(reg)?
+               .strip_prefix(',')?,
+            &base,
+         )
+      })
       .ok_or("header message id slot not found")?;
    let mut adds = Vec::new();
    for at in 1..lines.len() {
@@ -3010,40 +2669,52 @@ fn node_svg(image: &Image<'_>, body: usize) -> Found<NodeSvg> {
    svg_news.dedup();
    let svg_new = one("node svg_new", &svg_news)?;
 
-   // In the body: `lea out,[frame+leaf]; ...; call svg_new`, then
-   // `mov dword ptr [frame+color],1` and the call pushing the leaf.
+   // `lea out,[frame+leaf]; ...; call svg_new`, then
+   // `mov dword ptr [frame+color],1` and the call pushing the leaf. Windows
+   // gb71ec80 draws it in a function the body calls, at negative offsets.
    let leaf_arg = format!("lea {},", reg_name(abi.arg(0)));
-   let lines = phoenix_hook::x86::disasm(
-      function_code(image, body, "message body")?,
-      body,
-      usize::MAX,
-   );
-   let (push_svg, svg_color) = lines
-      .iter()
-      .enumerate()
-      .filter(|(_, line)| callee(image, line) == Some(svg_new))
-      .find_map(|(at, _)| {
-         let leaf = lines[at.saturating_sub(8)..at]
-            .iter()
-            .rev()
-            .find_map(|line| slot_of(line.text.strip_prefix(&leaf_arg)?, &base))?;
-         let after = &lines[at + 1..(at + 24).min(lines.len())];
-         let push = after.iter().find(|line| line.text.starts_with("call "))?;
-         let tag = after
-            .iter()
-            .take_while(|line| line.addr < push.addr)
-            .find_map(|line| {
-               slot_of(
-                  line
-                     .text
-                     .strip_prefix("mov dword ptr ")?
-                     .strip_suffix(",1")?,
-                  &base,
-               )
-            })?;
-         Some((callee(image, push)?, tag.checked_sub(leaf)?))
-      })
-      .ok_or("node SVG leaf push not found in the message body")?;
+   let leaf_push = |func: usize| {
+      let lines = phoenix_hook::x86::disasm(function_code(image, func, "").ok()?, func, usize::MAX);
+      lines
+         .iter()
+         .enumerate()
+         .filter(|(_, line)| callee(image, line) == Some(svg_new))
+         .find_map(|(at, _)| {
+            let leaf = lines[at.saturating_sub(8)..at]
+               .iter()
+               .rev()
+               .find_map(|line| signed_slot(line.text.strip_prefix(&leaf_arg)?, &base))?;
+            let after = &lines[at + 1..(at + 24).min(lines.len())];
+            let push = after.iter().find(|line| line.text.starts_with("call "))?;
+            let tag = after
+               .iter()
+               .take_while(|line| line.addr < push.addr)
+               .find_map(|line| {
+                  signed_slot(
+                     line
+                        .text
+                        .strip_prefix("mov dword ptr ")?
+                        .strip_suffix(",1")?,
+                     &base,
+                  )
+               })?;
+            Some((callee(image, push)?, usize::try_from(tag - leaf).ok()?))
+         })
+   };
+   let mut scanned = straight_calls(image, body)
+      .into_iter()
+      .map(|(_, callee)| callee)
+      .chain([body])
+      .collect::<Vec<_>>();
+   scanned.sort_unstable();
+   scanned.dedup();
+   let mut pushes = scanned
+      .into_iter()
+      .filter_map(leaf_push)
+      .collect::<Vec<_>>();
+   pushes.sort_unstable();
+   pushes.dedup();
+   let (push_svg, svg_color) = one("node SVG leaf push near the message body", &pushes)?;
    if !(4..0x30).contains(&svg_color) {
       return Err(format!("node SVG color at {svg_color:#x}"));
    }
@@ -3215,19 +2886,117 @@ pub fn asset_load(image: &Image<'_>) -> Found<usize> {
    one("asset loader", &loaders)
 }
 
+/// GPUI's renderer `draw(&mut self, scene: &Scene)`.
+///
+/// Also where `Scene` keeps the primitive lists a theme recolors before they
+/// are drawn, each a `Vec` (`cap`, `ptr`, `len`) at the offset given.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneDraw {
+   pub draw:     usize,
+   pub quads:    usize,
+   pub mono:     usize,
+   pub subpixel: usize,
+}
+
+/// [`SceneDraw`], from the renderer's error for a frame it cannot draw.
+///
+/// `"scene too large: {} paths, {} shadows, {} quads, ..."`. A closure formats
+/// it, reading each list's `len` off the scene, its second argument, in the
+/// order the template names them. `draw` is the closure's one caller.
+pub fn scene_draw(image: &Image<'_>) -> Found<SceneDraw> {
+   const ANCHOR: &[u8] = b"scene too large:";
+   if Abi::of(image) != Abi::Win64 {
+      return Err("scene draw locator requires Win64".to_owned());
+   }
+   let text = one("scene template", &image.find_bytes(ANCHOR))?;
+   // The template starts with a length byte, so the load can point before
+   // the text.
+   let loads = [text - 1, text]
+      .iter()
+      .flat_map(|&at| lea_refs(image, at))
+      .collect::<Vec<_>>();
+   let load = one("scene template load", &loads)?;
+   let (formatter, _) = image
+      .function_bounds(load)
+      .ok_or("scene formatter has no function bounds")?;
+
+   let tail = image
+      .read(text + ANCHOR.len(), 0x100)
+      .ok_or("scene template is unmapped")?;
+   let tail = &tail[..tail.iter().position(|&b| b == 0).unwrap_or(tail.len())];
+   let names = tail
+      .split(|b| !b.is_ascii_lowercase())
+      .filter(|name| !name.is_empty())
+      .collect::<Vec<_>>();
+
+   // `mov r64, [scene + disp32]`, the scene in the second argument register.
+   let (scene, scene_ext) = reg(Abi::of(image).arg(1));
+   let code = image
+      .read(formatter, load - formatter)
+      .ok_or("scene formatter is unmapped")?;
+   let lens = (0..code.len().saturating_sub(7))
+      .filter(|&at| {
+         code[at] & 0xFB == 0x48
+            && code[at] & 1 == scene_ext
+            && code[at + 1] == 0x8B
+            && code[at + 2] & 0xC7 == 0x80 | scene
+      })
+      .map(|at| {
+         u32::from_le_bytes([code[at + 3], code[at + 4], code[at + 5], code[at + 6]]) as usize
+      })
+      .collect::<Vec<_>>();
+   if lens.len() != names.len() {
+      return Err(format!(
+         "scene formatter reads {} lengths for {} names",
+         lens.len(),
+         names.len()
+      ));
+   }
+   let vec_of = |name: &[u8]| {
+      names
+         .iter()
+         .position(|&n| n == name)
+         .and_then(|i| lens[i].checked_sub(0x10))
+         .ok_or_else(|| format!("scene template has no {}", String::from_utf8_lossy(name)))
+   };
+
+   let sites = call_sites(image, |callee| callee == formatter);
+   let (site, _) = one("scene formatter call", &sites)?;
+   let (draw, end) = image
+      .function_bounds(site)
+      .ok_or("renderer draw has no function bounds")?;
+   let found = SceneDraw {
+      draw,
+      quads: vec_of(b"quads")?,
+      mono: vec_of(b"mono")?,
+      subpixel: vec_of(b"subpixel")?,
+   };
+   // `draw` walks the quads through their `ptr`, right before `len`.
+   let ptr = u32::try_from(found.quads + 8).map_err(|_| "quads offset overflows")?;
+   let body = image
+      .read(draw, end - draw)
+      .ok_or("renderer draw is unmapped")?;
+   if !body.windows(4).any(|w| w == ptr.to_le_bytes()) {
+      return Err(format!("renderer draw never reads the quads at {ptr:#x}"));
+   }
+   Ok(found)
+}
+
 /// The `jne rel32` that leaves the composer's Nitro gift button out.
 ///
 /// The composer fills an `Option` for the button: its block, after the
 /// `gift-button.wrap` id, stores `Some` (`mov qword [rax - 8], 1`) and jumps
-/// past the `None` store, `and qword [rsp + disp32], 0`. The first `jne` to
+/// past the `None` store, `and qword [rsp|rbp + disp32], 0`. The first `jne` to
 /// just before that store skips the button. Rewriting its two opcode bytes as
 /// `nop; jmp` keeps the displacement, and the locator checks both bytes share
 /// a word so the rewrite is one atomic store.
 pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
    const SOME_THEN_JMP: [u8; 9] = [0x48, 0xC7, 0x40, 0xF8, 0x01, 0x00, 0x00, 0x00, 0xE9];
-   const NONE_STORE: [u8; 4] = [0x48, 0x83, 0xA4, 0x24];
+   const NONE_STORES: [&[u8]; 2] = [&[0x48, 0x83, 0xA4, 0x24], &[0x48, 0x83, 0xA5]];
 
-   let ids = literal(image, b"gift-button.wrap")
+   // Windows build gb71ec80 pools the id without a NUL, so `literal` misses it.
+   let ids = image
+      .find_bytes(b"gift-button.wrap")
       .into_iter()
       .flat_map(|text| lea_refs(image, text))
       .collect::<Vec<_>>();
@@ -3242,15 +3011,17 @@ pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
       .ok_or("gift button stores no Some")?;
    let after = rel32_target(image, id + some + SOME_THEN_JMP.len())
       .ok_or("gift button jump does not decode")?;
-   let none = after.checked_sub(9).ok_or("gift button jumps to 0")?;
-   match image.read(none, 9) {
-      Some(store) if store.starts_with(&NONE_STORE) && store[8] == 0 => {},
-      _ => {
-         return Err(format!(
-            "gift button jumps to {after:#x}, after no None store"
-         ));
-      },
-   }
+   let none = NONE_STORES
+      .into_iter()
+      .find_map(|prefix| {
+         let len = prefix.len() + 5;
+         let store = after.checked_sub(len)?;
+         image
+            .read(store, len)
+            .filter(|bytes| bytes.starts_with(prefix) && bytes[len - 1] == 0)
+            .map(|_| store)
+      })
+      .ok_or_else(|| format!("gift button jumps to {after:#x}, after no None store"))?;
    let code = none
       .checked_sub(start)
       .and_then(|len| image.read(start, len))
@@ -3266,121 +3037,384 @@ pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
       .ok_or_else(|| format!("no jne skips the gift button before {none:#x}"))
 }
 
-/// `Store::delete_message`, the client's optimistic delete. It shares the map
-/// and index deletes with the `MESSAGE_DELETE` handler and takes a lock.
-pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usize> {
-   let (del_start, del_end) = image
-      .function_bounds(message_delete)
-      .ok_or("MESSAGE_DELETE handler has no unwind entry")?;
-   let del_callees = callees(image, del_start, del_end)
-      .into_iter()
-      .collect::<HashSet<_>>();
-   let mut parents: HashMap<usize, HashSet<usize>> = HashMap::new();
-   for (site, callee) in call_sites(image, |callee| del_callees.contains(&callee)) {
-      if let Some((parent, _)) = image.function_bounds(site) {
-         parents.entry(callee).or_default().insert(parent);
-      }
-   }
-   let mut found = Vec::new();
-   for parents in parents.values() {
-      if parents.len() != 2 || !parents.contains(&del_start) {
-         continue;
-      }
-      let Some(&other) = parents.iter().find(|&&parent| parent != del_start) else {
-         continue;
-      };
-      if found.contains(&other) || !prologues(image).frame.at(image, other) {
-         continue;
-      }
-      // `lock cmpxchg [..], r64` taking the store's write lock, inline or, in
-      // ELF builds, in the first function the head calls.
-      let cmpxchg = |at: usize| {
-         image.read(at, 0x80).is_some_and(|head| {
-            head
-               .windows(4)
-               .any(|w| w[0] == 0xF0 && w[1] & 0xF8 == 0x48 && w[2..] == [0x0F, 0xB1])
-         })
-      };
-      let locks = cmpxchg(other)
-         || calls_in(image, other, 0x40)
-            .first()
-            .is_some_and(|&(_, lock)| cmpxchg(lock));
-      let Some((start, end)) = image.function_bounds(other) else {
-         continue;
-      };
-      // 6 shared callees on the builds seen, at most 2 for unrelated callers.
-      let shared = callees(image, start, end)
-         .into_iter()
-         .filter(|callee| del_callees.contains(callee))
-         .count();
-      if locks && shared >= 4 {
-         found.push(other);
-      }
-   }
-   one("optimistic delete", &found)
+/// The type name `Entity::read` panics with for the channel sidebar's width
+/// state, `discord_desktop::ui::sidebar_resize::SidebarResize`.
+const SIDEBAR_RESIZE: &[u8] = b"discord_desktop::ui::sidebar_resize::SidebarResize";
+/// The workspace's id for the channel sidebar's resize handle.
+const SIDEBAR_HANDLE_ID: &[u8] = b"channel-sidebar-resize";
+
+/// What collapses the channel sidebar.
+///
+/// The workspace sizes the sidebar from `SidebarResize`'s width, the server
+/// rail plus 1 px plus the channel column (clamped to 264..432 px by the
+/// handle): `column_site` calls the width getter
+/// in the function returning the column's width (`width - rail - 1`), and
+/// `publish_site` in the one handing the whole width to other views. The width
+/// getter's third caller saves the width to settings and stays as it is.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelSidebar {
+   /// `call width(root, cx)` in the column width function.
+   pub column_site:  usize,
+   /// `call width(root, cx)` in the function publishing the sidebar's width.
+   pub publish_site: usize,
+   /// `f32 rail()`, the server rail's width.
+   pub rail:         usize,
+   /// `call covered(root)` in `Workspace::render`, whose `true` leaves out the
+   /// resize handle.
+   pub handle_site:  usize,
 }
 
-/// `flag_override` in `StoreState`, from the inlined
-/// `(user.flags | flag_override) & 1`:
-///
-/// ```text
-/// cmp dword ptr [base + tag], 1    ; (41) 83 B8..BF <tag> 01
-/// jne +0x0e
-/// mov r64, qword ptr [base + value] ; 48..4F 8B <modrm> <value>
-/// cmp reg2, 1; je +9; jmp +0xe; xor r32, r32; cmp reg2, 1; jne +7
-/// or r64, qword ptr [base + flags]  ; 48..4F 0B <modrm> <flags>
-/// ```
-///
-/// The Linux build reads it off `r15`, behind REX prefixes, and lays
-/// `StoreState` out differently, so the base register is decoded with them.
-/// Reads off `&RwLock<StoreState>` sit 0x10 bytes higher, behind the lock, so
-/// the lower pair is the one gateway handlers see.
-pub fn staff(image: &Image<'_>) -> Found<StaffField> {
-   const CHECK: Pattern = Pattern::new(
-      "83 ?? ?? ?? ?? ?? 01 75 0E ?? 8B ?? ?? ?? ?? ?? 83 ?? 01 74 09 EB 0E 31 ?? 83 ?? 01 75 07 \
-       ?? 0B ?? ?? ?? ?? ??",
-   );
-   const LOCK_HEADER: usize = 0x10;
-   // `[base + disp32]` with no SIB byte, as `base` with REX.B folded in.
-   let base = |rex: u8, modrm: u8| {
-      (modrm >> 6 == 0b10 && modrm & 7 != 4).then_some(modrm & 7 | (rex & 1) << 3)
-   };
-   let rex_w = |byte: u8| (0x48..=0x4F).contains(&byte).then_some(byte);
-   let mut found = image
-      .scan(CHECK)
+/// Finds [`ChannelSidebar`] from `SidebarResize`'s type name: the width getter
+/// is the only caller of its `Entity::read` that adds the entity's offset to
+/// its first argument and loads an `f32` from the result.
+pub fn channel_sidebar(image: &Image<'_>) -> Found<ChannelSidebar> {
+   let abi = Abi::of(image);
+   if abi != Abi::Win64 {
+      return Err("channel sidebar locator requires Win64".to_owned());
+   }
+   // Type names are pooled without a NUL, so `literal` misses them.
+   let reads = image
+      .find_bytes(SIDEBAR_RESIZE)
       .into_iter()
-      .filter_map(|at| {
-         let bytes = image.read(at, 37)?;
-         let cmp_rex = match at.checked_sub(1).and_then(|before| image.read(before, 1)) {
-            Some([0x41]) => 0x41,
-            _ => 0x40,
+      .flat_map(|text| lea_refs(image, text))
+      .filter_map(|site| Some(image.function_bounds(site)?.0))
+      .collect::<HashSet<_>>();
+   if reads.is_empty() {
+      return Err("SidebarResize is never named in code".to_owned());
+   }
+   let (number, rex_b) = reg(abi.arg(0));
+   // `add arg0, imm32`, then the call, then `movss xmm0, [rax + disp8]`.
+   let add = [0x48 | rex_b, 0x81, 0xC0 | number];
+   let index = call_index(image);
+   let getters = reads
+      .iter()
+      .flat_map(|&read| index.sites(read))
+      .filter(|&site| {
+         image
+            .read(site.wrapping_sub(7), 7 + 5 + 5)
+            .is_some_and(|code| code[..3] == add && code[12..16] == [0xF3, 0x0F, 0x10, 0x40])
+      })
+      .filter_map(|site| Some(image.function_bounds(site)?.0))
+      .collect::<HashSet<_>>()
+      .into_iter()
+      .collect::<Vec<_>>();
+   let width = one("sidebar width getter", &getters)?;
+
+   let (mut columns, mut publishes) = (Vec::new(), Vec::new());
+   for site in index.sites(width) {
+      let Some(after) = image.read(site + 5, 0x18) else {
+         continue;
+      };
+      // Column: `movaps` the width aside, `call rail`, then `subss` it.
+      if let Some(at) = (0..8).find(|&at| after[at] == 0xE8)
+         && after[at + 5..].starts_with(&[0xF3, 0x0F, 0x5C])
+         && let Some(rail) = rel32_target(image, site + 5 + at + 1)
+      {
+         columns.push((site, rail));
+      // Publish: `lea r8, [rsp + disp8]` and `movss [r8], xmm0`.
+      } else if after.starts_with(&[0x4C, 0x8D, 0x44, 0x24])
+         && after[5..].starts_with(&[0xF3, 0x41, 0x0F, 0x11, 0x00])
+      {
+         publishes.push(site);
+      }
+   }
+   let (column_site, rail) = one("sidebar column width", &columns)?;
+   let publish_site = one("sidebar width publish", &publishes)?;
+   match image.function_bounds(rail) {
+      Some((start, end)) if start == rail && end - start <= 0x80 => {},
+      _ => return Err(format!("sidebar rail width {rail:#x} is no small function")),
+   }
+   Ok(ChannelSidebar {
+      column_site,
+      publish_site,
+      rail,
+      handle_site: sidebar_handle_gate(image)?,
+   })
+}
+
+/// The call whose `true` skips the resize handle: before the handle's id,
+/// `Workspace::render` tests it, stores it, and on `true` stores `None` for
+/// the handle and jumps past it:
+/// `test al, al; mov [rbp + disp32], al; je; and qword [rbp + disp32], 0; jmp`.
+fn sidebar_handle_gate(image: &Image<'_>) -> Found<usize> {
+   const GATE: Pattern =
+      Pattern::new("84 C0 88 85 ?? ?? ?? ?? 74 ?? 48 83 A5 ?? ?? ?? ?? 00 E9 ?? ?? ?? ??");
+   const BEFORE: usize = 0x400;
+   let id = id_lea(image, SIDEBAR_HANDLE_ID)?;
+   let start = id.saturating_sub(BEFORE);
+   let code = image
+      .read(start, id - start)
+      .ok_or("sidebar handle is unmapped")?;
+   let at = GATE
+      .find_in(code)
+      .last()
+      .copied()
+      .ok_or("no test skips the sidebar handle")?;
+   let gate = start + at;
+   let skip = rel32_target(image, gate + 19).ok_or("sidebar handle skip does not decode")?;
+   if skip <= id {
+      return Err(format!(
+         "sidebar handle skip {skip:#x} lands before its id at {id:#x}"
+      ));
+   }
+   // Win64 builds put a `nop` after calls inside an unwind scope.
+   [gate.wrapping_sub(6), gate.wrapping_sub(5)]
+      .into_iter()
+      .find(|&site| {
+         image.read(site, 1) == Some(&[0xE8][..])
+            && (site + 5 == gate || image.read(site + 5, 1) == Some(&[0x90][..]))
+            && rel32_target(image, site + 1).is_some_and(|callee| image.is_function(callee))
+      })
+      .ok_or_else(|| format!("no call feeds the sidebar handle test at {gate:#x}"))
+}
+
+/// The channel header toolbar's member list button id.
+const TOOLBAR_MEMBERS_ID: &[u8] = b"tb-members";
+
+/// Where the channel header toolbar builds and adds its member list button,
+/// which plugin header buttons follow.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelToolbar {
+   /// `call button(out, id, id_len, icon: u16, tooltip: &mut SharedString,
+   /// selected, _, cx)`, the toolbar icon button builder.
+   pub button_site:  usize,
+   /// `call append(out, &mut toolbar, &mut button)`, which pushes the button
+   /// into the toolbar in place and then moves the toolbar to `out`.
+   pub append_site:  usize,
+   /// The button's bytes.
+   pub button_size:  usize,
+   /// Bytes moved from the toolbar to the return slot by `append`.
+   pub toolbar_size: usize,
+   /// Its `Option<Rc<dyn Fn>>` click handler: data, then vtable.
+   pub on_click:     usize,
+}
+
+/// Finds [`ChannelToolbar`] from the member list button's id.
+///
+/// The first call after the id builds the button, the call setting its click
+/// handler gives the handler's offset and the button's size. The append must
+/// take the resulting button, consume the toolbar, and return it via `out`.
+pub fn channel_toolbar(image: &Image<'_>) -> Found<ChannelToolbar> {
+   // `mov [rsi + on_click], rax; lea rax, [vtable]; mov [rsi + on_click + 8],
+   // rax; mov ecx, size`, then the copy to `out`.
+   const SET_CLICK: Pattern =
+      Pattern::new("48 89 86 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 89 86 ?? ?? ?? ?? B9 ?? ?? ?? ??");
+   if Abi::of(image) != Abi::Win64 {
+      return Err("channel toolbar locator requires Win64".to_owned());
+   }
+   let id = id_lea(image, TOOLBAR_MEMBERS_ID)?;
+   let (button_site, builder) = calls_in(image, id, 0x20)
+      .first()
+      .copied()
+      .ok_or("no call builds the members toolbar button")?;
+   let func = image
+      .function_bounds(id)
+      .ok_or("members toolbar has no unwind entry")?
+      .0;
+   let calls = straight_calls(image, func);
+   let after = calls
+      .iter()
+      .copied()
+      .filter(|&(site, _)| site > button_site)
+      .collect::<Vec<_>>();
+   let (setter, on_click, size) = after
+      .iter()
+      .find_map(|&(site, callee)| {
+         let code = function_code(image, callee, "").ok()?;
+         let at = SET_CLICK.find_in(code).first().copied()?;
+         let field = |offset: usize| {
+            code
+               .get(at + offset..at + offset + 4)
+               .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
          };
-         let cmp = (bytes[1] & 0x38 == 0x38).then(|| base(cmp_rex, bytes[1]))??;
-         let mov = base(rex_w(bytes[9])?, bytes[11])?;
-         let or = base(rex_w(bytes[30])?, bytes[32])?;
-         if cmp != mov || mov != or {
-            return None;
-         }
-         let (tag, value) = (imm32(image, at + 2)?, imm32(image, at + 12)?);
-         (value == tag + 8).then_some(StaffField { tag, value })
+         let (data, vtable, size) = (field(3)?, field(17)?, field(22)?);
+         (vtable == data + 8).then_some((site, data, size))
+      })
+      .ok_or("no call sets the members button's click handler")?;
+   let setter_args = image
+      .read(setter.wrapping_sub(11), 11)
+      .ok_or("no toolbar setter arguments")?;
+   if !setter_args.starts_with(&[0x48, 0x8D, 0x8D]) {
+      return Err("toolbar setter has no stack return slot".to_owned());
+   }
+   let appends = after
+      .windows(2)
+      .filter(|pair| pair[0].0 > setter && pair[1].1 != builder)
+      .filter_map(|pair| {
+         let bytes = toolbar_append(image, pair[0], pair[1], &setter_args[3..7], size)?;
+         Some((pair[1].0, bytes))
       })
       .collect::<Vec<_>>();
-   found.sort_unstable();
-   found.dedup();
-   match found[..] {
-      [only] => Ok(only),
-      [direct, locked]
-         if locked.tag == direct.tag + LOCK_HEADER
-            && locked.value == direct.value + LOCK_HEADER =>
+   let (append_site, toolbar_size) = one("members toolbar append", &appends)?;
+   Ok(ChannelToolbar {
+      button_site,
+      append_site,
+      button_size: fits("toolbar button", size, layout::SCRATCH_CAP)?,
+      toolbar_size: fits("toolbar append return", toolbar_size, layout::SCRATCH_CAP)?,
+      on_click: fits("toolbar button click", on_click + 16, size)? - 16,
+   })
+}
+
+fn toolbar_append(
+   image: &Image<'_>,
+   (finish, finish_fn): (usize, usize),
+   (append, append_fn): (usize, usize),
+   setter_slot: &[u8],
+   button_size: usize,
+) -> Option<usize> {
+   // The finish call takes the setter's output and returns the final button.
+   const FINISH_CALL: Pattern =
+      Pattern::new("48 8D 4D ?? 48 8D 95 ?? ?? ?? ?? 4C 8D 85 ?? ?? ?? ??");
+   const FINISH_COPY: Pattern =
+      Pattern::new("41 B8 ?? ?? ?? ?? 48 89 F1 48 8B 55 ?? E8 ?? ?? ?? ?? 48 89 F0");
+   // Append takes distinct toolbar and button slots, and returns the toolbar.
+   const APPEND_CALL: Pattern =
+      Pattern::new("48 8D 95 ?? ?? ?? ?? 4C 8D 45 ?? 4C 89 F1 E8 ?? ?? ?? ?? 90 4C 89 F0");
+   const APPEND_BODY: Pattern = Pattern::new(
+      "4C 89 C0 48 89 55 ?? 48 89 CB 4C 8D 05 ?? ?? ?? ?? 48 8D 4D ?? 48 89 C2 E8 ?? ?? ?? ?? 90 \
+       0F 10 45 ?? 0F 10 4D ?? 48 8D 55 ?? 0F 29 4A ?? 0F 29 02 48 8B 4D ?? E8 ?? ?? ?? ?? 90 B9 \
+       ?? ?? ?? ?? 48 89 DF 48 8B 75 ?? F3 A4 48 89 D8",
+   );
+   let finish_args = image.read(finish.checked_sub(18)?, 18)?;
+   let append_args = image.read(append.checked_sub(14)?, 23)?;
+   if FINISH_CALL.find_in(finish_args).first() != Some(&0)
+      || &finish_args[7..11] != setter_slot
+      || APPEND_CALL.find_in(append_args).first() != Some(&0)
+      || append_args[10] != finish_args[3]
+   {
+      return None;
+   }
+   let code = function_code(image, finish_fn, "toolbar button finish").ok()?;
+   let at = *FINISH_COPY.find_in(code).first()?;
+   if imm32(image, finish_fn + at + 2)? != button_size {
+      return None;
+   }
+   let code = function_code(image, append_fn, "toolbar append").ok()?;
+   let at = *APPEND_BODY.find_in(code).first()?;
+   // All three reads of the consumed toolbar use the same saved argument.
+   if code[at + 6] != code[at + 52] || code[at + 6] != code[at + 70] {
+      return None;
+   }
+   imm32(image, append_fn + at + 60)
+}
+
+/// `serde_json::from_slice::<Ready>`, `fn(out, &mut SliceRead)`, the first
+/// call of the `READY` handler. Phoenix's session parses READY with it too,
+/// past the registry, so a hook here sees every READY.
+pub fn ready_parse(image: &Image<'_>, ready: usize) -> Found<usize> {
+   let prologue = prologues(image)
+      .ready_parse
+      .ok_or("READY's parse is only known on Win64")?;
+   let &(_, parse) = calls_in(image, ready, 0x80)
+      .first()
+      .ok_or_else(|| format!("READY handler at {ready:#x} makes no call"))?;
+   if prologue.at(image, parse) {
+      Ok(parse)
+   } else {
+      Err(format!(
+         "READY's first call at {parse:#x} opens unlike its parse"
+      ))
+   }
+}
+
+/// The session's READY parse for text under 2 MB, `fn(out, ptr, len) -> out`:
+/// the caller of [`ready_parse`] that builds its reader from the text it takes.
+///
+/// ```text
+/// push r14; push rsi; push rdi; push rbx; sub rsp, imm32; mov rdi, r8
+/// ...
+/// mov [rsp + 0x20], rdx; mov [rsp + 0x28], r8
+/// ```
+pub fn ready_text(image: &Image<'_>, parse: usize) -> Found<usize> {
+   const READER: Pattern = Pattern::new("48 89 54 24 20 4C 89 44 24 28");
+   let prologue = prologues(image)
+      .ready_text
+      .ok_or("READY's text parse is only known on Win64")?;
+   let mut callers = call_sites(image, |callee| callee == parse)
+      .into_iter()
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .filter(|&func| {
+         prologue.at(image, func)
+            && image
+               .read(func, 0x40)
+               .is_some_and(|head| !READER.find_in(head).is_empty())
+      })
+      .collect::<Vec<_>>();
+   callers.sort_unstable();
+   callers.dedup();
+   one("READY text parse", &callers)
+}
+
+/// Phoenix's session READY handler, `fn(out, payload)`, which owns the gateway
+/// payload and parses READY itself, past the registry.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadySession {
+   pub func:     usize,
+   /// The payload's kind byte, and the kind whose READY is parsed from the raw
+   /// text. Other kinds carry the gateway's own parse of it.
+   pub kind:     usize,
+   pub raw_kind: u8,
+   /// The raw text's pointer and length.
+   pub raw:      usize,
+   pub raw_len:  usize,
+}
+
+/// The caller of [`ready_parse`] that opens by checking the payload's kind:
+///
+/// ```text
+/// cmp byte ptr [rdx + kind], raw_kind ; 80 BA <kind> <raw_kind>
+/// jne value                           ; 0F 85 <rel32>
+/// mov rdi, [rdx + raw]                ; 48 8B BA <raw>
+/// mov rbx, [rdx + raw_len]            ; 48 8B 9A <raw_len>
+/// ```
+pub fn ready_session(image: &Image<'_>, parse: usize) -> Found<ReadySession> {
+   const CHECK: Pattern = Pattern::new(
+      "80 BA ?? ?? ?? ?? ?? 0F 85 ?? ?? ?? ?? 48 8B BA ?? ?? ?? ?? 48 8B 9A ?? ?? ?? ??",
+   );
+   let disp = |bytes: &[u8], at: usize| {
+      bytes
+         .get(at..at + 4)
+         .and_then(|word| Some(u32::from_le_bytes(word.try_into().ok()?) as usize))
+   };
+   let mut callers = call_sites(image, |callee| callee == parse)
+      .into_iter()
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .collect::<Vec<_>>();
+   callers.sort_unstable();
+   callers.dedup();
+   let mut found = Vec::new();
+   for func in callers {
+      if !prologues(image).row.at(image, func) {
+         continue;
+      }
+      let Some(head) = image.read(func, 0x100) else {
+         continue;
+      };
+      let Some(&at) = CHECK.find_in(head).first() else {
+         continue;
+      };
+      let check = &head[at..];
+      if let (Some(kind), Some(raw), Some(raw_len)) =
+         (disp(check, 2), disp(check, 16), disp(check, 23))
       {
-         Ok(direct)
-      },
-      _ => {
+         found.push(ReadySession {
+            func,
+            kind,
+            raw_kind: check[6],
+            raw,
+            raw_len,
+         });
+      }
+   }
+   match found.as_slice() {
+      [session] if session.raw_len == session.raw + 8 => Ok(*session),
+      [session] => {
          Err(format!(
-            "staff flag reads disagree ({} variants)",
-            found.len()
+            "READY session at {:#x} reads no &str",
+            session.func
          ))
       },
+      _ => Err(format!("{} READY sessions", found.len())),
    }
 }
 
@@ -3860,9 +3894,9 @@ pub fn modal(image: &Image<'_>, div_into_any: usize, div: &DivLayout) -> Found<M
    // `Div::id` is the first call after `lea` of `"game-server-shop-carousel"`,
    // checking `ElementId::None` in `Interactivity` (`cmp byte ptr [rcx +
    // disp32], 0xff`).
-   // Newer builds keep a second copy of the string for another use, so the
-   // load is picked from every copy. `Div::id(div, id)` takes the id string as
-   // its third argument.
+   // `Div::id(div, id)` takes the id string as its third argument. The
+   // string has more than one copy (two on 1.0.9269), and only one of them
+   // is loaded there.
    let abi = Abi::of(image);
    let carousel_leas: Vec<usize> = image
       .find_bytes(b"game-server-shop-carousel")
@@ -3963,6 +3997,89 @@ pub fn wayland_frame(image: &Image<'_>) -> Found<WaylandFrame> {
       frame,
       force_render,
       ping,
+   })
+}
+
+/// The branch that skips looking up `vapostproc` for a clip pipeline, and the
+/// bytes that make it unconditional.
+#[derive(Clone, Copy, Debug)]
+pub struct VaScalerSkip {
+   pub at:    usize,
+   pub patch: &'static [u8],
+}
+
+/// The `jne` before the `vapostproc` lookup that jumps where a failed lookup
+/// goes.
+///
+/// With Mesa's radeonsi, `vapostproc` fails every frame after the first with
+/// `vaBeginPicture: invalid VASurfaceID` (build 2233), freezing the clip.
+pub fn va_scaler_lookup(image: &Image<'_>) -> Found<VaScalerSkip> {
+   if Abi::of(image) != Abi::SysV {
+      return Err("the VA scaler lookup is decoded on Linux builds only".to_owned());
+   }
+   let skips = image
+      .find_bytes(b"\0vapostproc\0")
+      .into_iter()
+      .flat_map(|text| lea_refs(image, text + 1))
+      .filter_map(|lea| {
+         let (start, end) = image.function_bounds(lea)?;
+         let lines = phoenix_hook::x86::disasm(image.read(start, end - start)?, start, usize::MAX);
+         let at = lines.iter().position(|line| line.addr == lea)?;
+         let skip = lines[at.saturating_sub(4)..at]
+            .iter()
+            .rfind(|line| line.text.starts_with("jne "))?;
+         let fails = lines[at..lines.len().min(at + 6)]
+            .iter()
+            .find(|line| line.text.starts_with("je "))?;
+         if skip.target.is_none() || skip.target != fails.target {
+            return None;
+         }
+         // `jne rel8` becomes `jmp rel8`, `jne rel32` a `nop` and `jmp rel32`.
+         let patch: &'static [u8] = match image.read(skip.addr, 2)? {
+            [0x75, _] => &[0xEB],
+            [0x0F, 0x85] => &[0x90, 0xE9],
+            _ => return None,
+         };
+         Some(VaScalerSkip {
+            at: skip.addr,
+            patch,
+         })
+      })
+      .collect::<Vec<_>>();
+   one("VA scaler lookup", &skips)
+}
+
+/// GPUI's `LinuxPlatform::primary_display` and `displays`, the slot before
+/// it in the `Platform` vtable.
+#[derive(Debug, Clone, Copy)]
+pub struct LinuxPrimaryDisplay {
+   pub primary_display: usize,
+   pub displays:        usize,
+}
+
+pub const LINUX_PRIMARY_DISPLAY_PROLOGUE: Prologue = Prologue {
+   pattern: Pattern::new("41 57 41 56 53 48 83 EC ?? 48 B8 FF FF FF FF FF FF FF 7F"),
+   len:     19,
+};
+
+pub fn linux_primary_display(image: &Image<'_>) -> Found<LinuxPrimaryDisplay> {
+   const PRIMARY: Pattern = Pattern::new(
+      "41 57 41 56 53 48 83 EC ?? 48 B8 FF FF FF FF FF FF FF 7F 48 8B 4F ?? 48 39 C1 0F 83 ?? ?? \
+       ?? ?? 48 89 FB 48 8D 51 01 48 89 57 ?? 83 7F ?? 02 0F 85",
+   );
+   let primary_display = one("Linux primary_display", &image.scan(PRIMARY))?;
+   let code_at = |slot: usize| image.read_usize(slot).filter(|&func| image.is_code(func));
+   // Skips the `.rela.dyn` addend `sigscan` also sees.
+   let slots: Vec<usize> = image
+      .pointers_to(primary_display)
+      .into_iter()
+      .filter(|&slot| slot >= 8 && code_at(slot - 8).is_some() && code_at(slot + 8).is_some())
+      .collect();
+   let slot = one("Linux primary_display vtable slot", &slots)?;
+   let displays = code_at(slot - 8).ok_or("Linux displays vtable slot did not decode")?;
+   Ok(LinuxPrimaryDisplay {
+      primary_display,
+      displays,
    })
 }
 
@@ -4495,20 +4612,11 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
 
    // Set C: every function referencing any copy of the `RichTextState` "read"
    // panic string (may appear in multiple CGUs).
-   // COFF merges the panic's verb into the type name's literal, ELF loads the
-   // bare name.
-   let read_panic = match abi {
-      Abi::Win64 => READ_PANIC,
-      Abi::SysV => &READ_PANIC[b"read".len()..],
-   };
-   // Newer COFF builds stopped merging the verb in, so the bare name counts
-   // there too.
-   let bare = &READ_PANIC[b"read".len()..];
-   let leas = string_leas(image, &[read_panic, bare, TEXT_INPUT_TYPE, TEXT_AREA_TYPE]);
-   let mut read_panics = image.find_bytes(read_panic);
-   if read_panic != bare {
-      read_panics.extend(image.find_bytes(bare));
-   }
+   // The panic passes the verb and the type name as two pointers. COFF shares
+   // the verb with any literal starting "read", so only the name marks C.
+   let read_panic = &READ_PANIC[b"read".len()..];
+   let leas = string_leas(image, &[read_panic, TEXT_INPUT_TYPE, TEXT_AREA_TYPE]);
+   let read_panics = image.find_bytes(read_panic);
    if read_panics.is_empty() {
       return Err("read RichTextState panic not found".to_owned());
    }
@@ -4667,10 +4775,19 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    };
    // ELF can keep two copies of `set_value` from different codegen units,
    // one with its drops outlined, each calling its own `Arc<str>::drop_slow`.
-   let resolved = set_value_hits
+   let (resolved, failed): (Vec<_>, Vec<_>) = set_value_hits
       .iter()
-      .map(|&(func, calls)| Ok((func, set_value_callees(calls)?)))
-      .collect::<Found<Vec<(usize, (usize, bool, usize))>>>()?;
+      .map(|&(func, calls)| set_value_callees(calls).map(|found| (func, found)))
+      .partition(Result::is_ok);
+   let resolved = resolved
+      .into_iter()
+      .filter_map(Result::ok)
+      .collect::<Vec<(usize, (usize, bool, usize))>>();
+   if resolved.is_empty()
+      && let Some(Err(err)) = failed.into_iter().next()
+   {
+      return Err(err);
+   }
    let Some(&(set_value, (arc_drop_slow, _, update_entity_dyn))) = resolved
       .iter()
       .find(|(_, (_, inline, _))| *inline)
@@ -4855,61 +4972,254 @@ pub fn settings_layer(image: &Image<'_>) -> Found<usize> {
    Ok(func)
 }
 
-/// The `tracing::Callsite` static naming `"media_fetch"` /
-/// `"libdiscord_media::fetch"`, the same data on every platform.
-pub(crate) fn media_fetch_callsite(image: &Image<'_>) -> Found<usize> {
-   let name = one(
-      "media_fetch tracing name",
-      &image.find_bytes(b"media_fetchlibdiscord_media::fetch"),
-   )?;
-   let target = name + 11;
-   let name_bytes = name.to_le_bytes();
-
-   let mut callsites = Vec::new();
-   for seg in image.segments.iter().filter(|s| !s.executable) {
-      let mut pos = 0;
-      while pos + 8 <= seg.bytes.len() {
-         let Some(rel) = seg.bytes[pos..]
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .position(|chunk| *chunk == name_bytes)
-         else {
-            break;
-         };
-         let off = pos + rel * 8;
-         let slot = seg.addr + off;
-         if image.read_usize(slot + 8) == Some(11)
-            && image.read_usize(slot + 0x10) == Some(target)
-            && image.read_usize(slot + 0x18) == Some(23)
-            && let Some(callsite) = image.read_usize(slot + 0x30)
-         {
-            callsites.push(callsite);
-         }
-         pos = off + 8;
-      }
-   }
-   one("media_fetch callsite", &callsites)
+/// Decoded layout of `mana_gpui::components::motion::effects::ScaleFade` and
+/// its `ElementId` field.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleFadeLayout {
+   pub size:               usize,
+   pub child:              usize,
+   pub opacity_range:      usize,
+   pub label_none:         usize,
+   pub element_id:         usize,
+   pub element_id_tag_off: usize,
+   pub element_id_tag:     u8,
+   pub element_id_key:     usize,
+   pub element_id_str:     usize,
+   pub progress:           usize,
+   pub scale_from:         usize,
+   pub origin:             usize,
+   pub fade:               usize,
 }
 
-/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
-///
-/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
-/// and the desktop runtime hooks the function to unwrap custom badge icon
-/// URLs (`/badge-icons/phx_u_<hex>`).
-pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
-   let callsite = media_fetch_callsite(image)?;
-   let mut funcs: Vec<usize> = lea_refs(image, callsite)
-      .into_iter()
-      .filter_map(|site| Some(image.function_bounds(site)?.0))
-      .collect();
-   funcs.sort_unstable();
-   funcs.dedup();
-   let func = one("libdiscord_media::fetch", &funcs)?;
-   if !prologues(image).media_fetch.at(image, func) {
-      return Err("libdiscord_media::fetch prologue changed".to_owned());
+/// Discord's `ScaleFade::into_any_element`, its `Location` static, and its
+/// decoded struct layout.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleFade {
+   pub into_any:   usize,
+   pub caller_loc: usize,
+   pub layout:     ScaleFadeLayout,
+}
+
+pub(crate) fn validate_scale_fade_layout(layout: ScaleFadeLayout) -> Found<ScaleFadeLayout> {
+   const ELEMENT_ID_SIZE: usize = 0x28;
+   if !(0x40..=layout::SCALE_FADE_CAP).contains(&layout.size) {
+      return Err(format!("ScaleFade size {:#x} out of bounds", layout.size));
    }
-   Ok(func)
+   let check_spans = |what: &str, cap: usize, spans: &[(usize, usize)]| -> Found<()> {
+      for (i, &(off, len)) in spans.iter().enumerate() {
+         let end = off
+            .checked_add(len)
+            .filter(|&end| end <= cap)
+            .ok_or_else(|| format!("{what} field +{off:#x}..+{len:#x} exceeds {cap:#x}"))?;
+         for &(other_off, other_len) in &spans[i + 1..] {
+            let other_end = other_off.saturating_add(other_len);
+            if off < other_end && other_off < end {
+               return Err(format!(
+                  "{what} fields +{off:#x} and +{other_off:#x} overlap"
+               ));
+            }
+         }
+      }
+      Ok(())
+   };
+   check_spans("ElementId", ELEMENT_ID_SIZE, &[
+      (layout.element_id_tag_off, 1),
+      (layout.element_id_key, 8),
+      (layout.element_id_str, 24),
+   ])?;
+   check_spans("ScaleFade", layout.size, &[
+      (layout.child, layout::ANY_ELEMENT),
+      (layout.opacity_range, 8),
+      (layout.label_none, 1),
+      (layout.element_id, ELEMENT_ID_SIZE),
+      (layout.progress, 4),
+      (layout.scale_from, 4),
+      (layout.origin, 4),
+      (layout.fade, 1),
+   ])?;
+   Ok(layout)
+}
+
+/// Shared call-graph search for [`animation_frame`] and
+/// [`crate::macos::animation_frame`]: runs bounded BFS from `"modal-layer-scrim"`
+/// callees to the 12-byte closure scheduler (`on_next_frame_notify`), then picks
+/// the unique short caller whose targets are a subset of the spring tick's.
+pub(crate) fn find_animation_frame(
+   roots: Vec<usize>,
+   func_targets: impl Fn(usize) -> Vec<usize>,
+   is_notify: impl Fn(usize) -> bool,
+   callers_of: impl Fn(usize) -> Vec<usize>,
+   is_short: impl Fn(usize) -> bool,
+) -> Found<usize> {
+   let mut visited = HashSet::new();
+   let mut queue = std::collections::VecDeque::new();
+   for root in roots {
+      if visited.insert(root) {
+         queue.push_back((root, 0usize));
+      }
+   }
+   let mut edges = Vec::new();
+   while let Some((func, depth)) = queue.pop_front() {
+      if depth >= 4 || visited.len() > 96 {
+         continue;
+      }
+      for target in func_targets(func) {
+         if is_notify(target) {
+            edges.push((func, target));
+            continue;
+         }
+         if visited.insert(target) {
+            queue.push_back((target, depth + 1));
+         }
+      }
+   }
+   edges.sort_unstable();
+   edges.dedup();
+   let mut notify_fns: Vec<usize> = edges.iter().map(|&(_, n)| n).collect();
+   notify_fns.sort_unstable();
+   notify_fns.dedup();
+   let notify_fn = one("on_next_frame_notify", &notify_fns)?;
+   let parent_set: HashSet<usize> = edges
+      .iter()
+      .filter(|&&(_, n)| n == notify_fn)
+      .map(|&(parent, _)| parent)
+      .collect();
+   let parent_callees: HashSet<usize> = parent_set
+      .iter()
+      .flat_map(|&parent| func_targets(parent))
+      .collect();
+
+   let candidates: Vec<usize> = callers_of(notify_fn)
+      .into_iter()
+      .filter(|caller| !parent_set.contains(caller) && is_short(*caller))
+      .filter(|&caller| {
+         let targets = func_targets(caller);
+         (3..=5).contains(&targets.len())
+            && targets.contains(&notify_fn)
+            && targets.iter().all(|t| parent_callees.contains(t))
+      })
+      .collect();
+   one("animation_frame", &candidates)
+}
+
+fn x86_callers(image: &Image<'_>, target: usize) -> Vec<usize> {
+   let mut callers: Vec<usize> = image
+      .rip_refs(target..target + 1)
+      .into_iter()
+      .filter(|&(field, _)| {
+         field
+            .checked_sub(1)
+            .and_then(|op| image.read(op, 1))
+            .is_some_and(|b| matches!(b, [0xE8 | 0xE9]))
+      })
+      .filter_map(|(field, _)| Some(image.function_bounds(field)?.0))
+      .collect();
+   for slot in image.pointers_to(target) {
+      for (field, _) in image.rip_refs(slot..slot + 1) {
+         if field
+            .checked_sub(2)
+            .and_then(|op| image.read(op, 2))
+            .is_some_and(|b| matches!(b, [0xFF, 0x15 | 0x25]))
+            && let Some((func, _)) = image.function_bounds(field)
+         {
+            callers.push(func);
+         }
+      }
+   }
+   callers.sort_unstable();
+   callers.dedup();
+   callers
+}
+
+/// GPUI's per-view next-frame scheduler, `fn(window: *mut c_void, app: *mut
+/// c_void)`.
+pub fn animation_frame(image: &Image<'_>) -> Found<usize> {
+   let abi = Abi::of(image);
+   let scrim = one("modal-layer-scrim", &image.find_bytes(b"modal-layer-scrim"))?;
+   let mut roots = Vec::new();
+   for site in lea_refs(image, scrim) {
+      let Some(code) = image.read(site, 0xA0) else {
+         continue;
+      };
+      for idx in 0..code.len() {
+         if let Some((_, target)) = call_target(image, &code[idx..], site + idx)
+            && image.is_function(target)
+         {
+            roots.push(target);
+         }
+      }
+   }
+   roots.sort_unstable();
+   roots.dedup();
+
+   let func_targets = |func: usize| -> Vec<usize> {
+      let Some((start, end)) = image.function_bounds(func) else {
+         return Vec::new();
+      };
+      let mut out = callees(image, start, end);
+      if let Some(bytes) = image.read(start, end.saturating_sub(start)) {
+         for idx in 0..bytes.len() {
+            if let Some(target) = jump_target(image, &bytes[idx..], start + idx)
+               && target != func
+               && image.is_function(target)
+            {
+               out.push(target);
+            }
+         }
+      }
+      out.sort_unstable();
+      out.dedup();
+      out
+   };
+
+   let sizes = imm_loads(abi.arg(0), 12);
+   let aligns = imm_loads(abi.arg(1), 4);
+   let is_notify = |func: usize| -> bool {
+      let Some((start, end)) = image.function_bounds(func) else {
+         return false;
+      };
+      let len = end.saturating_sub(start);
+      let Some(bytes) = (80..=640)
+         .contains(&len)
+         .then(|| image.read(start, len))
+         .flatten()
+      else {
+         return false;
+      };
+      let near = |a: &[Vec<u8>], b: &[Vec<u8>]| {
+         (0..bytes.len()).any(|at| {
+            let Some(rest) = bytes.get(at..) else {
+               return false;
+            };
+            a.iter().any(|pa| {
+               rest.starts_with(pa)
+                  && rest
+                     .get(pa.len()..(pa.len() + 12).min(rest.len()))
+                     .is_some_and(|win| {
+                        (0..win.len()).any(|off| b.iter().any(|pb| win[off..].starts_with(pb)))
+                     })
+            })
+         })
+      };
+      if !near(&sizes, &aligns) && !near(&aligns, &sizes) {
+         return false;
+      }
+      phoenix_hook::x86::disasm(bytes, start, usize::MAX)
+         .iter()
+         .any(|line| line.text.starts_with("call qword ptr [") || line.text.starts_with("call r"))
+   };
+
+   find_animation_frame(
+      roots,
+      func_targets,
+      is_notify,
+      |notify_fn| x86_callers(image, notify_fn),
+      |func| {
+         image
+            .function_bounds(func)
+            .is_some_and(|(start, end)| end.saturating_sub(start) <= 260)
+      },
+   )
 }
 
 /// `serde_json::to_value::<Message>`, which Phoenix runs to store a message,
