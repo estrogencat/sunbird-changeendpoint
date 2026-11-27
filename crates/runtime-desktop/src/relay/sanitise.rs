@@ -292,7 +292,7 @@ fn each(data: &mut Value, key: &str, fix: fn(&mut Value) -> bool) {
 pub fn dispatch(frame: &[u8], tweaks: Tweaks) -> Option<Vec<u8>> {
    let head = &frame[..frame.len().min(64)];
    let has = |name: &[u8]| head.windows(name.len()).any(|window| window == name);
-   let names: [&[u8]; 7] = [
+   let names: [&[u8]; 11] = [
       b"\"t\":\"READY\"",
       b"\"t\":\"GUILD_CREATE\"",
       b"\"t\":\"GUILD_UPDATE\"",
@@ -300,6 +300,10 @@ pub fn dispatch(frame: &[u8], tweaks: Tweaks) -> Option<Vec<u8>> {
       b"\"t\":\"MESSAGE_CREATE\"",
       b"\"t\":\"MESSAGE_UPDATE\"",
       b"\"t\":\"RELATIONSHIP_ADD\"",
+      b"\"t\":\"CHANNEL_CREATE\"",
+      b"\"t\":\"CHANNEL_UPDATE\"",
+      b"\"t\":\"CHANNEL_DELETE\"",
+      b"\"t\":\"GUILD_DELETE\"",
    ];
    if !names.into_iter().any(has) {
       return None;
@@ -309,6 +313,7 @@ pub fn dispatch(frame: &[u8], tweaks: Tweaks) -> Option<Vec<u8>> {
       Some("READY") => {
          each(&mut payload.d, "guilds", |value| {
             guild(value);
+            crate::channel_order::remember_guild(value);
             true
          });
          if tweaks.boosts {
@@ -327,6 +332,7 @@ pub fn dispatch(frame: &[u8], tweaks: Tweaks) -> Option<Vec<u8>> {
       },
       Some("GUILD_CREATE") => {
          guild(&mut payload.d);
+         crate::channel_order::remember_guild(&payload.d);
          if tweaks.boosts {
             crate::tweaks::boost(&mut payload.d);
          }
@@ -342,6 +348,10 @@ pub fn dispatch(frame: &[u8], tweaks: Tweaks) -> Option<Vec<u8>> {
          if !crate::attachments::flag_message(&mut payload.d) {
             return None;
          }
+      },
+      Some(event @ ("CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" | "GUILD_DELETE")) => {
+         crate::channel_order::follow(event, &payload.d);
+         return None;
       },
       _ => return None,
    }

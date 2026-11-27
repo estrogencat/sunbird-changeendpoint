@@ -92,9 +92,14 @@ fn spacebar_path(url: &str) -> Option<&str> {
 }
 
 /// A request body to send in place of the one Phoenix built, for message
-/// sends and edits and server edits to a Spacebar server.
+/// sends and edits, server edits and channel moves to a Spacebar server.
 pub fn rewrite_request(method: &str, url: &str, body: &[u8]) -> Option<Vec<u8>> {
    let path = spacebar_path(url)?;
+   if method == "PATCH"
+      && let Some(id) = path.strip_suffix("/channels").and_then(guild_id)
+   {
+      return crate::channel_order::reorder(id, body);
+   }
    if method == "PATCH"
       && let Some(id) = guild_id(path)
    {

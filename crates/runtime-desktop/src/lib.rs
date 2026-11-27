@@ -13,6 +13,7 @@ mod account_switch;
 mod attachments;
 mod audio;
 mod badges;
+mod channel_order;
 mod composer;
 mod context_menu;
 #[cfg(target_arch = "x86_64")]
