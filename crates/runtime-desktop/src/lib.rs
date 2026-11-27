@@ -5,6 +5,7 @@
 
 mod accessories;
 mod account_switch;
+mod attachments;
 mod audio;
 mod badges;
 mod context_menu;

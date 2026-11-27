@@ -197,11 +197,18 @@ fn guild(guild: &mut Value) {
    }
 }
 
-/// A server dispatch fixed up for Phoenix, or `None` to pass it as it is.
+/// A server dispatch fixed up for Phoenix (guild versions, and the animated
+/// flag on WebP attachments), or `None` to pass it as it is.
 pub fn dispatch(frame: &[u8]) -> Option<Vec<u8>> {
    let head = &frame[..frame.len().min(64)];
    let has = |name: &[u8]| head.windows(name.len()).any(|window| window == name);
-   if !has(b"\"t\":\"READY\"") && !has(b"\"t\":\"GUILD_CREATE\"") {
+   let names: [&[u8]; 4] = [
+      b"\"t\":\"READY\"",
+      b"\"t\":\"GUILD_CREATE\"",
+      b"\"t\":\"MESSAGE_CREATE\"",
+      b"\"t\":\"MESSAGE_UPDATE\"",
+   ];
+   if !names.into_iter().any(has) {
       return None;
    }
    let mut payload = serde_json::from_slice::<Payload>(frame).ok()?;
@@ -213,6 +220,11 @@ pub fn dispatch(frame: &[u8]) -> Option<Vec<u8>> {
          guilds.iter_mut().for_each(guild);
       },
       Some("GUILD_CREATE") => guild(&mut payload.d),
+      Some("MESSAGE_CREATE" | "MESSAGE_UPDATE") => {
+         if !crate::attachments::flag_message(&mut payload.d) {
+            return None;
+         }
+      },
       _ => return None,
    }
    serde_json::to_vec(&payload).ok()
