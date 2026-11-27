@@ -1535,6 +1535,37 @@ pub fn channel_row_picture(image: &Image<'_>) -> Found<ChannelRowPicture> {
    Ok(ChannelRowPicture { lookup, kind_check })
 }
 
+/// What masks an avatar's picture into a circle.
+#[derive(Debug, Clone, Copy)]
+pub struct PictureMask {
+   /// GPUI's `Window::paint_image(&mut self, bounds, mask_bounds, &corner_radii,
+   /// ...)`.
+   pub paint_image: usize,
+   /// Mana's blob mask builder, which returns null when a picture has no mask.
+   pub mask: usize,
+}
+
+pub fn picture_mask(image: &Image<'_>) -> Found<PictureMask> {
+   /// `movq xmm1, [rdx]; movq xmm0, [r8]`, then the float ordering trick it
+   /// clamps the bounds with.
+   const PAINT_IMAGE: Pattern =
+      Pattern::new("F3 0F 7E 0A F3 41 0F 7E 00 66 0F 6F F1 66 0F 72 E6 1F 66 0F 72 D6 01 66 0F EF F1");
+   /// `cmp sil, 0x1b; sete dil; cmove r15, rax`, right before the mask call.
+   const BEFORE_MASK: Pattern = Pattern::new("40 80 FE 1B 40 0F 94 C7 4C 0F 44 F8");
+   let paints: Vec<usize> = image
+      .scan(PAINT_IMAGE)
+      .into_iter()
+      .filter_map(|site| Some(image.function_bounds(site)?.0))
+      .collect();
+   let paint_image = one("paint_image", &paints)?;
+   let site = one("picture mask call", &image.scan(BEFORE_MASK))?;
+   let mask = calls_in(image, site, 0x40)
+      .first()
+      .map(|&(_, callee)| callee)
+      .ok_or("picture mask builder call not found")?;
+   Ok(PictureMask { paint_image, mask })
+}
+
 /// Discord's own GPUI and Mana builders the settings page calls.
 #[derive(Debug, Clone)]
 pub struct Gpui {

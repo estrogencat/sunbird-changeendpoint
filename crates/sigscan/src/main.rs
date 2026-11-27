@@ -283,6 +283,11 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|found| format!("{} (kind check {})", at(found.lookup), at(found.kind_check))),
          );
          report(
+            "picture mask",
+            desktop::picture_mask(image)
+               .map(|found| format!("paint {} mask {}", at(found.paint_image), at(found.mask))),
+         );
+         report(
             "settings section",
             desktop::settings_section(image)
                .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),
