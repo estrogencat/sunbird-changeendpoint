@@ -24,6 +24,10 @@ use std::{
       Mutex,
       OnceLock,
       PoisonError,
+      atomic::{
+         AtomicBool,
+         Ordering,
+      },
    },
 };
 
@@ -328,6 +332,10 @@ impl Default for UiState {
 
 static UI_STATE: LazyLock<Mutex<UiState>> = LazyLock::new(|| Mutex::new(UiState::default()));
 
+/// Whether the Servers page has its own sidebar entry, which takes the tab
+/// off the Sunbird page.
+pub static SERVERS_PAGE: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone)]
 enum Action {
    SetTab(Tab),
@@ -367,6 +375,7 @@ enum Action {
    InstallCatalog(String),
    ServersToggle,
    ServerActivity(String),
+   ServerTweak(servers_tab::Tweak),
    Servers(servers_tab::Press),
 }
 
@@ -409,6 +418,7 @@ unsafe fn switch_callback(
          Action::ToggleStaff => phoenix_runtime::set_staff_enabled(on),
          Action::ServersToggle => servers_tab::toggle(on),
          Action::ServerActivity(key) => servers_tab::activity(key, on),
+         Action::ServerTweak(tweak) => servers_tab::tweak(tweak, on),
          Action::TogglePlugin(name) => phoenix_runtime::set_enabled(&name, on),
          Action::ToggleSetting { plugin, key } => {
             phoenix_runtime::set_setting(&plugin, &key, Chosen::Switch(on));
@@ -1559,6 +1569,7 @@ impl DesktopCompat {
 }
 
 /// Renders the categorized native Sunbird Settings page into `sret`.
+#[expect(clippy::too_many_lines, reason = "one GPUI element tree, built top to bottom")]
 pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    let Some(sym) = SYMBOLS.get() else {
       return false;
@@ -1598,6 +1609,12 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    );
    root = b.push_div(root, b.text_block("Sunbird", &summary));
 
+   let own_page = SERVERS_PAGE.load(Ordering::Acquire);
+   let tab = if own_page && tab == Tab::Servers {
+      Tab::Plugins
+   } else {
+      tab
+   };
    let variant_for = |t: Tab| {
       if tab == t {
          BtnVariant::Primary
@@ -1622,14 +1639,16 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       BtnSize::Small,
       Action::SetTab(Tab::Catalog),
    );
-   tab_bar = b.push_button(
-      tab_bar,
-      "sunbird-tab-servers",
-      "Servers",
-      variant_for(Tab::Servers),
-      BtnSize::Small,
-      Action::SetTab(Tab::Servers),
-   );
+   if !own_page {
+      tab_bar = b.push_button(
+         tab_bar,
+         "sunbird-tab-servers",
+         "Servers",
+         variant_for(Tab::Servers),
+         BtnSize::Small,
+         Action::SetTab(Tab::Servers),
+      );
+   }
    tab_bar = b.push_button(
       tab_bar,
       "sunbird-tab-general",
@@ -1667,6 +1686,21 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       },
    }
 
+   b.write_any(root, sret);
+   true
+}
+
+/// Renders the Servers page, in its own sidebar entry, into `sret`.
+pub fn render_servers_page(sret: *mut RawAnyElement) -> bool {
+   let Some(sym) = SYMBOLS.get() else {
+      return false;
+   };
+   let b = Builder { sym };
+   ACTIONS
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .clear();
+   let root = servers_tab::render(&b, b.v_stack(16.0));
    b.write_any(root, sret);
    true
 }

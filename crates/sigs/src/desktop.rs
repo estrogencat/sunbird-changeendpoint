@@ -1261,6 +1261,9 @@ pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
 pub struct SettingsLabel {
    pub name: usize,
    pub id:   usize,
+   /// The `mov r9, imm64` translation key loaded after the id, which finds
+   /// `Phoenix` whatever the name says.
+   pub key:  Option<usize>,
 }
 
 /// Page 24's label, from its one loader: `lea rax, [name]` with length 7,
@@ -1282,7 +1285,7 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
       })
       .chain(suffixes.iter().copied())
       .collect();
-   let mut found: Vec<(usize, usize)> = lea_refs_many(image, &ids)
+   let mut found: Vec<(usize, usize, Option<usize>)> = lea_refs_many(image, &ids)
       .into_iter()
       .flat_map(|(id, loads)| loads.into_iter().map(move |lea| (id, lea)))
       .filter_map(|(id, lea)| {
@@ -1297,13 +1300,14 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
          } else {
             id + PREFIX.len()
          };
-         (image.read(name, NAME.len())? == NAME).then_some((name, suffix))
+         let key = (image.read(lea + 7, 2)? == [0x49, 0xB9]).then_some(lea + 9);
+         (image.read(name, NAME.len())? == NAME).then_some((name, suffix, key))
       })
       .collect();
    found.sort_unstable();
    found.dedup();
-   let (name, id) = one("settings label loader", &found)?;
-   Ok(SettingsLabel { name, id })
+   let (name, id, key) = one("settings label loader", &found)?;
+   Ok(SettingsLabel { name, id, key })
 }
 
 /// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
@@ -1351,6 +1355,88 @@ pub fn settings_section(image: &Image<'_>) -> Found<Section> {
       .find(|disp| (0x100..=0x2000).contains(disp))
       .ok_or("settings section active page load not found")?;
    Ok(Section { func, page_offset })
+}
+
+/// Page 23's sidebar name, `Developer Options`, and the immediate holding its
+/// length. The page is staff only, so the runtime renames it for its Servers
+/// page.
+#[derive(Clone, Copy, Debug)]
+pub struct SparePage {
+   pub name: usize,
+   pub len:  usize,
+}
+
+/// Page 23's label loader: `lea <arg2>, [name]`, then its length moved into
+/// the third argument register.
+pub fn settings_spare_page(image: &Image<'_>) -> Found<SparePage> {
+   const NAME: &[u8] = b"Developer Options";
+   let found: Vec<SparePage> = image
+      .find_bytes(NAME)
+      .into_iter()
+      .flat_map(|name| lea_refs(image, name).into_iter().map(move |lea| (name, lea)))
+      .filter_map(|(name, lea)| {
+         let next = image.read(lea + 7, 6)?;
+         let len = match next {
+            [0x41, 0xB8, ..] => lea + 9,
+            [0xBA, ..] => lea + 8,
+            _ => return None,
+         };
+         (imm32(image, len)? == NAME.len()).then_some(SparePage { name, len })
+      })
+      .collect();
+   one("spare settings page loader", &found)
+}
+
+/// The function building the account's perks, and where its answer keeps the
+/// upload limit in bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct UploadLimit {
+   pub func:  usize,
+   pub field: usize,
+}
+
+/// The account perks function and its upload limit field.
+///
+/// Two functions pick the limit by Nitro tier (`mov <reg>, 50 MiB; jmp; mov
+/// <reg>, 10 MiB`): the perks builder, and the one caller that copies its
+/// answer out unchanged. The caller is hooked, the builder names the field.
+pub fn upload_limit(image: &Image<'_>) -> Found<UploadLimit> {
+   const TIERS: Pattern = Pattern::new("?? 00 00 20 03 EB ?? ?? 00 00 A0 00");
+   let sites: Vec<(usize, usize)> = image
+      .scan(TIERS)
+      .into_iter()
+      .filter_map(|site| Some((image.function_bounds(site)?.0, site)))
+      .collect();
+   let [(a, a_site), (b, b_site)] = sites[..] else {
+      return Err(format!("upload limit tiers matched {} times", sites.len()));
+   };
+   let ((outer, _), (inner, site)) = if callers(image, b).contains(&a) {
+      ((a, a_site), (b, b_site))
+   } else if callers(image, a).contains(&b) {
+      ((b, b_site), (a, a_site))
+   } else {
+      return Err("upload limit functions don't call each other".to_owned());
+   };
+   let reg = image
+      .read(site, 1)
+      .and_then(|op| op[0].checked_sub(0xB8))
+      .filter(|reg| *reg < 8)
+      .ok_or("upload limit register not found")?;
+   let head = image.read(inner, 0x40).ok_or("perks builder is unmapped")?;
+   let base = head
+      .windows(3)
+      .find(|w| w[0] == 0x48 && w[1] == 0x89 && w[2] & 0xF8 == 0xC8)
+      .map(|w| w[2] & 7)
+      .ok_or("perks builder answer register not found")?;
+   let (_, end) = image.function_bounds(inner).ok_or("perks builder has no unwind entry")?;
+   let body = image.read(inner, end - inner).ok_or("perks builder is unmapped")?;
+   let store = [0x48, 0x89, 0x40 | (reg << 3) | base];
+   let field = body
+      .windows(4)
+      .find(|w| w[..3] == store)
+      .map(|w| usize::from(w[3]))
+      .ok_or("perks builder upload limit store not found")?;
+   Ok(UploadLimit { func: outer, field })
 }
 
 /// Discord's own GPUI and Mana builders the settings page calls.

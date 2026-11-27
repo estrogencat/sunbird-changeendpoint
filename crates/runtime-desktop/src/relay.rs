@@ -161,9 +161,10 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
          return Err(err);
       },
    };
+   let tweaks = servers::routes().tweaks();
    let send = |message: Message| {
       socket.send(&if gateway.spacebar {
-         trimmed(message, gateway.activities)
+         trimmed(message, gateway.activities, tweaks)
       } else {
          message
       })
@@ -177,7 +178,7 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
       let writer = writer.clone();
       thread::Builder::new()
          .name("sunbird-relay-down".to_owned())
-         .spawn(move || pump_down(&socket, &writer, spacebar))?
+         .spawn(move || pump_down(&socket, &writer, spacebar.then_some(tweaks)))?
    };
    loop {
       match wire::read_message(&mut reader, &writer) {
@@ -202,8 +203,9 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
 }
 
 /// Server to Phoenix, until the server closes. A close outside the 4000s
-/// becomes 4000 so Phoenix resumes instead of dropping the session.
-fn pump_down(socket: &Socket, writer: &Writer, spacebar: bool) {
+/// becomes 4000 so Phoenix resumes instead of dropping the session. Spacebar
+/// servers come with their tweaks.
+fn pump_down(socket: &Socket, writer: &Writer, spacebar: Option<servers::Tweaks>) {
    loop {
       match socket.receive() {
          Ok(Message::Close(code, reason)) => {
@@ -218,8 +220,9 @@ fn pump_down(socket: &Socket, writer: &Writer, spacebar: bool) {
          },
          Ok(message) => {
             let message = match message {
-               Message::Text(bytes) if spacebar => {
-                  Message::Text(sanitise::dispatch(&bytes).unwrap_or(bytes))
+               Message::Text(bytes) => {
+                  let fixed = spacebar.and_then(|tweaks| sanitise::dispatch(&bytes, tweaks));
+                  Message::Text(fixed.unwrap_or(bytes))
                },
                other => other,
             };
@@ -242,10 +245,10 @@ fn pump_down(socket: &Socket, writer: &Writer, spacebar: bool) {
 }
 
 /// A Spacebar-safe copy of a text frame from Phoenix.
-fn trimmed(message: Message, activities: bool) -> Message {
+fn trimmed(message: Message, activities: bool, tweaks: servers::Tweaks) -> Message {
    match message {
       Message::Text(bytes) => {
-         Message::Text(sanitise::sanitise(&bytes, activities).unwrap_or(bytes))
+         Message::Text(sanitise::sanitise(&bytes, activities, tweaks).unwrap_or(bytes))
       },
       other => other,
    }

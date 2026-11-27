@@ -40,6 +40,8 @@ mod restart;
 mod servers;
 mod settings;
 mod staff;
+mod tweaks;
+mod upload_limit;
 
 use std::{
    ffi::c_void,
@@ -182,6 +184,7 @@ pub fn prepare() -> Result<(), Error> {
    account_switch::install(&image);
    if X86_CODE {
       modal::install(&image);
+      upload_limit::install(&image);
    }
    context_menu::install(&image);
    // Before accessories hooks `MessageRow::render`, whose prologue the header

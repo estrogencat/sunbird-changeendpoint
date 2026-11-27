@@ -1,5 +1,5 @@
 // @description Fixes Spacebar payloads that Phoenix cannot decode
-// @version 0.4.0
+// @version 0.4.1
 // @author softgaypaws
 // @unlisted
 
@@ -187,8 +187,8 @@ function fixObject(object) {
   const decoration = object.avatar_decoration_data;
   if (decoration && typeof decoration === "object" && typeof decoration.asset === "string") {
     const hex = decoration.asset.replace(/^a_/, "");
-    if (!/^\d+$/.test(decoration.sku_id ?? "") && /^[0-9a-f]{15}/.test(hex)) {
-      decoration.sku_id = BigInt(`0x${hex.slice(0, 15)}`).toString();
+    if (!/^\d{17,}$/.test(decoration.sku_id ?? "") && /^[0-9a-f]{15}/.test(hex)) {
+      decoration.sku_id = (BigInt(`0x${hex.slice(0, 15)}`) | (1n << 60n)).toString();
       note("avatar_decoration_data.sku_id");
       changed = true;
     }
@@ -325,6 +325,12 @@ phoenix.discord.onResponse({ pathIncludes: "/application-identities" }, res => {
   if (res.status !== 404) return;
   note("users.application_identities");
   return { status: 200, body: [] };
+});
+
+phoenix.discord.onResponse({ method: "POST", pathSuffix: "/gifs/select" }, res => {
+  if (res.status !== 404) return;
+  note("gifs.select");
+  return { status: 204, body: "" };
 });
 
 phoenix.discord.onRequest({ method: "POST", pathSuffix: "/external-assets" }, req => {

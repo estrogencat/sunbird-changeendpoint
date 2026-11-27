@@ -3,14 +3,18 @@
 //! Discord flags animated attachments, and Phoenix only plays a webp image
 //! that carries the flag. Spacebar servers never set it, so their webp
 //! attachments and linked webp images get it here before Phoenix reads the
-//! message. Spacebar also answers an attachment link refresh with bare links
+//! message. Spacebar has no spoiler flag either, only the `SPOILER_` file
+//! name, so sent spoilers get the name and received ones get the flag back.
+//! Spacebar also answers an attachment link refresh with bare links
 //! where Discord pairs each with the one asked for, and Phoenix drops the
 //! whole answer.
 
 use serde::Deserialize;
 use serde_json::Value;
 
+const IS_SPOILER: u64 = 1 << 3;
 const IS_ANIMATED: u64 = 1 << 5;
+const SPOILER_PREFIX: &str = "SPOILER_";
 
 /// A Spacebar request whose answer needs reshaping.
 pub enum Fix {
@@ -20,6 +24,10 @@ pub enum Fix {
    RefreshUrls(Vec<String>),
    /// GIF picker results, whose links need to be the GIF files.
    Gifs,
+   /// The account, shown verified.
+   Me,
+   /// A server, shown boosted.
+   Guild,
 }
 
 impl Fix {
@@ -32,6 +40,15 @@ impl Fix {
       let path = spacebar_path(url)?;
       if method == "GET" && crate::gifs::is_picker(path) {
          return Some(Self::Gifs);
+      }
+      if method == "GET" {
+         let tweaks = crate::servers::routes().tweaks();
+         if tweaks.verified && path.ends_with("/users/@me") {
+            return Some(Self::Me);
+         }
+         if tweaks.boosts && guild_id(path).is_some() {
+            return Some(Self::Guild);
+         }
       }
       if method == "POST" && path.ends_with("/attachments/refresh-urls") {
          let refresh = serde_json::from_slice::<Refresh>(body).ok()?;
@@ -48,8 +65,24 @@ impl Fix {
          Self::Messages => flag_response(body),
          Self::RefreshUrls(asked) => paired_refresh(body, asked),
          Self::Gifs => crate::gifs::direct_links(body),
+         Self::Me => reshaped(body, crate::tweaks::verify),
+         Self::Guild => reshaped(body, crate::tweaks::boost),
       }
    }
+}
+
+fn reshaped(body: &[u8], change: fn(&mut Value)) -> Option<Vec<u8>> {
+   let mut value = serde_json::from_slice::<Value>(body).ok()?;
+   change(&mut value);
+   serde_json::to_vec(&value).ok()
+}
+
+/// The id of a request for one server, `/guilds/<id>`.
+fn guild_id(path: &str) -> Option<&str> {
+   path
+      .rsplit_once("/guilds/")
+      .map(|(_, id)| id)
+      .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The path of a request to a Spacebar server, without its query.
@@ -59,9 +92,18 @@ fn spacebar_path(url: &str) -> Option<&str> {
 }
 
 /// A request body to send in place of the one Phoenix built, for message
-/// sends and edits to a Spacebar server.
+/// sends and edits and server edits to a Spacebar server.
 pub fn rewrite_request(method: &str, url: &str, body: &[u8]) -> Option<Vec<u8>> {
    let path = spacebar_path(url)?;
+   if method == "PATCH"
+      && let Some(id) = guild_id(path)
+   {
+      return crate::servers::routes()
+         .tweaks()
+         .boosts
+         .then(|| crate::tweaks::unboosted_edit(id, body))
+         .flatten();
+   }
    let sends = matches!(method, "POST" | "PATCH")
       && path
          .rsplit_once("/messages")
@@ -71,7 +113,37 @@ pub fn rewrite_request(method: &str, url: &str, body: &[u8]) -> Option<Vec<u8>> 
                   .strip_prefix('/')
                   .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
          });
-   if sends { crate::gifs::outgoing(body) } else { None }
+   if !sends {
+      return None;
+   }
+   let spoilered = spoiler_names(body);
+   crate::gifs::outgoing(spoilered.as_deref().unwrap_or(body)).or(spoilered)
+}
+
+/// A message body with spoilered attachments named `SPOILER_` instead of
+/// flagged `is_spoiler`, the only way Spacebar stores a spoiler.
+fn spoiler_names(body: &[u8]) -> Option<Vec<u8>> {
+   let mut value = serde_json::from_slice::<Value>(body).ok()?;
+   let Some(Value::Array(attachments)) = value.get_mut("attachments") else {
+      return None;
+   };
+   let mut changed = false;
+   for attachment in attachments {
+      let Value::Object(fields) = attachment else {
+         continue;
+      };
+      let Some(spoiler) = fields.remove("is_spoiler") else {
+         continue;
+      };
+      changed = true;
+      if spoiler.as_bool() == Some(true)
+         && let Some(Value::String(name)) = fields.get_mut("filename")
+         && !name.starts_with(SPOILER_PREFIX)
+      {
+         name.insert_str(0, SPOILER_PREFIX);
+      }
+   }
+   changed.then(|| serde_json::to_vec(&value).ok()).flatten()
 }
 
 #[derive(serde::Serialize)]
@@ -117,15 +189,22 @@ fn is_webp(attachment: &Value) -> bool {
          .is_some_and(|name| name.to_ascii_lowercase().ends_with(".webp"))
 }
 
-fn flag(fields: &mut Value) -> bool {
+fn is_spoiler(attachment: &Value) -> bool {
+   attachment
+      .get("filename")
+      .and_then(Value::as_str)
+      .is_some_and(|name| name.starts_with(SPOILER_PREFIX))
+}
+
+fn flag(fields: &mut Value, bit: u64) -> bool {
    let flags = fields.get("flags").and_then(Value::as_u64).unwrap_or(0);
-   if flags & IS_ANIMATED != 0 {
+   if flags & bit != 0 {
       return false;
    }
    let Value::Object(fields) = fields else {
       return false;
    };
-   fields.insert("flags".to_owned(), Value::from(flags | IS_ANIMATED));
+   fields.insert("flags".to_owned(), Value::from(flags | bit));
    true
 }
 
@@ -143,11 +222,13 @@ fn is_webp_media(media: &Value) -> bool {
 pub fn flag_message(message: &mut Value) -> bool {
    let mut changed = false;
    if let Some(Value::Array(attachments)) = message.get_mut("attachments") {
-      for attachment in attachments
-         .iter_mut()
-         .filter(|attachment| is_webp(attachment))
-      {
-         changed |= flag(attachment);
+      for attachment in attachments {
+         if is_webp(attachment) {
+            changed |= flag(attachment, IS_ANIMATED);
+         }
+         if is_spoiler(attachment) {
+            changed |= flag(attachment, IS_SPOILER);
+         }
       }
    }
    if let Some(Value::Array(embeds)) = message.get_mut("embeds") {
@@ -156,7 +237,7 @@ pub fn flag_message(message: &mut Value) -> bool {
             if let Some(media) = embed.get_mut(key)
                && is_webp_media(media)
             {
-               changed |= flag(media);
+               changed |= flag(media, IS_ANIMATED);
             }
          }
       }
@@ -192,6 +273,7 @@ mod tests {
    use super::{
       Fix,
       flag_response,
+      rewrite_request,
    };
 
    #[test]
@@ -204,6 +286,22 @@ mod tests {
       let body = br#"{"id":"1","embeds":[{"type":"image","thumbnail":{"url":"https://x.test/a.webp?b=1"}}]}"#;
       let out: serde_json::Value = serde_json::from_slice(&flag_response(body).unwrap()).unwrap();
       assert_eq!(out["embeds"][0]["thumbnail"]["flags"], 32);
+   }
+
+   #[test]
+   fn names_spoilers() {
+      let body = br#"[{"id":"1","attachments":[{"filename":"SPOILER_a.png","flags":4}]}]"#;
+      let out: serde_json::Value = serde_json::from_slice(&flag_response(body).unwrap()).unwrap();
+      assert_eq!(out[0]["attachments"][0]["flags"], 12);
+      let url = "https://api.x.test/api/v9/channels/1/messages";
+      let sent = br#"{"content":"","attachments":[{"id":"0","filename":"a.png","uploaded_filename":"u","is_spoiler":true},{"id":"1","filename":"b.png","is_spoiler":false}]}"#;
+      let out: serde_json::Value =
+         serde_json::from_slice(&rewrite_request("POST", url, sent).unwrap()).unwrap();
+      assert_eq!(out["attachments"][0]["filename"], "SPOILER_a.png");
+      assert_eq!(out["attachments"][0]["uploaded_filename"], "u");
+      assert!(out["attachments"][0].get("is_spoiler").is_none());
+      assert_eq!(out["attachments"][1]["filename"], "b.png");
+      assert!(rewrite_request("POST", url, br#"{"content":"hi"}"#).is_none());
    }
 
    #[test]

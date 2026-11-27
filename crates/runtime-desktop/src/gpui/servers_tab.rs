@@ -1,5 +1,5 @@
-//! The Servers tab: which server each account and new logins go to, and the
-//! custom servers beside the built-in ones.
+//! The Servers page: which server each account and new logins go to, the
+//! custom servers beside the built-in ones, and the Spacebar tweaks.
 
 use std::sync::PoisonError;
 
@@ -7,7 +7,7 @@ use super::{Action, BtnSize, BtnVariant, Builder, RawDiv, UI_STATE};
 use crate::{
    discover,
    modal::{FieldKind, SettingField},
-   servers::{self, Identity, Server},
+   servers::{self, Identity, Server, Tweaks},
 };
 
 const FIELDS: [(&str, &str); 4] = [
@@ -25,6 +25,96 @@ pub enum Press {
    Unlink(u64),
    Add,
    Edit { key: String, field: &'static str },
+}
+
+#[derive(Clone, Copy)]
+pub enum Tweak {
+   Boosts,
+   Verified,
+   Announce,
+   UploadLimit,
+}
+
+impl Tweak {
+   const ALL: [Self; 4] = [Self::Boosts, Self::Verified, Self::Announce, Self::UploadLimit];
+
+   const fn text(self) -> (&'static str, &'static str, &'static str) {
+      match self {
+         Self::Boosts => (
+            "boosts",
+            "Unlock Server Boost Perks",
+            "Shows every server at boost level 3, so you can use animated icons, banners, role icons and more emoji. Spacebar has no boosting, but most servers allow these anyway.",
+         ),
+         Self::Verified => (
+            "verified",
+            "Skip Email Verification",
+            "Treats your account as verified, so servers that need a verified email let you chat. Useful on servers that can't send emails.",
+         ),
+         Self::Announce => (
+            "announce",
+            "Show When You Come Online",
+            "Lets friends and server members see you come online. Spacebar only tells them when you connect as offline, so Sunbird does that and the server switches you to online. Invisible stays invisible.",
+         ),
+         Self::UploadLimit => (
+            "upload-limit",
+            "Use the Server's Upload Limit",
+            "Lets you upload files as big as the server allows, instead of Discord's 10 MB without Nitro.",
+         ),
+      }
+   }
+
+   const fn get(self, tweaks: Tweaks) -> bool {
+      match self {
+         Self::Boosts => tweaks.boosts,
+         Self::Verified => tweaks.verified,
+         Self::Announce => tweaks.announce,
+         Self::UploadLimit => tweaks.upload_limit,
+      }
+   }
+
+   const fn set(self, tweaks: &mut Tweaks, on: bool) {
+      match self {
+         Self::Boosts => tweaks.boosts = on,
+         Self::Verified => tweaks.verified = on,
+         Self::Announce => tweaks.announce = on,
+         Self::UploadLimit => tweaks.upload_limit = on,
+      }
+   }
+}
+
+pub fn tweak(tweak: Tweak, on: bool) {
+   report(servers::update(|config| tweak.set(&mut config.tweaks, on)));
+   if !matches!(tweak, Tweak::UploadLimit) {
+      phoenix_ui_desktop::toast("Restart Discord to apply");
+   }
+}
+
+fn tweaks(b: &Builder, root: RawDiv, routes: &servers::Routes) -> RawDiv {
+   let root = b.push_div(
+      root,
+      b.text_block(
+         "Spacebar Tweaks",
+         "Changes to how Spacebar servers work in Discord. Discord accounts stay as they are.",
+      ),
+   );
+   let mut card = b.card(8.0, 14.0, 8.0, 0.18);
+   for (index, tweak) in Tweak::ALL.into_iter().enumerate() {
+      if index > 0 {
+         card = b.push_div(card, b.divider());
+      }
+      let (id, title, description) = tweak.text();
+      card = b.push_div(
+         card,
+         b.switch_row(
+            &format!("sunbird-servers-tweak-{id}"),
+            title,
+            Some(description),
+            tweak.get(routes.tweaks()),
+            Action::ServerTweak(tweak),
+         ),
+      );
+   }
+   b.push_div(root, card)
 }
 
 fn label(key: &str, server: &Server) -> String {
@@ -433,6 +523,8 @@ pub fn render(b: &Builder, mut root: RawDiv) -> RawDiv {
          Action::Servers(Press::Add),
       ),
    );
+   root = b.push_div(root, b.divider());
+   root = tweaks(b, root, &routes);
    root = b.push_div(root, b.divider());
    accounts(b, root, &routes)
 }

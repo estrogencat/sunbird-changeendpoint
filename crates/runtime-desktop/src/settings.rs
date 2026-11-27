@@ -15,6 +15,8 @@
 //!    string xref and `.pdata` function bounds) so when active page `== 24`, it
 //!    builds and returns a native GPUI `AnyElement` directly into Discord's
 //!    User Settings scroll viewport.
+//! 4. Rename staff-only page `23` (`Developer Options`, right above Sunbird)
+//!    to `Servers`, show it the same way, and draw the Servers page there.
 
 use std::{
    ffi::c_void,
@@ -36,6 +38,7 @@ use crate::gpui::{
 };
 
 const SUNBIRD_PAGE: u8 = 24;
+const SERVERS_PAGE: u8 = 23;
 
 type SectionFn = unsafe extern "C" fn(
    sret: *mut RawAnyElement,
@@ -61,8 +64,10 @@ pub fn install(image: &Image<'static>) {
       return;
    }
    patch_sidebar_label(image);
-   patch_page_visibility(image);
-   if gpui::locate(image) {
+   let native = gpui::locate(image);
+   let servers = native && patch_servers_label(image);
+   patch_page_visibility(image, servers);
+   if native {
       hook_section_render(image);
    }
 }
@@ -181,9 +186,53 @@ fn patch_sidebar_label(image: &Image<'static>) {
       Ok(()) => log::info!("desktop settings: relabeled page 24 to Sunbird"),
       Err(err) => log::warn!("desktop settings: relabel id failed: {err}"),
    }
+   // the translation key would still find `Phoenix`, a key nothing has falls
+   // back to the name
+   if let Some(key) = label.key
+      && let Some(hash) = image.read(key, 8).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+   {
+      let unknown = (u64::from_le_bytes(hash) ^ 0x5355_4E42_4952_4400).to_le_bytes();
+      // SAFETY: the 8-byte immediate of one `mov r9, imm64`, from `prepare`
+      // before Discord's threads run.
+      if let Err(err) = unsafe { image.write_code(key, &unknown) } {
+         log::warn!("desktop settings: relabel key failed: {err}");
+      }
+   }
 }
 
-fn patch_page_visibility(image: &Image<'static>) {
+/// Renames page 23 in place: the name keeps its bytes past `Servers`, and the
+/// length loaded with it drops to 7.
+fn patch_servers_label(image: &Image<'static>) -> bool {
+   const NAME: &[u8] = b"Servers";
+   let page = match desktop::settings_spare_page(image) {
+      Ok(page) => page,
+      Err(err) => {
+         log::warn!("desktop settings: {err}, servers stay a Sunbird tab");
+         return false;
+      },
+   };
+   let len = u32::try_from(NAME.len()).unwrap_or_default().to_le_bytes();
+   // SAFETY: a shorter name over the start of a 17-byte `.rdata` string with
+   // one loader, and its 4-byte length immediate, from `prepare` before
+   // Discord's threads run.
+   match unsafe {
+      image
+         .write_code(page.name, NAME)
+         .and_then(|()| image.write_code(page.len, &len))
+   } {
+      Ok(()) => {
+         gpui::SERVERS_PAGE.store(true, Ordering::Release);
+         log::info!("desktop settings: relabeled page 23 to Servers");
+         true
+      },
+      Err(err) => {
+         log::warn!("desktop settings: relabel servers failed: {err}");
+         false
+      },
+   }
+}
+
+fn patch_page_visibility(image: &Image<'static>, servers: bool) {
    let limit = match desktop::settings_visibility(image) {
       Ok(limit) => limit,
       Err(err) => {
@@ -192,10 +241,12 @@ fn patch_page_visibility(image: &Image<'static>) {
       },
    };
    // Tightening `cmp r8d, 0xf` -> `0x0e` excludes page 24 (`24 - 9 = 15`) from
-   // the gated switch so `is_page_visible(24)` returns `true` unconditionally.
+   // the gated switch so `is_page_visible(24)` returns `true` unconditionally,
+   // and `0x0d` excludes page 23 as well.
+   let guard = if servers { 0x0D } else { 0x0E };
    // SAFETY: single-byte immediate patch in `.text` executed from `DllMain`.
-   match unsafe { image.write_code(limit, &[0x0E]) } {
-      Ok(()) => log::info!("desktop settings: page 24 visibility unlocked"),
+   match unsafe { image.write_code(limit, &[guard]) } {
+      Ok(()) => log::info!("desktop settings: pages {}24 visibility unlocked", if servers { "23 and " } else { "" }),
       Err(err) => log::warn!("desktop settings: visibility patch failed: {err}"),
    }
 }
@@ -261,6 +312,13 @@ unsafe extern "C" fn section_detour(
       if page == SUNBIRD_PAGE {
          let rendered =
             std::panic::catch_unwind(|| gpui::render_sunbird_page(sret)).unwrap_or(false);
+         if rendered {
+            return sret;
+         }
+      }
+      if page == SERVERS_PAGE && gpui::SERVERS_PAGE.load(Ordering::Acquire) {
+         let rendered =
+            std::panic::catch_unwind(|| gpui::render_servers_page(sret)).unwrap_or(false);
          if rendered {
             return sret;
          }

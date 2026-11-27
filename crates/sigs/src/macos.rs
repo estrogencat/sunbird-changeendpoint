@@ -380,6 +380,7 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
    Ok(SettingsLabel {
       name,
       id: name + NAME,
+      key: None,
    })
 }
 

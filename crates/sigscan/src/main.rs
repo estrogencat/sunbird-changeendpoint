@@ -248,6 +248,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             desktop::settings_visibility(image).map(at),
          );
          report(
+            "spare settings page",
+            desktop::settings_spare_page(image)
+               .map(|page| format!("{} (length {})", at(page.name), at(page.len))),
+         );
+         report(
+            "upload limit",
+            desktop::upload_limit(image)
+               .map(|limit| format!("{} (field +{:#x})", at(limit.func), limit.field)),
+         );
+         report(
             "settings section",
             desktop::settings_section(image)
                .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),

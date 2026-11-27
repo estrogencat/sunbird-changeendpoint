@@ -47,6 +47,30 @@ pub struct Config {
    /// Servers whose activity switch was flipped from its default.
    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
    pub activities: BTreeMap<String, bool>,
+   #[serde(default)]
+   pub tweaks: Tweaks,
+}
+
+/// Changes to what Spacebar servers send and expect, all on by default.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+#[expect(clippy::struct_excessive_bools, reason = "one switch each on the Servers page")]
+pub struct Tweaks {
+   pub boosts: bool,
+   pub verified: bool,
+   pub announce: bool,
+   pub upload_limit: bool,
+}
+
+impl Default for Tweaks {
+   fn default() -> Self {
+      Self {
+         boosts: true,
+         verified: true,
+         announce: true,
+         upload_limit: true,
+      }
+   }
 }
 
 /// What the Spacebar plugin kept before the Servers page, read once to carry
@@ -106,9 +130,14 @@ pub struct Routes {
    login_discord: bool,
    enabled: bool,
    activities: BTreeMap<String, bool>,
+   tweaks: Tweaks,
 }
 
 impl Routes {
+   pub const fn tweaks(&self) -> Tweaks {
+      self.tweaks
+   }
+
    pub const fn active(&self) -> bool {
       self.enabled
    }
@@ -255,6 +284,7 @@ fn carried_over() -> Config {
       accounts: stored.accounts,
       login: stored.login,
       activities: BTreeMap::new(),
+      tweaks: Tweaks::default(),
    }
 }
 
@@ -288,6 +318,7 @@ pub fn update(change: impl FnOnce(&mut Config)) -> std::io::Result<()> {
    )?;
    fs::rename(&staged, &path)?;
    *ROUTES.lock().unwrap_or_else(PoisonError::into_inner) = None;
+   crate::upload_limit::refresh();
    Ok(())
 }
 
@@ -331,6 +362,7 @@ pub fn routes() -> Arc<Routes> {
       login: config.login.filter(|key| servers.contains_key(key)),
       enabled: config.enabled,
       activities: config.activities,
+      tweaks: config.tweaks,
       servers,
    });
    *cache = Some((stamp, routes.clone()));
@@ -501,6 +533,7 @@ pub fn set_viewer(viewer: Identity) {
          "discord".to_owned()
       };
       let _ = fs::write(viewer_file(), text);
+      crate::upload_limit::refresh();
    }
 }
 
