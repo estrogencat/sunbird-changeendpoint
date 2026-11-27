@@ -50,7 +50,12 @@ static ORIG_MEDIA_FETCH: OnceLock<MediaFetchFn> = OnceLock::new();
 /// Locates and inline-hooks `libdiscord_media::fetch` during
 /// [`crate::prepare`].
 pub fn install(image: &Image<'static>) {
-   let func = match desktop::media_fetch(image) {
+   let found = if crate::X86_CODE {
+      desktop::media_fetch(image)
+   } else {
+      phoenix_sigs::macos::media_fetch(image)
+   };
+   let func = match found {
       Ok(func) => func,
       Err(err) => {
          log::warn!("desktop badges: {err}, custom badge icons disabled");
@@ -151,12 +156,17 @@ unsafe fn media_fetch_detour(
 
 #[cfg(test)]
 mod tests {
+   use std::fmt::Write;
+
    use super::*;
 
    #[test]
    fn unwraps_valid_https_badge_urls() {
       let real = "https://badges.equicord.org/icon.png";
-      let hex: String = real.bytes().map(|b| format!("{b:02x}")).collect();
+      let hex = real.bytes().fold(String::new(), |mut hex, b| {
+         let _ = write!(hex, "{b:02x}");
+         hex
+      });
       let wrapped = format!("https://cdn.discordapp.com/badge-icons/phx_u_{hex}.png?size=64");
       assert_eq!(unwrap_badge_url(&wrapped).as_deref(), Some(real));
    }
@@ -164,7 +174,10 @@ mod tests {
    #[test]
    fn rejects_non_https_or_malformed_badge_urls() {
       let http = "http://example.com/a.png";
-      let hex: String = http.bytes().map(|b| format!("{b:02x}")).collect();
+      let hex = http.bytes().fold(String::new(), |mut hex, b| {
+         let _ = write!(hex, "{b:02x}");
+         hex
+      });
       let wrapped = format!("https://cdn.discordapp.com/badge-icons/phx_u_{hex}.png");
       assert_eq!(unwrap_badge_url(&wrapped), None);
       assert_eq!(

@@ -56,6 +56,7 @@ use crate::{
       hooks::{
          Hook,
          add_gateway_api,
+         gateway_object,
       },
       http::{
          discord_object,
@@ -81,10 +82,23 @@ pub struct Engine {
 
 struct Loaded {
    source:    String,
+   /// The bundled source an installed copy replaced, put back when the copy
+   /// is uninstalled.
+   bundled:   Option<String>,
    enabled:   bool,
    error:     Option<String>,
    /// Read from `home/plugins`, so the user can delete it.
    installed: bool,
+}
+
+impl Loaded {
+   fn install(&mut self, source: String) {
+      let old = std::mem::replace(&mut self.source, source);
+      if !self.installed {
+         self.bundled = Some(old);
+      }
+      self.installed = true;
+   }
 }
 
 type ChosenMap = BTreeMap<String, BTreeMap<String, Chosen>>;
@@ -144,14 +158,22 @@ pub struct Registry<'js> {
    /// `phoenix.discord.onRequest` interceptors, by id.
    request_hooks:    RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.discord.onResponse` interceptors, by id.
-   response_hooks:   RefCell<HashMap<u64, (String, Function<'js>)>>,
+   response_hooks:     RefCell<HashMap<u64, (String, Function<'js>)>>,
+   gateway_send_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
-   pub interceptors: RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
 }
 
 // SAFETY: every field is bound to 'js, and Changed swaps exactly that lifetime.
 unsafe impl<'js> JsLifetime<'js> for Registry<'js> {
    type Changed<'to> = Registry<'to>;
+}
+
+/// A plugin's source as a function of its `phoenix` object, which the engine
+/// calls to load it.
+#[must_use]
+pub fn wrap(source: &str) -> String {
+   format!("(function (phoenix) {{\n{source}\n}})")
 }
 
 #[expect(clippy::needless_pass_by_value, reason = "used as a map_err callback")]
@@ -229,6 +251,7 @@ impl Engine {
                         title:       definition.title.clone(),
                         description: definition.description.clone(),
                         control:     definition.kind.current(picked),
+                        multiline:   definition.multiline,
                      }
                   })
                   .collect();
@@ -253,8 +276,8 @@ impl Engine {
       let outcome = self.context.with(|ctx| {
          let run = || -> rquickjs::Result<()> {
             let phoenix = api(&ctx, name)?;
-            let wrapped = format!("(function (phoenix) {{\n{}\n}})", loaded.source);
-            ctx.eval::<Function<'_>, _>(wrapped)?.call((phoenix,))
+            ctx.eval::<Function<'_>, _>(wrap(&loaded.source))?
+               .call((phoenix,))
          };
          run().catch(&ctx).map_err(js_error)
       });
@@ -273,7 +296,7 @@ impl Engine {
 
    /// Drops every hook `name` registered, and turns off events nobody else
    /// listens to.
-   fn unload(&self, name: &str) {
+   pub(super) fn unload(&self, name: &str) {
       self.context.with(|ctx| {
          let Some(registry) = ctx.userdata::<Registry<'_>>() else {
             return;
@@ -299,6 +322,11 @@ impl Engine {
             .borrow_mut()
             .retain(|_, (plugin, _)| plugin != name);
          discord::forget_response_hooks(name);
+         registry
+            .gateway_send_hooks
+            .borrow_mut()
+            .retain(|_, (plugin, _)| plugin != name);
+         gateway::forget_send_hooks(name);
          registry
             .interceptors
             .borrow_mut()
@@ -339,12 +367,12 @@ impl Engine {
    /// it off.
    pub fn install(&mut self, name: &str, source: String) {
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
-         loaded.source = source;
-         loaded.installed = true;
+         loaded.install(source);
          loaded.enabled
       } else {
          self.plugins.insert(name.to_owned(), Loaded {
             source,
+            bundled: None,
             enabled: true,
             error: None,
             installed: true,
@@ -357,17 +385,32 @@ impl Engine {
       }
    }
 
-   /// Drops `name` and what the user chose for it. A bundled plugin it
-   /// replaced comes back at the next start.
-   pub fn uninstall(&mut self, name: &str) {
+   /// Drops `name` and what the user chose for it, or, when it replaced a
+   /// bundled plugin, puts that one back with the same switch and settings.
+   pub fn uninstall(&mut self, name: &str) -> crate::Uninstalled {
       self.unload(name);
-      self.plugins.remove(name);
-      self.context.with(|ctx| {
-         if let Some(registry) = ctx.userdata::<Registry<'_>>() {
-            registry.chosen.borrow_mut().remove(name);
-         }
+      let restored = self.plugins.get_mut(name).and_then(|loaded| {
+         loaded.source = loaded.bundled.take()?;
+         loaded.installed = false;
+         loaded.error = None;
+         Some(loaded.enabled)
       });
+      let outcome = if let Some(enabled) = restored {
+         if enabled {
+            self.eval(name);
+         }
+         crate::Uninstalled::RestoredBundled
+      } else {
+         self.plugins.remove(name);
+         self.context.with(|ctx| {
+            if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+               registry.chosen.borrow_mut().remove(name);
+            }
+         });
+         crate::Uninstalled::Removed
+      };
       self.save_choices();
+      outcome
    }
 
    pub fn reload(&mut self, name: &str) {
@@ -487,6 +530,7 @@ fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<R
       pending: RefCell::default(),
       request_hooks: RefCell::default(),
       response_hooks: RefCell::default(),
+      gateway_send_hooks: RefCell::default(),
       interceptors: RefCell::default(),
    })
 }
@@ -510,11 +554,7 @@ fn camel_case(name: &str) -> String {
 /// The `phoenix` object one plugin receives.
 fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    let api = Object::new(ctx.clone())?;
-   let gateway = ctx
-      .userdata::<Registry<'js>>()
-      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
-   api.set("gateway", gateway.gateway.clone())?;
-   drop(gateway);
+   api.set("gateway", gateway_object(ctx, plugin)?)?;
 
    add_gateway_api(ctx, plugin, &api)?;
 
@@ -609,10 +649,18 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
    }
 
    let dir = state.plugins_dir();
-   let mut sources = bundled
+   let mut plugins = bundled
       .into_iter()
-      .map(|plugin| (plugin.name, (plugin.source, false)))
-      .collect::<BTreeMap<String, (String, bool)>>();
+      .map(|plugin| {
+         (plugin.name, Loaded {
+            source:    plugin.source,
+            bundled:   None,
+            enabled:   false,
+            error:     None,
+            installed: false,
+         })
+      })
+      .collect::<BTreeMap<String, Loaded>>();
    let paths = match fs::read_dir(&dir) {
       Ok(entries) => {
          entries
@@ -631,7 +679,25 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
          continue;
       };
       let source = fs::read_to_string(&path).map_err(io_error(&path))?;
-      sources.insert(name.to_owned(), (source, true));
+      match plugins.get_mut(name) {
+         Some(loaded) => loaded.install(source),
+         None => {
+            plugins.insert(name.to_owned(), Loaded {
+               source,
+               bundled: None,
+               enabled: false,
+               error: None,
+               installed: true,
+            });
+         },
+      }
+   }
+   for (name, loaded) in &mut plugins {
+      loaded.enabled = if Header::from(loaded.source.as_str()).default_off {
+         choices.enabled.contains(name)
+      } else {
+         !choices.disabled.contains(name)
+      };
    }
 
    let mut engine = state
@@ -643,22 +709,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
          *registry.chosen.borrow_mut() = choices.settings.into_owned();
       }
    });
-   engine.plugins = sources
-      .into_iter()
-      .map(|(name, (source, installed))| {
-         let enabled = if Header::from(source.as_str()).default_off {
-            choices.enabled.contains(&name)
-         } else {
-            !choices.disabled.contains(&name)
-         };
-         (name, Loaded {
-            source,
-            enabled,
-            error: None,
-            installed,
-         })
-      })
-      .collect();
+   engine.plugins = plugins;
    let enabled = engine
       .plugins
       .iter()

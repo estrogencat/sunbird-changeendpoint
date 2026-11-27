@@ -48,10 +48,18 @@ type SectionFn = unsafe extern "C" fn(
 
 static ORIG_SECTION: OnceLock<SectionFn> = OnceLock::new();
 static PAGE_OFFSET: AtomicUsize = AtomicUsize::new(0);
+/// The page the last section render showed, so the arm64 page opens the
+/// settings window once per visit rather than once per frame.
+static LAST_PAGE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Installs the Desktop User Settings sidebar label, visibility patch, native
 /// GPUI builder bindings, and `host::section` render hook.
 pub fn install(image: &Image<'static>) {
+   if !crate::X86_CODE {
+      #[cfg(target_os = "macos")]
+      install_arm64(image);
+      return;
+   }
    patch_sidebar_label(image);
    patch_page_visibility(image);
    if gpui::locate(image) {
@@ -59,11 +67,102 @@ pub fn install(image: &Image<'static>) {
    }
 }
 
-fn patch_sidebar_label(image: &Image<'static>) {
+/// macOS Phoenix, arm64: the same sidebar entry, unhidden, whose page is
+/// drawn with Discord's own builders ([`gpui::locate`]), or opens Sunbird's
+/// settings window when they don't decode. Each part is located before
+/// anything is written, so a build that moved one changes nothing.
+#[cfg(target_os = "macos")]
+fn install_arm64(image: &Image<'static>) {
+   use phoenix_sigs::macos;
+
    const NEW_NAME: &[u8] = b"Sunbird";
    const NEW_ID: &[u8] = b"DESKTOP_SUNBIRD";
+
+   let (label, limits, section) = match (
+      macos::settings_label_parts(image),
+      macos::settings_visibility(image),
+      macos::settings_section(image),
+   ) {
+      (Ok(label), Ok(limits), Ok(section)) => (label, limits, section),
+      (label, limits, section) => {
+         let err = [label.err(), limits.err(), section.err()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+         log::warn!("desktop settings: {err}, leaving the sidebar");
+         return;
+      },
+   };
+   let Some(guards) = limits
+      .iter()
+      .map(|&limit| {
+         image
+            .read_u32(limit)
+            .map(|cmp| (limit, macos::lowered_guard(cmp)))
+      })
+      .collect::<Option<Vec<_>>>()
+   else {
+      log::warn!("desktop settings: visibility guard unmapped");
+      return;
+   };
+   PAGE_OFFSET.store(section.page_offset, Ordering::Release);
+   let native = gpui::locate(image);
+   let Some(detour) = phoenix_hook::image::sret_callee(section_detour as *const () as usize) else {
+      log::warn!("desktop settings: no memory for the section hook");
+      return;
+   };
+   // SAFETY: runs from `prepare` before Discord's threads; the callee thunk
+   // hands `section_detour` the call the x86-64 way.
+   let trampoline = match unsafe {
+      // arm64 decodes the displaced instructions itself, so the x86 prologue
+      // every caller passes is ignored.
+      let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+      image.hook_entry(section.func, pro.pattern, pro.len, detour)
+   } {
+      Ok(trampoline) => trampoline,
+      Err(err) => {
+         log::warn!("desktop settings: section hook failed: {err}");
+         return;
+      },
+   };
+   let Some(orig) = phoenix_hook::image::sret_caller(trampoline) else {
+      log::warn!("desktop settings: no memory for the section call");
+      return;
+   };
+   // SAFETY: the caller thunk takes `SectionFn`'s x86-64 arguments and calls
+   // the trampoline the arm64 way.
+   let _ = ORIG_SECTION.set(unsafe { std::mem::transmute::<usize, SectionFn>(orig) });
+   // SAFETY: exact-length string and one-instruction patches from `prepare`,
+   // before Discord's threads run.
+   let written = unsafe {
+      guards
+         .iter()
+         .try_for_each(|&(limit, lowered)| image.write_code(limit, &lowered.to_le_bytes()))
+         .and_then(|()| image.write_code(label.name, NEW_NAME))
+         .and_then(|()| image.write_code(label.id, NEW_ID))
+   };
+   match written {
+      Ok(()) => {
+         log::info!(
+            "desktop settings: page 24 is Sunbird, shown by {} visibility checks, {}",
+            guards.len(),
+            if native {
+               "drawn natively"
+            } else {
+               "and opens the settings window"
+            }
+         );
+      },
+      Err(err) => log::warn!("desktop settings: {err}"),
+   }
+}
+
+fn patch_sidebar_label(image: &Image<'static>) {
+   const NEW_NAME: &[u8] = b"Sunbird";
+   const NEW_ID: &[u8] = b"SUNBIRD";
    const _: () = assert!(NEW_NAME.len() == b"Phoenix".len());
-   const _: () = assert!(NEW_ID.len() == b"DESKTOP_PHOENIX".len());
+   const _: () = assert!(NEW_ID.len() == b"PHOENIX".len());
 
    let label = match desktop::settings_label_parts(image) {
       Ok(label) => label,
@@ -148,6 +247,17 @@ unsafe extern "C" fn section_detour(
       // SAFETY: `host_state` is Discord's live `&mut HostState` for this render
       // call.
       let page = unsafe { *host_state.cast::<u8>().add(offset) };
+      let last = LAST_PAGE.swap(usize::from(page), Ordering::AcqRel);
+      if !crate::X86_CODE
+         && page == SUNBIRD_PAGE
+         && last != usize::from(page)
+         && gpui::layout().is_none()
+      {
+         // Opening spawns a browser, which must not run on GPUI's thread.
+         let _ = std::thread::Builder::new()
+            .name("sunbird-settings".to_owned())
+            .spawn(phoenix_ui_desktop::open_devtools);
+      }
       if page == SUNBIRD_PAGE {
          let rendered =
             std::panic::catch_unwind(|| gpui::render_sunbird_page(sret)).unwrap_or(false);

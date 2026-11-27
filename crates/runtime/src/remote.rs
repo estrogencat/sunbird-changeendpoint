@@ -705,6 +705,8 @@ struct SettingJson<'a> {
    key:         &'a str,
    title:       &'a str,
    description: Option<&'a str>,
+   #[serde(skip_serializing_if = "std::ops::Not::not")]
+   multiline:   bool,
    #[serde(flatten)]
    control:     ControlJson<'a>,
 }
@@ -740,6 +742,7 @@ impl<'a> From<&'a Setting> for SettingJson<'a> {
          key: &setting.key,
          title: &setting.title,
          description: setting.description.as_deref(),
+         multiline: setting.multiline,
          control,
       }
    }
@@ -769,6 +772,7 @@ pub enum Done<'a> {
    Staff(bool),
    Installed(&'a str),
    Uninstalled(&'a str),
+   Restored(&'a str),
    Reloaded(&'a str),
    Enabled(&'a str),
    Disabled(&'a str),
@@ -844,9 +848,12 @@ fn plugin_route(method: &str, rest: &str, body: &[u8]) -> Reply {
       },
       ("DELETE", None) => {
          match crate::uninstall(name) {
-            Ok(()) => {
+            Ok(outcome) => {
                crate::refresh_settings();
-               ok_json(&Done::Uninstalled(name))
+               ok_json(&match outcome {
+                  crate::Uninstalled::Removed => Done::Uninstalled(name),
+                  crate::Uninstalled::RestoredBundled => Done::Restored(name),
+               })
             },
             Err(message) => err("500 Internal Server Error", &message.to_string()),
          }
@@ -934,7 +941,7 @@ fn catalog_install(body: &[u8]) -> Reply {
    match outcome {
       Ok(installed) => {
          crate::refresh_settings();
-         ok_json(&Done::Installed(&installed))
+         ok_json(&Done::Installed(&installed.name))
       },
       Err(message) => err("400 Bad Request", &message.to_string()),
    }

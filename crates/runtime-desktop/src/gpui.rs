@@ -84,7 +84,7 @@ impl SharedString {
       }
       // SAFETY: `inner` holds `16 + s.len()` bytes, aligned to 8.
       unsafe {
-         inner.cast::<[usize; 2]>().write([1, 1]);
+         inner.cast::<[usize; 2]>().write_unaligned([1, 1]);
          ptr::copy_nonoverlapping(s.as_ptr(), inner.add(16), s.len());
       }
       Self {
@@ -157,6 +157,17 @@ pub struct RcInner {
    strong:    usize,
    weak:      usize,
    action_id: u64,
+}
+
+/// An `Rc<u64>` whose counts never reach zero, so Discord never frees it:
+/// for when Discord's allocator isn't located (macOS, whose Rust heap may be
+/// its own malloc zone). Leaks 24 bytes.
+pub fn pinned_rc_u64(value: u64) -> *mut RcInner {
+   Box::into_raw(Box::new(RcInner {
+      strong:    usize::MAX / 4,
+      weak:      usize::MAX / 4,
+      action_id: value,
+   }))
 }
 
 #[repr(C)]
@@ -493,8 +504,8 @@ unsafe extern "C" fn button_callback(
                };
                match phoenix_runtime::install_file(&file_name, bytes) {
                   Ok(installed) => {
-                     log::info!("sunbird settings: installed {installed} from {file_name}");
-                     phoenix_ui_desktop::toast(&format!("Installed {installed}"));
+                     log::info!("sunbird settings: {installed} from {file_name}");
+                     phoenix_ui_desktop::toast(&installed.to_string());
                      crate::modal::force_redraw();
                   },
                   Err(err) => {
@@ -515,8 +526,8 @@ unsafe extern "C" fn button_callback(
             std::thread::spawn(move || {
                match update::install_listed(&name) {
                   Ok(installed) => {
-                     log::info!("sunbird settings: installed {installed}");
-                     phoenix_ui_desktop::toast(&format!("Installed {installed}"));
+                     log::info!("sunbird settings: {installed}");
+                     phoenix_ui_desktop::toast(&installed.to_string());
                   },
                   Err(err) => {
                      log::warn!("sunbird settings: install {name}: {err}");
@@ -537,10 +548,14 @@ pub fn locate(image: &Image<'static>) -> bool {
       return true;
    }
 
-   let found = desktop::gpui(image).and_then(|gpui| {
-      let layout = desktop::gpui_layouts(image, &gpui)?;
-      Ok((gpui, layout))
-   });
+   let found = if crate::X86_CODE {
+      desktop::gpui(image).and_then(|gpui| {
+         let layout = desktop::gpui_layouts(image, &gpui)?;
+         Ok((gpui, layout))
+      })
+   } else {
+      arm64_builders(image)
+   };
    let (
       desktop::Gpui {
          caller_loc,
@@ -605,12 +620,52 @@ pub fn locate(image: &Image<'static>) -> bool {
    true
 }
 
+/// The arm64 builders ([`phoenix_sigs::macos::gpui`]) with every one that
+/// returns through `x8` swapped for an `image::sret_caller` thunk, so they
+/// are called the x86 way, result slot first, like the types here say.
+#[cfg(target_os = "macos")]
+fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
+   let gpui = phoenix_sigs::macos::gpui(image)?;
+   let layout = phoenix_sigs::macos::gpui_layouts(image, &gpui)?;
+   let thunk = |addr: usize| {
+      phoenix_hook::image::sret_caller(addr).ok_or_else(|| "no memory for a thunk".to_owned())
+   };
+   let thunked = desktop::Gpui {
+      div_new: thunk(gpui.div_new)?,
+      div_flex: thunk(gpui.div_flex)?,
+      div_flex_col: thunk(gpui.div_flex_col)?,
+      div_child_div: thunk(gpui.div_child_div)?,
+      div_child_button: thunk(gpui.div_child_button)?,
+      div_into_any: thunk(gpui.div_into_any)?,
+      str_into_any: gpui.str_into_any.map(thunk).transpose()?,
+      text_block: thunk(gpui.text_block)?,
+      switch_new: thunk(gpui.switch_new)?,
+      switch_into_div: thunk(gpui.switch_into_div)?,
+      button_new: thunk(gpui.button_new)?,
+      action_row: thunk(gpui.action_row)?,
+      ..gpui
+   };
+   Ok((thunked, layout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
+   Err("no arm64 builders off macOS".to_owned())
+}
+
 /// `div.f(..)` for a `Div` builder taking and returning it by value.
 fn chain(f: DivMutFn, mut div: RawDiv) -> RawDiv {
    let mut out = RawDiv::zeroed();
    // SAFETY: `f` moves `div` into `out`, both buffers fit a `Div`.
    unsafe { f(&raw mut out, &raw mut div) };
    out
+}
+
+/// `size` bytes aligned to `align` from Discord's allocator, once the builders
+/// are located.
+pub fn host_alloc(size: usize, align: usize) -> Option<*mut u8> {
+   // SAFETY: Discord's own `alloc_or_oom`, which aborts rather than return null.
+   SYMBOLS.get().map(|sym| unsafe { (sym.alloc_or_oom)(align, size) })
 }
 
 /// The `GpuiLayout` decoded from this `Discord.exe`.
@@ -1169,6 +1224,9 @@ pub fn wrap_with_accessories(
          s.hsla(s.at.text_color, hsla);
          s.length(s.at.border_widths[3], gpui_px(3.0));
          s.hsla(s.at.border_color, hsla);
+         // A faint wash of the tint behind the whole row.
+         let [h, sat, l, _] = hsla;
+         s.solid_background([h, sat, l, 0.12]);
       });
    }
    if !b.push_any(&mut outer, &mut orig) {
@@ -1256,6 +1314,181 @@ pub fn wrap_with_login_servers(
    true
 }
 
+/// Muted accessory text, for lines without a color of their own.
+const ACCESSORY_MUTED: [f32; 4] = [0.60, 0.08, 0.62, 0.85];
+
+/// One piece of an inline accessory: SVG icons when it has them and the build
+/// can draw them, else its text.
+#[derive(Clone, Debug)]
+pub struct Piece {
+   pub text:  String,
+   pub color: Option<u32>,
+   /// Asset paths from [`crate::icons::register`], each with its own color.
+   pub icons: Vec<(&'static str, Option<u32>)>,
+}
+
+/// GPUI's `Svg` builders and layout, resolved by [`locate_svg`].
+struct SvgSymbols {
+   new:       SvgNewFn,
+   path:      SvgPathFn,
+   into_any:  SvgIntoAnyFn,
+   style_box: usize,
+}
+
+type RawSvg = Scratch<{ layout::SVG_CAP }>;
+type SvgNewFn = unsafe extern "C" fn(*mut RawSvg, *const c_void) -> *mut RawSvg;
+type SvgPathFn = unsafe extern "C" fn(*mut RawSvg, *mut RawSvg, *const u8, usize) -> *mut RawSvg;
+type SvgIntoAnyFn = unsafe extern "C" fn(*mut RawAnyElement, *mut RawSvg) -> *mut RawAnyElement;
+
+static SVG: OnceLock<SvgSymbols> = OnceLock::new();
+
+/// Resolves the `Svg` builders, after [`locate`].
+pub fn locate_svg(image: &Image<'static>) {
+   let found = match desktop::svg_builders(image) {
+      Ok(found) => found,
+      Err(err) => {
+         log::warn!("desktop gpui: {err}, icons fall back to text");
+         return;
+      },
+   };
+   if found.size > layout::SVG_CAP {
+      log::warn!(
+         "desktop gpui: Svg is {:#x} bytes, over {:#x}",
+         found.size,
+         layout::SVG_CAP
+      );
+      return;
+   }
+   // SAFETY: decoded from the code drawing a bundled icon, which calls them
+   // with these Rust-ABI signatures.
+   let symbols = unsafe {
+      SvgSymbols {
+         new:       std::mem::transmute::<usize, SvgNewFn>(found.new),
+         path:      std::mem::transmute::<usize, SvgPathFn>(found.path),
+         into_any:  std::mem::transmute::<usize, SvgIntoAnyFn>(found.into_any),
+         style_box: found.style_box,
+      }
+   };
+   let _ = SVG.set(symbols);
+   log::info!("desktop gpui: resolved Svg builders {found:x?}");
+}
+
+/// Whether icons can be drawn.
+pub fn svg_ready() -> bool {
+   SVG.get().is_some() && SYMBOLS.get().is_some()
+}
+
+/// `len` bytes from Discord's own allocator, so Discord can free them.
+pub fn discord_alloc(len: usize) -> Option<*mut u8> {
+   let sym = SYMBOLS.get()?;
+   // SAFETY: Discord's `alloc_or_oom(align, size)`, which aborts rather than
+   // returning null.
+   let ptr = unsafe { (sym.alloc_or_oom)(1, len.max(1)) };
+   (!ptr.is_null()).then_some(ptr)
+}
+
+/// An `svg().path(path)` of `px` pixels filled with `color`, as an
+/// `AnyElement`.
+fn svg_icon(
+   b: &Builder,
+   svg: &SvgSymbols,
+   path: &'static str,
+   px: f32,
+   color: [f32; 4],
+) -> RawAnyElement {
+   let mut fresh = RawSvg::zeroed();
+   let mut icon = RawSvg::zeroed();
+   // SAFETY: `svg()` builds into a buffer that fits an `Svg`, and `path` moves
+   // it into the second with a `'static` path.
+   unsafe {
+      (svg.new)(&raw mut fresh, b.sym.caller_loc);
+      (svg.path)(&raw mut icon, &raw mut fresh, path.as_ptr(), path.len());
+   }
+   // SAFETY: the `Svg`'s boxed `StyleRefinement`, at the decoded offset.
+   let style = unsafe {
+      icon
+         .as_mut_ptr()
+         .add(svg.style_box)
+         .cast::<*mut u8>()
+         .read_unaligned()
+   };
+   if !style.is_null() {
+      let s = Style {
+         ptr: style,
+         at:  &b.sym.layout.style,
+      };
+      s.lengths(&s.at.size, gpui_px(px));
+      s.float(s.at.flex_shrink, 0.0);
+      s.hsla(s.at.text_color, color);
+   }
+   let mut any = MaybeUninit::<RawAnyElement>::uninit();
+   // SAFETY: moves the `Svg` into a 32-byte `AnyElement`.
+   unsafe {
+      (svg.into_any)(any.as_mut_ptr(), &raw mut icon);
+      any.assume_init()
+   }
+}
+
+/// `pieces` side by side in a row: each piece's icons when it has any and
+/// they can be drawn, else its text.
+fn inline_row(b: &Builder, pieces: &[Piece], font_px: f32) -> RawDiv {
+   let mut row = b.h_row(4.0, false);
+   for piece in pieces {
+      let hsla = piece.color.map_or(ACCESSORY_MUTED, argb_to_hsla);
+      if let Some(svg) = SVG.get().filter(|_| !piece.icons.is_empty()) {
+         let mut icons = b.h_row(2.0, false);
+         for &(path, color) in &piece.icons {
+            let mut icon = svg_icon(
+               b,
+               svg,
+               path,
+               font_px + 3.0,
+               color.map_or(hsla, argb_to_hsla),
+            );
+            b.push_any(&mut icons, &mut icon);
+         }
+         row = b.push_div(row, icons);
+      } else if !piece.text.is_empty()
+         && let Some(line) = b.text_line(&piece.text, hsla, font_px)
+      {
+         row = b.push_div(row, line);
+      }
+   }
+   row
+}
+
+/// Adds `pieces` as one more child of a `Div` Discord built by value, like the
+/// member name's row right after the name, `lead` pixels after the child
+/// before them.
+pub fn append_pieces(div: *mut c_void, pieces: &[Piece], lead: f32) -> bool {
+   let Some(sym) = SYMBOLS.get() else {
+      return false;
+   };
+   let Some(push) = sym.div_push_any else {
+      return false;
+   };
+   if div.is_null() || sym.str_into_any.is_none() {
+      return false;
+   }
+   let b = Builder { sym };
+   let mut row = inline_row(&b, pieces, 13.0);
+   if lead > 0.0 {
+      b.style_div(&mut row, |s| s.length(s.at.padding[3], gpui_px(lead)));
+   }
+   let mut any = MaybeUninit::<RawAnyElement>::uninit();
+   b.write_any(row, any.as_mut_ptr());
+   // SAFETY: `div` is a live `Div` that `Div::child` just returned, whose
+   // children sit at the decoded offset; `push` moves the element into them.
+   unsafe {
+      let children = div
+         .cast::<u8>()
+         .add(sym.layout.div.children)
+         .cast::<c_void>();
+      push(children, any.as_mut_ptr());
+   }
+   true
+}
+
 // ---------------------------------------------------------------------------
 // Sunbird Categorized Native GPUI Settings Page
 // ---------------------------------------------------------------------------
@@ -1274,6 +1507,7 @@ const DESKTOP_FULL: &[&str] = &[
    "translate",
    "clear-urls",
    "fix-embeds",
+   "platform-indicators",
 ];
 
 const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
@@ -1357,9 +1591,10 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
 
    // 1. Header + Category Tab Bar
    let summary = format!(
-      "v{} · {enabled_count}/{} plugins active · Ctrl+Shift+I for DevTools",
+      "v{} · {enabled_count}/{} plugins active · {} for DevTools",
       update::VERSION,
-      plugins.len()
+      plugins.len(),
+      phoenix_ui_desktop::DEVTOOLS_SHORTCUT,
    );
    root = b.push_div(root, b.text_block("Sunbird", &summary));
 
@@ -1654,7 +1889,8 @@ fn render_plugins_tab(
          for setting in &plugin.settings {
             let sid = format!("sunbird-set-{}-{}", plugin.name, setting.key);
             let sdesc = setting.description.as_deref().unwrap_or("");
-            // A text, number or secret setting: its value, and Edit for an input.
+            // A text, number or secret setting: its value, and Edit for an
+            // input.
             let edit_row = |shown: &str, initial: String, kind: FieldKind| {
                let sub = if sdesc.is_empty() {
                   shown.to_owned()
@@ -1771,12 +2007,19 @@ fn render_plugins_tab(
                   );
                },
                Control::Text(val) => {
-                  let shown = if val.is_empty() {
-                     "empty"
-                  } else {
-                     val.as_str()
+                  let count = val.lines().filter(|line| !line.trim().is_empty()).count();
+                  let shown = match (setting.multiline, count) {
+                     (_, 0) => "empty".to_owned(),
+                     (true, 1) => "1 line".to_owned(),
+                     (true, n) => format!("{n} lines"),
+                     (false, _) => val.clone(),
                   };
-                  drawer = b.push_div(drawer, edit_row(shown, val.clone(), FieldKind::Text));
+                  let kind = if setting.multiline {
+                     FieldKind::Lines
+                  } else {
+                     FieldKind::Text
+                  };
+                  drawer = b.push_div(drawer, edit_row(&shown, val.clone(), kind));
                },
                Control::Secret(val) => {
                   let shown = if val.is_empty() { "not set" } else { "set" };
@@ -2007,7 +2250,10 @@ fn render_general_tab(b: &Builder, mut root: RawDiv) -> RawDiv {
       b.action_row(
          "sunbird-open-devtools",
          "Runtime Console & DevTools",
-         "Evaluate JavaScript in QuickJS and view live runtime logs (Ctrl+Shift+I).",
+         &format!(
+            "Evaluate JavaScript in QuickJS and view live runtime logs ({}).",
+            phoenix_ui_desktop::DEVTOOLS_SHORTCUT
+         ),
          "Open DevTools",
          BtnVariant::Secondary,
          BtnSize::Medium,

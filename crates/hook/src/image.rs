@@ -83,6 +83,20 @@ pub(crate) fn alloc_exec(at: usize, len: usize) -> Option<usize> {
    (page != libc::MAP_FAILED).then_some(page as usize)
 }
 
+/// Releases a mapping [`alloc_exec`] made at the wrong place.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const fn free_exec(_: usize, _: usize) {
+   // `VirtualAlloc` at an address places the memory there or fails.
+}
+
+/// Releases a mapping [`alloc_exec`] made at the wrong place: the kernel takes
+/// the address as a hint and maps elsewhere when it is taken.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn free_exec(addr: usize, len: usize) {
+   // SAFETY: unmaps the fresh mapping nothing else uses.
+   unsafe { libc::munmap(addr as *mut c_void, len) };
+}
+
 const NT_GNU_BUILD_ID: u32 = 3;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 const PF_X: u32 = 1;
@@ -181,22 +195,74 @@ impl Segment<'_> {
 /// A loaded or offline binary module (ELF or PE), mapped with its relative
 /// relocations applied so pointer slots hold the addresses code would see.
 pub struct Image<'a> {
-   pub path:          String,
-   pub build_id:      Option<BuildId>,
-   pub segments:      Vec<Segment<'a>>,
+   pub path:            String,
+   pub build_id:        Option<BuildId>,
+   pub segments:        Vec<Segment<'a>>,
    /// Address of `.eh_frame_hdr`, from `PT_GNU_EH_FRAME`.
-   pub eh_frame_hdr:  Option<usize>,
+   pub eh_frame_hdr:    Option<usize>,
    /// `.ARM.exidx` address and byte length, from `PT_ARM_EXIDX`. ARM32 unwinds
    /// through this table, so it carries the function starts `.eh_frame_hdr`
    /// holds on other targets.
-   pub arm_exidx:     Option<(usize, usize)>,
+   pub arm_exidx:       Option<(usize, usize)>,
    /// PE64 exception directory `(image_base, pdata_addr, pdata_len)` holding
    /// sorted 12-byte `RUNTIME_FUNCTION` `{begin_rva, end_rva, unwind_rva}`
    /// entries.
-   pub pdata:         Option<(usize, usize, usize)>,
+   pub pdata:           Option<(usize, usize, usize)>,
    /// Width of a pointer in this image, 4 for 32-bit and 8 for 64-bit. A file
    /// parsed offline keeps the target's width, not the host's.
-   pub pointer_width: usize,
+   pub pointer_width:   usize,
+   /// Mach-O `LC_FUNCTION_STARTS`, the only function table a Mach-O carries
+   /// without parsing `__unwind_info`.
+   pub function_starts: Option<FunctionStarts>,
+}
+
+/// Where an image's `LC_FUNCTION_STARTS` data sits, decoded on first use, since
+/// dyld reports hundreds of images and only the target is ever searched.
+pub struct FunctionStarts {
+   /// Address of the ULEB128 deltas, readable through [`Image::read`].
+   pub data: usize,
+   pub len:  usize,
+   /// `__TEXT`'s address, which the first delta counts from.
+   pub text: usize,
+   decoded:  std::sync::OnceLock<Vec<usize>>,
+}
+
+impl FunctionStarts {
+   #[must_use]
+   pub const fn new(data: usize, len: usize, text: usize) -> Self {
+      Self {
+         data,
+         len,
+         text,
+         decoded: std::sync::OnceLock::new(),
+      }
+   }
+
+   /// The sorted starts, empty when the data is not mapped.
+   fn starts(&self, image: &Image<'_>) -> &[usize] {
+      self.decoded.get_or_init(|| {
+         let Some(bytes) = image.read(self.data, self.len) else {
+            return Vec::new();
+         };
+         let mut starts = Vec::new();
+         let (mut at, mut delta, mut shift) = (self.text, 0usize, 0u32);
+         for &byte in bytes {
+            delta |= usize::from(byte & 0x7F).checked_shl(shift).unwrap_or(0);
+            shift += 7;
+            if byte & 0x80 != 0 {
+               continue;
+            }
+            // A zero delta ends the list; the rest is padding.
+            if delta == 0 {
+               break;
+            }
+            at = at.wrapping_add(delta);
+            starts.push(at);
+            (delta, shift) = (0, 0);
+         }
+         starts
+      })
+   }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -215,6 +281,7 @@ impl Image<'static> {
       const MH_MAGIC_64: u32 = 0xFEED_FACF;
       const LC_SEGMENT_64: u32 = 0x19;
       const LC_UUID: u32 = 0x1B;
+      const LC_FUNCTION_STARTS: u32 = 0x26;
       const SEGMENT_COMMAND_SIZE: usize = 72;
       const SECTION_SIZE: usize = 80;
       const INSTRUCTIONS: u32 = 0x8000_0400;
@@ -253,6 +320,9 @@ impl Image<'static> {
             };
             let mut build_id = None;
             let mut segments = Vec::new();
+            // `(fileoff - vmaddr)` of `__LINKEDIT` and `__TEXT`'s vmaddr, so a
+            // file offset there maps to memory; then the starts' file range.
+            let (mut linkedit, mut text, mut starts) = (None, None, None);
             let mut push = |addr: usize, len: usize, executable: bool, writable: bool| {
                let addr = addr.wrapping_add_signed(slide);
                // SAFETY: dyld maps the segment for the image's lifetime.
@@ -271,6 +341,11 @@ impl Image<'static> {
                let kind = u32_at(command);
                if kind == LC_SEGMENT_64 {
                   let (vmaddr, vmsize) = (word_at(command + 24), word_at(command + 32));
+                  match name_at(command + 8) {
+                     b"__TEXT" => text = Some(vmaddr),
+                     b"__LINKEDIT" => linkedit = Some((vmaddr, word_at(command + 40))),
+                     _ => {},
+                  }
                   let initprot = u32_at(command + 60).cast_signed();
                   let readable = vmsize != 0 && initprot & libc::PROT_READ != 0;
                   if readable && initprot & libc::PROT_EXEC != 0 {
@@ -285,6 +360,8 @@ impl Image<'static> {
                         && !READ_ONLY_AFTER_FIXUPS.contains(&name_at(command + 8));
                      push(vmaddr, vmsize, false, writable);
                   }
+               } else if kind == LC_FUNCTION_STARTS {
+                  starts = Some((u32_at(command + 8) as usize, u32_at(command + 12) as usize));
                } else if kind == LC_UUID && build_id.is_none() {
                   // SAFETY: LC_UUID carries a 16-byte UUID at offset 8.
                   let uuid = unsafe { slice::from_raw_parts((command + 8) as *const u8, 16) };
@@ -292,6 +369,18 @@ impl Image<'static> {
                }
                command += u32_at(command + 4) as usize;
             }
+            let function_starts = match (starts, linkedit, text) {
+               (Some((offset, len)), Some((vmaddr, fileoff)), Some(text)) if len > 0 => {
+                  offset.checked_sub(fileoff).map(|into| {
+                     FunctionStarts::new(
+                        (vmaddr + into).wrapping_add_signed(slide),
+                        len,
+                        text.wrapping_add_signed(slide),
+                     )
+                  })
+               },
+               _ => None,
+            };
             Some(Image {
                path,
                build_id,
@@ -300,6 +389,7 @@ impl Image<'static> {
                arm_exidx: None,
                pdata: None,
                pointer_width: size_of::<usize>(),
+               function_starts,
             })
          })
          .collect()
@@ -331,15 +421,87 @@ impl Image<'static> {
                .ok_or(crate::Error::Unmapped { addr: page })
          })
          .collect::<Result<Vec<_>, _>>()?;
+      if restore.iter().any(|&(_, prot)| prot & libc::PROT_EXEC != 0) {
+         // SAFETY: forwarded from the caller, and `restore` holds each slot's
+         // page.
+         return unsafe { swap_code(writes, page_size, &restore) };
+      }
       // SAFETY: forwarded from the caller, and `restore` holds each slot's
       // page.
       unsafe { swap_protected(writes, page_size, &restore) }
    }
 }
 
+/// [`swap_protected`] for code pages. A signed image's `__TEXT` never takes
+/// `PROT_WRITE`, its maximum protection is `r-x`, so each page is copied
+/// writable with `VM_PROT_COPY`, which drops its execute bit until it is
+/// restored.
+///
+/// # Safety
+///
+/// As [`swap_protected`], and no thread runs code on these pages until this
+/// returns, since they are not executable meanwhile.
+#[cfg(target_vendor = "apple")]
+unsafe fn swap_code(
+   writes: &[(usize, usize)],
+   page_size: usize,
+   restore: &[(usize, c_int)],
+) -> Result<Vec<usize>, crate::Error> {
+   const VM_PROT_READ: c_int = 1;
+   const VM_PROT_WRITE: c_int = 2;
+   const VM_PROT_COPY: c_int = 0x10;
+
+   let protect = |page: usize, prot: c_int| {
+      // SAFETY: `page` is a mapped page of this task the caller looked up.
+      let status = unsafe { vm_protect(mach_task_self_, page, page_size, 0, prot) };
+      if status == 0 {
+         Ok(())
+      } else {
+         Err(crate::Error::Protect {
+            addr:   page,
+            source: std::io::Error::other(format!("vm_protect returned {status}")),
+         })
+      }
+   };
+
+   let _serial = PROTECT
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+   for (done, &(page, _)) in restore.iter().enumerate() {
+      if let Err(err) = protect(page, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) {
+         for &(page, prot) in &restore[..done] {
+            let _ = protect(page, prot);
+         }
+         return Err(err);
+      }
+   }
+   let previous = writes
+      .iter()
+      // SAFETY: the caller guarantees aligned slots, now writable.
+      .map(|&(slot, value)| {
+         unsafe { AtomicUsize::from_ptr(slot as *mut usize) }.swap(value, Ordering::AcqRel)
+      })
+      .collect();
+   for &(page, prot) in restore {
+      let _ = protect(page, prot);
+      // SAFETY: `page` is mapped; this only drops stale instruction cache
+      // lines.
+      unsafe { sys_icache_invalidate(page as *mut c_void, page_size) };
+   }
+   Ok(previous)
+}
+
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
    static mach_task_self_: u32;
+   fn vm_protect(
+      task: u32,
+      address: usize,
+      size: usize,
+      set_maximum: u32,
+      protection: c_int,
+   ) -> c_int;
+   fn sys_icache_invalidate(start: *mut c_void, len: usize);
    fn vm_region_64(
       task: u32,
       address: *mut usize,
@@ -479,6 +641,7 @@ impl Image<'static> {
             arm_exidx: None,
             pdata: None,
             pointer_width: size_of::<usize>(),
+            function_starts: None,
          };
          for header in headers {
             let addr = bias + header.p_vaddr as usize;
@@ -761,6 +924,7 @@ impl Image<'static> {
          arm_exidx: None,
          pdata,
          pointer_width,
+         function_starts: None,
       })
    }
 
@@ -933,6 +1097,217 @@ impl Image<'static> {
       unsafe { self.write_code(addr, &absolute_jump(detour)) }?;
       Ok(trampoline)
    }
+
+   /// Refuses, since the call-site hook only rewrites x86 calls. The macOS
+   /// runtime never reaches it.
+   ///
+   /// # Safety
+   ///
+   /// None, nothing is written.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   pub unsafe fn hook_call(
+      &self,
+      site: usize,
+      _prefix: &[u8],
+      _detour: usize,
+   ) -> Result<usize, crate::Error> {
+      Err(crate::Error::Attach {
+         backend: "call",
+         target:  site,
+         message: "arm64 code has no x86 call sites".to_owned(),
+      })
+   }
+
+   /// Points the one call at `site` to `detour`, through an island within
+   /// reach of the call that runs `prefix` and then jumps to `detour`, and
+   /// returns the call's original target. Other calls to that target stay as
+   /// they are. `prefix` may only touch registers the target does not read,
+   /// like handing a callee-saved register of the caller to `detour`.
+   ///
+   /// The call is a `call rel32`, or a `call [rip + slot]` as ELF builds make,
+   /// which becomes a `call rel32` and a `nop` the call returns onto.
+   ///
+   /// # Safety
+   ///
+   /// `detour` takes the target's arguments plus what `prefix` adds, and no
+   /// thread runs the call while its displacement is written.
+   #[cfg(all(target_arch = "x86_64", any(windows, target_os = "linux")))]
+   pub unsafe fn hook_call(
+      &self,
+      site: usize,
+      prefix: &[u8],
+      detour: usize,
+   ) -> Result<usize, crate::Error> {
+      /// `call rel32`.
+      const CALL: u8 = 0xE8;
+      const CALL_LEN: usize = 5;
+      const NOP: u8 = 0x90;
+      /// Windows hands out memory at this granularity.
+      const STEP: usize = 0x1_0000;
+      const REACH: usize = 0x7000_0000;
+
+      let refuse = |message: &str| {
+         crate::Error::Attach {
+            backend: "call",
+            target:  site,
+            message: message.to_owned(),
+         }
+      };
+      let call = self
+         .read(site, 6)
+         .or_else(|| self.read(site, CALL_LEN))
+         .ok_or(crate::Error::Unmapped { addr: site })?;
+      let (len, target) = match call {
+         [CALL, ..] | [0xFF, 0x15, ..] => {
+            crate::x86::call_target(self, call, site).ok_or_else(|| refuse("not a call"))?
+         },
+         _ => return Err(refuse("not a call rel32 or through a slot")),
+      };
+      let next = site + CALL_LEN;
+      let rel_to =
+         |to: usize| i32::try_from(i64::try_from(to).ok()? - i64::try_from(next).ok()?).ok();
+
+      let mut code = prefix.to_vec();
+      code.extend(absolute_jump(detour));
+      // Below the lowest segment, so the module's own pages are skipped.
+      let low = self
+         .segments
+         .iter()
+         .map(|segment| segment.addr)
+         .min()
+         .unwrap_or(site)
+         & !(STEP - 1);
+      let island = (1..REACH / STEP)
+         .filter_map(|k| low.checked_sub(k * STEP))
+         .take_while(|&at| rel_to(at).is_some())
+         .find_map(|at| {
+            let got = alloc_exec(at, code.len())?;
+            if rel_to(got).is_some() {
+               return Some(got);
+            }
+            free_exec(got, code.len());
+            None
+         })
+         .ok_or_else(|| refuse("no memory within reach of the call"))?;
+      // SAFETY: `island` holds `code.len()` writable bytes.
+      unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), island as *mut u8, code.len()) };
+      let rel = rel_to(island).ok_or_else(|| refuse("the island is out of reach"))?;
+      let mut patch = vec![CALL];
+      patch.extend(rel.to_le_bytes());
+      patch.resize(len, NOP);
+      // SAFETY: forwarded from the caller.
+      unsafe { self.write_code(site, &patch) }?;
+      Ok(target)
+   }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Image<'static> {
+   /// Sends calls to the function at `addr` to `detour` with an absolute jump
+   /// over its first four instructions, and returns a trampoline that runs
+   /// them, relocated, and jumps back past them: the detour calls the
+   /// trampoline to reach the original.
+   ///
+   /// `prologue` and `prologue_len` describe x86-64 code and are ignored: the
+   /// displaced instructions are decoded instead. A hook is refused when one
+   /// of them is a literal load, or when the function branches back into
+   /// them.
+   ///
+   /// # Safety
+   ///
+   /// `detour` has the function's exact ABI, and no thread runs the
+   /// function's first bytes while they are written.
+   pub unsafe fn hook_entry(
+      &self,
+      addr: usize,
+      _prologue: Pattern,
+      _prologue_len: usize,
+      detour: usize,
+   ) -> Result<usize, crate::Error> {
+      use crate::arm64::{
+         self,
+         Insn,
+         JUMP_LEN,
+      };
+
+      let refuse = |message: &str| {
+         crate::Error::Attach {
+            backend: "inline",
+            target:  addr,
+            message: message.to_owned(),
+         }
+      };
+      let displaced = self
+         .read(addr, JUMP_LEN)
+         .ok_or(crate::Error::Unmapped { addr })?;
+      let (start, body) = arm64::function(self, addr).ok_or_else(|| refuse("no function here"))?;
+      if start != addr {
+         return Err(refuse("not a function start"));
+      }
+      let inside = addr + 1..addr + JUMP_LEN;
+      if body.iter().any(|&(_, insn)| {
+         matches!(
+            insn,
+            Insn::B { target }
+               | Insn::BCond { target, .. }
+               | Insn::Cbz { target, .. }
+               | Insn::Tbz { target, .. }
+               if inside.contains(&target)
+         )
+      }) {
+         return Err(refuse("the function branches into its first instructions"));
+      }
+      let mut code = arm64::relocate(displaced, addr)
+         .ok_or_else(|| refuse("a displaced instruction can't be moved"))?;
+      code.extend(arm64::absolute_jump(addr + JUMP_LEN));
+      let trampoline = jit_copy(&code).ok_or_else(|| refuse("no memory for the trampoline"))?;
+      // SAFETY: forwarded from the caller.
+      unsafe { self.write_code(addr, &arm64::absolute_jump(detour)) }?;
+      Ok(trampoline)
+   }
+}
+
+/// [`crate::arm64::sret_caller`] in executable memory, as a function pointer.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[must_use]
+pub fn sret_caller(target: usize) -> Option<usize> {
+   jit_copy(&crate::arm64::sret_caller(target))
+}
+
+/// [`crate::arm64::sret_callee`] in executable memory, as a function pointer.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[must_use]
+pub fn sret_callee(detour: usize) -> Option<usize> {
+   jit_copy(&crate::arm64::sret_callee(detour))
+}
+
+/// `code` in fresh executable memory. `MAP_JIT` pages are the ones macOS lets a
+/// process write code into, one thread's view at a time.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn jit_copy(code: &[u8]) -> Option<usize> {
+   // SAFETY: asks for a fresh anonymous mapping that replaces nothing.
+   let page = unsafe {
+      libc::mmap(
+         std::ptr::null_mut(),
+         code.len(),
+         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+         libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+         -1,
+         0,
+      )
+   };
+   if page == libc::MAP_FAILED {
+      return None;
+   }
+   // SAFETY: `page` holds `code.len()` bytes, writable on this thread while
+   // JIT write protection is off, and executable again once it is back on.
+   unsafe {
+      libc::pthread_jit_write_protect_np(0);
+      std::ptr::copy_nonoverlapping(code.as_ptr(), page.cast::<u8>(), code.len());
+      libc::pthread_jit_write_protect_np(1);
+      sys_icache_invalidate(page, code.len());
+   }
+   Some(page as usize)
 }
 
 impl Image<'_> {
@@ -1057,6 +1432,9 @@ impl Image<'_> {
    /// pointers to strings. Images without a search table fall back to it.
    #[must_use]
    pub fn is_function(&self, addr: usize) -> bool {
+      if self.function_starts.is_some() {
+         return self.function_containing(addr) == Some(addr);
+      }
       if self.arm_exidx.is_none() && self.eh_frame_hdr.is_none() && self.pdata.is_none() {
          return self.is_code(addr);
       }
@@ -1075,6 +1453,14 @@ impl Image<'_> {
    /// `.eh_frame_hdr`.
    #[must_use]
    pub fn function_containing(&self, addr: usize) -> Option<usize> {
+      if let Some(starts) = &self.function_starts {
+         let starts = starts.starts(self);
+         let index = starts
+            .partition_point(|&start| start <= addr)
+            .checked_sub(1)?;
+         return Some(starts[index]);
+      }
+
       if let Some((image_base, base, len)) = self.pdata {
          return self
             .pdata_bounds(image_base, base, len / 12, addr)
@@ -1099,6 +1485,23 @@ impl Image<'_> {
    /// `.pdata` or the FDE `.eh_frame_hdr` points at.
    #[must_use]
    pub fn function_bounds(&self, addr: usize) -> Option<(usize, usize)> {
+      if let Some(starts) = &self.function_starts {
+         // Each function ends where the next starts, or with its section.
+         let starts = starts.starts(self);
+         let index = starts
+            .partition_point(|&start| start <= addr)
+            .checked_sub(1)?;
+         let section = self
+            .segments
+            .iter()
+            .find(|segment| segment.executable && segment.contains(starts[index]))?;
+         let end = starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(usize::MAX)
+            .min(section.addr + section.bytes.len());
+         return (addr < end).then_some((starts[index], end));
+      }
       if let Some((image_base, base, len)) = self.pdata {
          return self.pdata_bounds(image_base, base, len / 12, addr);
       }
@@ -1249,6 +1652,44 @@ fn last_at_or_below(
 mod tests {
    use super::*;
 
+   // `mov w0, #1; ret` on a 16 KB page of its own, since the page loses
+   // execute while it is written and must not hold the writer.
+   #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+   std::arch::global_asm!(
+      ".section __TEXT,__phoenix_test,regular,pure_instructions",
+      ".p2align 14",
+      ".globl _phoenix_test_answer",
+      ".private_extern _phoenix_test_answer",
+      "_phoenix_test_answer:",
+      "mov w0, #1",
+      "ret",
+      ".p2align 14",
+      ".text",
+   );
+
+   #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+   #[test]
+   fn write_code_rewrites_a_signed_function() {
+      unsafe extern "C" {
+         fn phoenix_test_answer() -> u32;
+      }
+      /// `mov w0, #2; ret`
+      const TWO: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
+      let call = std::hint::black_box(phoenix_test_answer as unsafe extern "C" fn() -> u32);
+      let addr = call as usize;
+      // SAFETY: the test binary's own images.
+      let images = unsafe { Image::loaded() };
+      let image = images
+         .iter()
+         .find(|image| image.is_code(addr))
+         .expect("the test's own text");
+      // SAFETY: nothing else calls `phoenix_test_answer`.
+      unsafe { image.write_code(addr, &TWO) }.expect("write_code");
+      // SAFETY: the bytes just written.
+      assert_eq!(unsafe { call() }, 2);
+   }
+
    #[test]
    fn function_bounds_read_the_fde_range() {
       let mut bytes = vec![0u8; 0x100];
@@ -1269,21 +1710,67 @@ mod tests {
       put(0x48, &(0x2000_i32 - 0x1048).to_le_bytes());
       put(0x4C, &0x80_u32.to_le_bytes());
       let image = Image {
-         path:          String::new(),
-         build_id:      None,
-         segments:      vec![Segment {
+         path:            String::new(),
+         build_id:        None,
+         segments:        vec![Segment {
             addr:       0x1000,
             bytes:      Cow::Owned(bytes),
             executable: false,
             writable:   false,
          }],
-         eh_frame_hdr:  Some(0x1000),
-         arm_exidx:     None,
-         pdata:         None,
-         pointer_width: 8,
+         eh_frame_hdr:    Some(0x1000),
+         arm_exidx:       None,
+         pdata:           None,
+         pointer_width:   8,
+         function_starts: None,
       };
       assert_eq!(image.function_bounds(0x2010), Some((0x2000, 0x2080)));
       assert_eq!(image.function_bounds(0x2080), None);
       assert_eq!(image.function_containing(0x2080), Some(0x2000));
+   }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod sret_thunk_tests {
+   /// Too big for registers, so arm64 returns it through `x8`.
+   #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+   #[repr(C)]
+   struct Big([u64; 6]);
+
+   type X86 = unsafe extern "C" fn(*mut Big, u64, u64, u64, u64, u64) -> *mut Big;
+   type Native = extern "C" fn(u64, u64, u64, u64, u64) -> Big;
+
+   const extern "C" fn native(one: u64, two: u64, three: u64, four: u64, five: u64) -> Big {
+      Big([one, two, three, four, five, one + two + three + four + five])
+   }
+
+   const unsafe extern "C" fn x86_style(
+      out: *mut Big,
+      one: u64,
+      two: u64,
+      three: u64,
+      four: u64,
+      five: u64,
+   ) -> *mut Big {
+      // SAFETY: the callee thunk passes the caller's return slot.
+      unsafe { out.write(Big([five, four, three, two, one, 7])) };
+      out
+   }
+
+   #[test]
+   fn callers_and_callees_round_trip() {
+      let caller = super::sret_caller(native as *const () as usize).expect("jit");
+      // SAFETY: the thunk has `X86`'s shape and calls `native`.
+      let call = unsafe { std::mem::transmute::<usize, X86>(caller) };
+      let mut out = Big([0; 6]);
+      // SAFETY: `out` is a valid return slot.
+      let back = unsafe { call(&raw mut out, 1, 2, 3, 4, 5) };
+      assert_eq!(back, &raw mut out);
+      assert_eq!(out, Big([1, 2, 3, 4, 5, 15]));
+
+      let entry = super::sret_callee(x86_style as *const () as usize).expect("jit");
+      // SAFETY: the thunk takes `Native`'s shape and hands it to `x86_style`.
+      let entered = unsafe { std::mem::transmute::<usize, Native>(entry) };
+      assert_eq!(entered(1, 2, 3, 4, 5), Big([5, 4, 3, 2, 1, 7]));
    }
 }

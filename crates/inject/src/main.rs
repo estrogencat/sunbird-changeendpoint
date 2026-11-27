@@ -15,6 +15,9 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)] mod http;
+#[cfg(windows)] mod shortcuts;
+
 #[cfg(windows)]
 fn main() {
    misstep::install_panic_hook();
@@ -40,13 +43,18 @@ mod windows {
       },
       fs,
       io,
-      os::windows::ffi::OsStrExt,
+      os::windows::ffi::{
+         OsStrExt,
+         OsStringExt,
+      },
       path::{
          Path,
          PathBuf,
       },
       process::Command,
       ptr,
+      thread,
+      time::Duration,
    };
 
    use misstep::{
@@ -122,9 +130,6 @@ mod windows {
       fn MessageBoxW(window: Handle, text: *const u16, caption: *const u16, kind: u32) -> i32;
    }
 
-   /// `CREATE_NO_WINDOW`, so `curl` and PowerShell don't flash a console.
-   const NO_WINDOW: u32 = 0x0800_0000;
-
    /// Where the site serves `version.json` and the loaders. `SUNBIRD_SITE`
    /// points it at a local server for testing; anything else must be https,
    /// since what it serves is loaded into Discord.
@@ -146,14 +151,6 @@ mod windows {
                   .strip_prefix(local)
                   .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
             })
-   }
-
-   /// A program in System32, by full path: `Command` looks beside this
-   /// launcher first, which is the Downloads folder on the first run.
-   fn system32(program: &str) -> PathBuf {
-      PathBuf::from(env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
-         .join("System32")
-         .join(program)
    }
 
    /// Shows `text` in a message box, since the launcher has no console.
@@ -190,10 +187,11 @@ mod windows {
 
    /// The UTF-16 text in `entry` from byte `at`, up to its NUL.
    fn entry_text(entry: &[u8], at: usize) -> OsString {
-      use std::os::windows::ffi::OsStringExt;
       let units: Vec<u16> = entry[at..]
-         .chunks_exact(2)
-         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+         .as_chunks::<2>()
+         .0
+         .iter()
+         .map(|pair| u16::from_le_bytes(*pair))
          .take_while(|&unit| unit != 0)
          .collect();
       OsString::from_wide(&units)
@@ -223,7 +221,7 @@ mod windows {
             let process = unsafe { OpenProcess(PROCESS_ACCESS, 0, pid) };
             if !process.is_null() {
                let mut path = [0u16; 1024];
-               let mut len = path.len() as u32;
+               let mut len = u32::try_from(path.len()).unwrap_or(1024);
                // SAFETY: `path` holds `len` units.
                let named = unsafe {
                   QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &raw mut len)
@@ -268,13 +266,37 @@ mod windows {
       found
    }
 
-   fn as_bytes(words: &[u64]) -> &[u8] {
+   const fn as_bytes(words: &[u64]) -> &[u8] {
       // SAFETY: any `u64`s are valid bytes, and the length covers them.
       unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) }
    }
 
    fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
       text.as_ref().encode_wide().chain([0]).collect()
+   }
+
+   fn append_quoted(command: &mut Vec<u16>, arg: &OsStr) {
+      const QUOTE: u16 = b'"' as u16;
+      const SLASH: u16 = b'\\' as u16;
+      command.push(QUOTE);
+      let mut slashes = 0;
+      for unit in arg.encode_wide() {
+         if unit == SLASH {
+            slashes += 1;
+            continue;
+         }
+         // Windows treats backslashes before a quote as escapes.
+         let count = if unit == QUOTE {
+            slashes * 2 + 1
+         } else {
+            slashes
+         };
+         command.extend(std::iter::repeat_n(SLASH, count));
+         command.push(unit);
+         slashes = 0;
+      }
+      command.extend(std::iter::repeat_n(SLASH, slashes * 2));
+      command.push(QUOTE);
    }
 
    fn check(ok: bool) -> io::Result<()> {
@@ -319,12 +341,18 @@ mod windows {
       {
          no_runtime = true;
       }
-      let dll = match explicit {
+      let launcher = if explicit.is_some() {
+         env::current_exe()?
+      } else {
+         home.join("sunbird.exe")
+      };
+      let dll = match &explicit {
          Some(path) => PathBuf::from(path),
          None => install(&local, &home)?,
       };
       let dll = dll.canonicalize()?;
-      let args: Vec<OsString> = args.skip_while(|arg| arg == "--").collect();
+      args.next_if(|arg| arg == "--");
+      let args: Vec<OsString> = args.collect();
 
       // A second Discord hands off to the running one and exits, so Sunbird
       // would never run in the Discord the user sees.
@@ -367,17 +395,44 @@ mod windows {
          }
       }
 
-      let mut command = OsString::from(format!("\"{}\"", exe.display()));
-      for arg in &args {
-         command.push(" ");
-         command.push(arg);
-      }
-      let mut command = wide(command);
+      set_restart_env(&launcher, explicit.as_ref().map(|_| dll.as_path()), no_runtime);
+      launch(&exe, &app, &dll, &args)
+   }
+
+   fn set_restart_env(launcher: &Path, explicit_dll: Option<&Path>, no_runtime: bool) {
+      let mut restart_args = Vec::new();
       if no_runtime {
-         // SAFETY: `phoenix-inject` is single-threaded; `Discord.exe` inherits
-         // the flag and opens only the access gate without starting Sunbird.
-         unsafe { env::set_var("SUNBIRD_GATE_ONLY", "1") };
+         restart_args.extend("--no-runtime ".encode_utf16());
       }
+      if let Some(dll) = explicit_dll {
+         append_quoted(&mut restart_args, dll.as_os_str());
+         restart_args.push(u16::from(b' '));
+      }
+      restart_args.extend("--".encode_utf16());
+      // SAFETY: the launcher is single-threaded. Discord and its restart helper
+      // inherit these settings with the rest of the environment.
+      unsafe {
+         env::set_var("SUNBIRD_RESTART_EXE", launcher);
+         env::set_var("SUNBIRD_RESTART_ARGS", OsString::from_wide(&restart_args));
+         if no_runtime {
+            env::set_var("SUNBIRD_GATE_ONLY", "1");
+         }
+      }
+   }
+
+   fn launch(
+      exe: &Path,
+      app: &Path,
+      dll: &Path,
+      args: &[OsString],
+   ) -> misstep::Result<()> {
+      let mut command = Vec::new();
+      append_quoted(&mut command, exe.as_os_str());
+      for arg in args {
+         command.push(u16::from(b' '));
+         append_quoted(&mut command, arg);
+      }
+      command.push(0);
 
       // STARTUPINFOW is 104 bytes on x64 and only `cb` must be set.
       let mut startup = [0u64; 13];
@@ -392,20 +447,20 @@ mod windows {
       // NUL-terminated.
       check(unsafe {
          CreateProcessW(
-            wide(&exe).as_ptr(),
+            wide(exe).as_ptr(),
             command.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
             0,
             CREATE_SUSPENDED,
             ptr::null(),
-            wide(&app).as_ptr(),
+            wide(app).as_ptr(),
             startup.as_ptr().cast(),
             &raw mut info,
          ) != 0
       })?;
 
-      let queued = queue_load(&info, &wide(&dll));
+      let queued = queue_load(&info, &wide(dll));
       if queued.is_err() {
          // SAFETY: `info.process` is the suspended child created above.
          unsafe { TerminateProcess(info.process, 1) };
@@ -484,7 +539,7 @@ mod windows {
       // Missing shortcuts never stop Discord from starting, and a shortcut the
       // user deleted stays deleted until they run the installer again.
       if copied {
-         let _ = shortcuts(local, &launcher, false);
+         let _ = crate::shortcuts::sync(local, &launcher, false);
       }
       Ok(dll)
    }
@@ -501,7 +556,7 @@ mod windows {
    /// which Windows lets us rename but not overwrite.
    fn update(home: &Path, dll: &Path) -> misstep::Result<()> {
       let site = site()?;
-      let manifest = curl(&site, 10, &[&format!("{site}/version.json")])?;
+      let manifest = crate::http::text(&format!("{site}/version.json"), Duration::from_secs(10))?;
       let version = loader_version(&manifest).context("version.json has no loader")?;
       let stamp = home.join("version.txt");
       if dll.is_file() && fs::read_to_string(&stamp).is_ok_and(|have| have.trim() == version) {
@@ -509,14 +564,24 @@ mod windows {
       }
       // Per process, so a second launch mid-download writes its own file.
       let fresh = home.join(format!("phoenix.dll.{}.new", std::process::id()));
-      curl(&site, 60, &[
-         "-o",
-         &fresh.to_string_lossy(),
-         &format!("{site}/plugins/phoenix-windows-x86_64.dll"),
-      ])?;
-      // `curl -f` only rejects an HTTP error, so a captive portal or a wrong
-      // deploy still writes its body here; swapping that in would leave
-      // Discord without a working DLL.
+      // Discord waits on this download. With a DLL to fall back on, a slow one
+      // gives up sooner; a first install has nothing else, so it keeps trying.
+      let attempts = if dll.is_file() { 1 } else { 3 };
+      let url = format!("{site}/plugins/phoenix-windows-x86_64.dll");
+      let mut downloaded = crate::http::download(&url, &fresh, Duration::from_secs(60));
+      for _ in 1..attempts {
+         if downloaded.is_ok() {
+            break;
+         }
+         thread::sleep(Duration::from_secs(2));
+         downloaded = crate::http::download(&url, &fresh, Duration::from_secs(60));
+      }
+      if let Err(err) = downloaded {
+         let _ = fs::remove_file(&fresh);
+         return Err(err);
+      }
+      // A captive portal or a wrong deploy still writes its body here;
+      // swapping that in would leave Discord without a working DLL.
       if !is_loader(&fresh) {
          let _ = fs::remove_file(&fresh);
          misstep::bail!("the downloaded phoenix.dll is not a Windows loader");
@@ -547,34 +612,11 @@ mod windows {
    /// loader is built with (`crates/runtime/src/update.rs`).
    fn is_loader(path: &Path) -> bool {
       fs::read(path).is_ok_and(|bytes| {
-         bytes.starts_with(b"MZ") && bytes.windows(16).any(|window| window == b"phoenix-version:")
+         bytes.starts_with(b"MZ")
+            && bytes
+               .windows(16)
+               .any(|window| window == b"phoenix-version:")
       })
-   }
-
-   /// Runs Windows' own `curl.exe` and returns what it printed. Only
-   /// `site`'s scheme is allowed, and redirects never leave https.
-   fn curl(site: &str, max_secs: u32, args: &[&str]) -> misstep::Result<String> {
-      use std::os::windows::process::CommandExt;
-      let proto = if site.starts_with("https://") {
-         "=https"
-      } else {
-         "=http"
-      };
-      let out = Command::new(system32("curl.exe"))
-         .args(["-fsSL", "--proto", proto, "--proto-redir", "=https"])
-         .args([
-            "--ssl-revoke-best-effort",
-            "--max-time",
-            &max_secs.to_string(),
-         ])
-         .args(args)
-         .creation_flags(NO_WINDOW)
-         .output()
-         .context("running curl.exe")?;
-      if !out.status.success() {
-         misstep::bail!("curl: {}", String::from_utf8_lossy(&out.stderr).trim());
-      }
-      Ok(String::from_utf8_lossy(&out.stdout).into_owned())
    }
 
    /// `"loader": "<version>"` from `version.json`.
@@ -584,42 +626,10 @@ mod windows {
       rest.get(..rest.find('"')?)
    }
 
-   /// The Start Menu and Desktop shortcuts, and a Start Menu one for access
-   /// gate only, for when the runtime crashes on a Discord build it doesn't
-   /// know yet. Made through PowerShell's `WScript.Shell`, so
-   /// OneDrive-redirected desktops resolve. Adds them when missing, or removes
-   /// them. Paths reach the script through the environment, never inside its
-   /// text.
-   fn shortcuts(local: &Path, launcher: &Path, remove: bool) -> misstep::Result<()> {
-      use std::os::windows::process::CommandExt;
-      let script = format!(
-         "$w = New-Object -ComObject WScript.Shell; $programs = \
-          [Environment]::GetFolderPath('Programs'); $sunbird = @('Sunbird', '', 'Discord with \
-          Sunbird'); foreach ($l in @((@($programs) + $sunbird), \
-          (@([Environment]::GetFolderPath('Desktop')) + $sunbird), @($programs, 'Sunbird (access \
-          gate only)', '--no-runtime', 'Discord past the access gate, without plugins'))) {{ $p = \
-          Join-Path $l[0] ($l[1] + '.lnk'); if (${remove}) {{ Remove-Item -LiteralPath $p \
-          -ErrorAction SilentlyContinue; continue }}; if (Test-Path -LiteralPath $p) {{ continue \
-          }}; $s = $w.CreateShortcut($p); $s.TargetPath = $env:SB_TARGET; $s.Arguments = $l[2]; \
-          $s.IconLocation = $env:SB_ICON + ',0'; $s.Description = $l[3]; $s.Save() }}"
-      );
-      let status = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"))
-         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-         .env("SB_TARGET", launcher)
-         .env("SB_ICON", local.join(r"DiscordPhoenix\app\Discord.exe"))
-         .creation_flags(NO_WINDOW)
-         .status()
-         .context("running powershell.exe")?;
-      if !status.success() {
-         misstep::bail!("creating the Sunbird shortcuts failed");
-      }
-      Ok(())
-   }
-
    /// Removes the shortcuts and `home`. Files a running Discord or launcher
    /// still holds stay until they exit, and the user is told so.
    fn uninstall(local: &Path, home: &Path) {
-      let _ = shortcuts(local, &home.join("sunbird.exe"), true);
+      let _ = crate::shortcuts::sync(local, &home.join("sunbird.exe"), true);
       match fs::remove_dir_all(home) {
          Err(err) if err.kind() != io::ErrorKind::NotFound => {
             alert(&format!(
@@ -634,6 +644,20 @@ mod windows {
 
    #[cfg(test)]
    mod tests {
+      #[test]
+      fn quotes_windows_arguments_for_restart() {
+         for (arg, quoted) in [
+            ("", r#""""#),
+            ("two words", r#""two words""#),
+            (r"C:\a b\", r#""C:\a b\\""#),
+            (r#"a\"b"#, r#""a\\\"b""#),
+         ] {
+            let mut command = Vec::new();
+            super::append_quoted(&mut command, arg.as_ref());
+            assert_eq!(String::from_utf16(&command).unwrap(), quoted);
+         }
+      }
+
       #[test]
       fn reads_the_loader_version() {
          let manifest = "{\n  \"loader\": \"2026.11.23.2353-b51d77c\",\n  \"plugins\": {}\n}";

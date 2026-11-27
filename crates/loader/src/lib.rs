@@ -1,6 +1,6 @@
 //! `libphoenix.so` / `phoenix.dll`, injected through `DT_NEEDED` on Android,
 //! as a dylib on iOS, or loaded into Desktop Phoenix on Windows and, through
-//! `LD_PRELOAD`, on Linux.
+//! `LD_PRELOAD` on Linux and `DYLD_INSERT_LIBRARIES` on macOS.
 //!
 //! On Unix the constructor runs once the host library is mapped and relocated.
 //! Desktop hooks Discord synchronously, from `DllMain` or the constructor, then
@@ -64,12 +64,20 @@ extern "C" fn init() {
    if linux::claim() {
       desktop();
    }
+   #[cfg(target_os = "macos")]
+   if macos::claim() {
+      desktop();
+   }
    #[cfg(target_os = "ios")]
    {
       logging();
       ios::start_with_phoenix();
    }
-   #[cfg(not(any(target_os = "ios", all(target_os = "linux", target_arch = "x86_64"))))]
+   #[cfg(not(any(
+      target_os = "ios",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "x86_64")
+   )))]
    {
       logging();
       run();
@@ -79,7 +87,11 @@ extern "C" fn init() {
 /// Hooks Discord before its own code runs, since Desktop Phoenix settles on
 /// the access gate and reads its HTTP vtables in its first frames, then starts
 /// phoenix on a thread.
-#[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(any(
+   windows,
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "x86_64")
+))]
 fn desktop() {
    logging();
    if env::var_os("SUNBIRD_GATE_ONLY").is_some() {
@@ -123,7 +135,11 @@ fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    phoenix_runtime_mobile::start(home, bundled)
 }
 
-#[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(any(
+   windows,
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "x86_64")
+))]
 fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    phoenix_runtime_desktop::start(home, bundled)
 }
@@ -131,6 +147,7 @@ fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
 #[cfg(not(any(
    target_os = "android",
    target_os = "ios",
+   target_os = "macos",
    windows,
    all(target_os = "linux", target_arch = "x86_64")
 )))]
@@ -167,7 +184,25 @@ fn home() -> PathBuf {
       );
       data.join("sunbird")
    }
-   #[cfg(all(unix, not(any(target_os = "ios", target_os = "linux"))))]
+   #[cfg(target_os = "macos")]
+   {
+      // Sits directly under macOS Phoenix's data directory, which holds
+      // `app.lock`, `modules/` and `store/<account>/cache.sqlite`, so its
+      // parent is the `store` root.
+      let data = env::var_os("LIBDISCORD_DATA_DIR").map_or_else(
+         || {
+            env::var_os("HOME")
+               .map_or_else(env::temp_dir, PathBuf::from)
+               .join("Library/Application Support/libdiscord")
+         },
+         PathBuf::from,
+      );
+      data.join("sunbird")
+   }
+   #[cfg(all(
+      unix,
+      not(any(target_os = "ios", target_os = "macos", target_os = "linux"))
+   ))]
    {
       // /proc/self/cmdline starts with the package name, plus `:process` for
       // secondary processes.
@@ -347,6 +382,68 @@ mod linux {
    }
 }
 
+#[cfg(target_os = "macos")]
+mod macos {
+   use std::{
+      env,
+      ffi::OsStr,
+      os::unix::ffi::OsStrExt,
+      path::Path,
+   };
+
+   /// macOS Phoenix's executable, `Discord.app/Contents/MacOS/Discord`. The
+   /// Electron client's has the same name, and its registry walk then fails.
+   const CLIENT: &str = "Discord";
+
+   /// Whether this process is the client, after its re-exec. If so, takes
+   /// this library out of `DYLD_INSERT_LIBRARIES` so the client's children
+   /// (the CEF helpers, `osascript`) never load it. dyld kills an arm64e
+   /// child that is handed this arm64 library when SIP is off.
+   pub fn claim() -> bool {
+      let client = env::current_exe().is_ok_and(|exe| {
+         exe.file_name() == Some(OsStr::new(CLIENT))
+            && exe
+               .parent()
+               .is_some_and(|dir| dir.ends_with("Contents/MacOS"))
+      });
+      // Discord re-execs itself unless its malloc settings are set, which
+      // replaces this image before its own code runs; the new one needs the
+      // library still inserted. Launch Services sets them, so nothing re-execs.
+      let last_image = env::var_os(phoenix_sigs::MACOS_REEXEC).is_some()
+         || env::var_os(phoenix_sigs::MACOS_MALLOC).is_some();
+      if !client || !last_image {
+         return false;
+      }
+      if let Some(path) = super::unix::library_path() {
+         uninsert(Path::new(OsStr::from_bytes(path.to_bytes())));
+      }
+      true
+   }
+
+   fn uninsert(ours: &Path) {
+      let Some(inserted) = env::var_os("DYLD_INSERT_LIBRARIES") else {
+         return;
+      };
+      let kept = inserted
+         .as_bytes()
+         .split(|&byte| byte == b':')
+         .filter(|entry| {
+            !entry.is_empty() && Path::new(OsStr::from_bytes(entry)).file_name() != ours.file_name()
+         })
+         .collect::<Vec<_>>()
+         .join(&b':');
+      // SAFETY: constructors run before `main`, while dyld is the only
+      // thread.
+      unsafe {
+         if kept.is_empty() {
+            env::remove_var("DYLD_INSERT_LIBRARIES");
+         } else {
+            env::set_var("DYLD_INSERT_LIBRARIES", OsStr::from_bytes(&kept));
+         }
+      }
+   }
+}
+
 #[cfg(target_os = "ios")]
 mod ios {
    use std::{
@@ -401,7 +498,9 @@ mod ios {
    }
 }
 
-#[cfg(target_os = "ios")]
+/// To the unified log, where `log stream --predicate 'process == "Discord"'`
+/// shows it, since a launched app's stderr goes nowhere.
+#[cfg(target_vendor = "apple")]
 fn logging() {
    struct Syslog;
 
@@ -446,7 +545,7 @@ fn logging() {
    }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_vendor = "apple")))]
 fn logging() {
    use std::io::Write as _;
 

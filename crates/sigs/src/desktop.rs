@@ -52,6 +52,37 @@ const FRAME_PROLOGUE_LEN: usize = 19;
 const MEDIA_FETCH_PROLOGUE: Pattern = Pattern::new("55 41 57 41 56 56 57 53 48 81 EC ?? ?? ?? ??");
 const MEDIA_FETCH_PROLOGUE_LEN: usize = 15;
 
+/// GPUI's Windows restart script.
+pub const WINDOWS_RESTART_SCRIPT: &str = r#"
+            $pidToWaitFor = $env:ZED_RESTART_PID
+            $exePath = $env:ZED_RESTART_EXECUTABLE
+            $argumentList = $env:ZED_RESTART_ARGUMENTS
+
+            [Environment]::SetEnvironmentVariable("ZED_RESTART_PID", $null)
+            [Environment]::SetEnvironmentVariable("ZED_RESTART_EXECUTABLE", $null)
+            [Environment]::SetEnvironmentVariable("ZED_RESTART_ARGUMENTS", $null)
+
+            while ($true) {
+                $process = Get-Process -Id $pidToWaitFor -ErrorAction SilentlyContinue
+                if (-not $process) {
+                    if ([string]::IsNullOrEmpty($argumentList)) {
+                        Start-Process -FilePath $exePath
+                    } else {
+                        Start-Process -FilePath $exePath -ArgumentList $argumentList
+                    }
+                    break
+                }
+                Start-Sleep -Seconds 0.1
+            }
+            "#;
+
+pub fn windows_restart_script(image: &Image<'_>) -> Found<usize> {
+   one(
+      "Windows restart script",
+      &image.find_bytes(WINDOWS_RESTART_SCRIPT.as_bytes()),
+   )
+}
+
 /// A function entry [`Image::hook_entry`] can displace: whole instructions
 /// with no RIP-relative operand, at least 14 bytes.
 #[derive(Clone, Copy)]
@@ -78,6 +109,8 @@ pub struct Prologues {
    /// and `ReqwestTransport::send`.
    pub frame:       Prologue,
    pub media_fetch: Prologue,
+   /// The asset loader, [`asset_load`].
+   pub asset_load:  Prologue,
    /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
    /// Win64, five on System V, up to the `jne`.
    pub emoji_check: Prologue,
@@ -107,6 +140,10 @@ impl Prologues {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
+               asset_load:  Prologue {
+                  pattern: MEDIA_FETCH_PROLOGUE,
+                  len:     MEDIA_FETCH_PROLOGUE_LEN,
+               },
                emoji_check: Prologue {
                   pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
                   len:     14,
@@ -118,6 +155,11 @@ impl Prologues {
                row:         SYSV_FRAME,
                frame:       SYSV_FRAME,
                media_fetch: SYSV_FRAME,
+               // Four pushes and `sub rsp, imm32`.
+               asset_load:  Prologue {
+                  pattern: Pattern::new("41 57 41 56 41 54 53 48 81 EC ?? ?? ?? ??"),
+                  len:     14,
+               },
                emoji_check: Prologue {
                   pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
                   len:     14,
@@ -275,6 +317,9 @@ pub mod layout {
    /// Bytes reserved for each other Mana struct (`Switch`, `Button`, `Modal`,
    /// `TextInput`, `TextArea`, `MenuItem`).
    pub const SCRATCH_CAP: usize = 0x800;
+   /// Bytes reserved for a `gpui::Svg`: its `Interactivity`, paths and
+   /// transformation.
+   pub const SVG_CAP: usize = 0x800;
    /// `gpui::AnyElement`, a boxed element and its vtable.
    pub const ANY_ELEMENT: usize = 0x20;
    /// `gpui::Entity<T>`: id, `Weak` and `TypeId`.
@@ -513,6 +558,44 @@ fn none_stores(code: &[u8]) -> Vec<usize> {
       .collect()
 }
 
+/// Offsets of `lea reg, [base + d8]` followed within 16 bytes by
+/// `mov byte [reg], 0xff`, the same `None` store where the build keeps the
+/// slot's address to pass it to a drop call first.
+fn none_stores_through(code: &[u8]) -> Vec<usize> {
+   (0..code.len())
+      .filter_map(|at| {
+         let [rex, 0x8D, modrm, ..] = *code.get(at..at + 5)? else {
+            return None;
+         };
+         if rex & 0xF8 != 0x48 || modrm & 0xC0 != 0x40 {
+            return None;
+         }
+         let (disp, len) = if modrm & 7 == 4 {
+            (code[at + 4], 5)
+         } else {
+            (code[at + 3], 4)
+         };
+         let dst = modrm >> 3 & 7;
+         if dst == 4 || dst == 5 {
+            return None;
+         }
+         let store: &[u8] = if rex & 4 == 0 {
+            &[0xC6, dst, 0xFF]
+         } else {
+            &[0x41, 0xC6, dst, 0xFF]
+         };
+         let after = code.get(at + len..(at + len + 16).min(code.len()))?;
+         after
+            .windows(store.len())
+            .enumerate()
+            .any(|(pos, w)| {
+               w == store && (rex & 4 != 0 || pos == 0 || after[pos - 1] & 0xF0 != 0x40)
+            })
+            .then_some(usize::from(disp))
+      })
+      .collect()
+}
+
 /// The 32-bit immediate after the first `prefix`.
 fn imm_after(code: &[u8], prefix: &[u8]) -> Option<usize> {
    let at = code.windows(prefix.len()).position(|w| w == prefix)? + prefix.len();
@@ -582,8 +665,16 @@ fn calls_in(image: &Image<'_>, start: usize, len: usize) -> Vec<(usize, usize)> 
       return Vec::new();
    };
    // A `call rel32` decoded at the wrong offset lands anywhere in `.text`, so
-   // its target must also open like a function.
+   // its target must also open like a function, and not sit inside one the
+   // unwind table bounds. Linux build 2233's TesterUpdates page holds such a
+   // false call into the middle of a function right before `ActionRow`.
    let entry = |target: usize| {
+      if image
+         .function_bounds(target)
+         .is_some_and(|(start, _)| start != target)
+      {
+         return false;
+      }
       image.is_function(target)
          || image.read(target, 1).is_some_and(|first| {
             matches!(
@@ -951,8 +1042,221 @@ pub fn dave_downgrade_allow(image: &Image<'_>) -> Found<usize> {
    Ok(one("DAVE version check", &image.scan(check))? + 4)
 }
 
-/// Settings page 24's sidebar name, `Phoenix`, and its id,
-/// `DESKTOP_PHOENIX`, both relabeled in place.
+/// The id the DM list gives its pending friend requests badge.
+pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
+/// The id the DM list gives its message requests badge.
+pub const MESSAGE_REQUESTS_BADGE: &[u8] = b"dm-message-requests-badge";
+
+/// What draws Phoenix's pending friend and message request counts.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingCounts {
+   /// The DM list's row badge, `fn(out, id: &str, count: u32, _, _) -> out`,
+   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only.
+   pub badge:           usize,
+   /// `u32 f(&RelationshipStore)`, the incoming friend and game friend
+   /// requests the DM list's Friends row and the inbox's Friends tab show.
+   pub friend_requests: usize,
+}
+
+/// The DM list draws both badges through one builder, each call just after the
+/// `lea` of its id. The friends count comes from the call whose `eax` the
+/// count argument was copied from.
+pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
+   let (friends_call, badge) = badge_call(image, FRIENDS_BADGE)?;
+   let (_, requests_badge) = badge_call(image, MESSAGE_REQUESTS_BADGE)?;
+   if badge != requests_badge {
+      return Err(format!(
+         "the DM badges are drawn by {badge:#x} and {requests_badge:#x}"
+      ));
+   }
+   let friend_requests = count_source(image, friends_call)?;
+   function_code(image, friend_requests, "friend requests count")?;
+   if !counts_incoming(image, friend_requests) {
+      return Err(format!(
+         "friend requests count at {friend_requests:#x} compares no type with 3"
+      ));
+   }
+   Ok(PendingCounts {
+      badge,
+      friend_requests,
+   })
+}
+
+/// `u32 f(&RelationshipStore)`, the number on the Home button.
+///
+/// It adds the DM mentions to the friend requests `friend_requests` counts,
+/// inlined but for its one call, which counts the game friend requests. The
+/// Home button is the other caller of that which counts incoming requests and
+/// returns a plain count.
+pub fn home_count(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let game_requests = game_requests(image, friend_requests)?;
+   let counts = callers(image, game_requests)
+      .into_iter()
+      .filter(|&func| {
+         func != friend_requests && !returns_badge(image, func) && counts_incoming(image, func)
+      })
+      .collect::<Vec<_>>();
+   one("Home count", &counts)
+}
+
+/// `(state, count) f(&Store, _)`, a badge built from the same counts as
+/// [`home_count`].
+///
+/// State 2 is a count, state 1 an unread dot. The badge is the caller of the
+/// game friend requests count which returns a count in `edx`.
+pub fn home_badge(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let game_requests = game_requests(image, friend_requests)?;
+   let badges = callers(image, game_requests)
+      .into_iter()
+      .filter(|&func| func != friend_requests && returns_badge(image, func))
+      .collect::<Vec<_>>();
+   one("Home badge", &badges)
+}
+
+/// The one call `friend_requests` makes, which counts the game friend requests.
+fn game_requests(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let calls = straight_calls(image, friend_requests);
+   let [(_, game_requests)] = calls[..] else {
+      return Err(format!(
+         "friend requests count at {friend_requests:#x} makes {} calls, not 1",
+         calls.len()
+      ));
+   };
+   Ok(game_requests)
+}
+
+/// Whether `func` compares a relationship type with 3, an incoming request, as
+/// it opens.
+fn counts_incoming(image: &Image<'_>, func: usize) -> bool {
+   function_code(image, func, "").is_ok_and(|code| {
+      phoenix_hook::x86::disasm(code, func, 0x80)
+         .iter()
+         .any(|line| line.text.starts_with("cmp byte ptr [") && line.text.ends_with("],3"))
+   })
+}
+
+/// Whether `func` can answer state 2 in `eax` and sets `edx` just before its
+/// epilogue.
+fn returns_badge(image: &Image<'_>, func: usize) -> bool {
+   let Ok(code) = function_code(image, func, "") else {
+      return false;
+   };
+   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
+   let Some(ret) = lines.iter().position(|line| line.text == "ret") else {
+      return false;
+   };
+   let body = &lines[..ret];
+   let sets_count = body
+      .iter()
+      .rev()
+      .find(|line| !line.text.starts_with("pop ") && !line.text.starts_with("add rsp,"))
+      .is_some_and(|line| line.text.starts_with("mov edx,"));
+   sets_count && body.iter().any(|line| line.text == "mov eax,2")
+}
+
+/// The one `lea` of the UI id `id`.
+fn id_lea(image: &Image<'_>, id: &[u8]) -> Found<usize> {
+   // The ids are packed back to back without a NUL, so `literal` misses them.
+   let leas = image
+      .find_bytes(id)
+      .into_iter()
+      .flat_map(|at| lea_refs(image, at))
+      .collect::<Vec<_>>();
+   one(&format!("{} lea", String::from_utf8_lossy(id)), &leas)
+}
+
+/// The site and callee of the `call` that draws the badge with id `id`, the
+/// first after the `lea` of the id.
+fn badge_call(image: &Image<'_>, id: &[u8]) -> Found<(usize, usize)> {
+   let lea = id_lea(image, id)?;
+   calls_in(image, lea, 0x40).first().copied().ok_or_else(|| {
+      format!(
+         "no call follows the {} lea at {lea:#x}",
+         String::from_utf8_lossy(id)
+      )
+   })
+}
+
+/// Follows the count argument of the `call` at `site` back through register
+/// copies to the call that returned it in `eax`.
+fn count_source(image: &Image<'_>, site: usize) -> Found<usize> {
+   let func = image
+      .function_containing(site)
+      .ok_or_else(|| format!("badge call at {site:#x} is in no function"))?;
+   let code = image
+      .read(func, site - func)
+      .ok_or_else(|| format!("DM list at {func:#x} is unmapped"))?;
+   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
+   let mut reg = reg32_name(Abi::of(image).arg(3));
+   for (at, line) in lines.iter().enumerate().rev() {
+      let Some(source) = line.text.strip_prefix(&format!("mov {reg},")) else {
+         continue;
+      };
+      if source != "eax" {
+         if source.contains('[') {
+            return Err(format!(
+               "the friends badge count is loaded from memory at {:#x}",
+               line.addr
+            ));
+         }
+         source.clone_into(&mut reg);
+         continue;
+      }
+      // Win64 pads calls that can unwind with a `nop`.
+      let before = lines[..at].iter().rev().find(|prev| prev.text != "nop");
+      return match before {
+         Some(call) if call.text.starts_with("call ") => {
+            call
+               .target
+               .ok_or_else(|| format!("call at {:#x} has no target", call.addr))
+         },
+         _ => Err(format!("{reg} at {:#x} is no call's result", line.addr)),
+      };
+   }
+   Err(format!("the badge call at {site:#x} has no count source"))
+}
+
+/// The 32-bit name of a 64-bit general register, as the disassembly prints it.
+fn reg32_name(register: Register) -> String {
+   let name = reg_name(register);
+   match name.strip_prefix('r') {
+      Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("{name}d"),
+      Some(rest) => format!("e{rest}"),
+      None => name,
+   }
+}
+
+/// The `jmp [rip]` and 8-byte target [`Image::hook_entry`] writes.
+const ENTRY_JUMP_LEN: usize = 14;
+
+/// The whole instructions opening `func` that an absolute jump covers, for a
+/// hook on a function no fixed prologue describes.
+pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
+   let head = image
+      .read(func, 32)
+      .ok_or_else(|| format!("{func:#x} is unmapped"))?;
+   let mut len = 0;
+   for line in phoenix_hook::x86::disasm(head, func, head.len()) {
+      len += line.len;
+      if len < ENTRY_JUMP_LEN {
+         continue;
+      }
+      if !phoenix_hook::x86::relocatable(&head[..len], func) {
+         return Err(format!("{func:#x} opens with code that cannot move"));
+      }
+      let hex = head[..len]
+         .iter()
+         .map(|byte| format!("{byte:02X}"))
+         .collect::<Vec<_>>()
+         .join(" ");
+      let pattern = Pattern::leak(hex).ok_or("prologue bytes make no pattern")?;
+      return Ok(Prologue { pattern, len });
+   }
+   Err(format!("{func:#x} opens with less than a jump's bytes"))
+}
+
+/// Settings page 24's sidebar name, `Phoenix`, and the `PHOENIX` that ends
+/// its id, both relabeled in place.
 #[derive(Clone, Copy, Debug)]
 pub struct SettingsLabel {
    pub name: usize,
@@ -960,11 +1264,24 @@ pub struct SettingsLabel {
 }
 
 /// Page 24's label, from its one loader: `lea rax, [name]` with length 7,
-/// then a load of the id. COFF builds keep the two as one literal,
-/// `PhoenixDESKTOP_PHOENIX`; ELF builds place them apart.
+/// then a load of the id.
+///
+/// The id is `DESKTOP_PHOENIX` through Linux build 2233 and `PHOENIX` after
+/// it. COFF builds keep name and id as one literal, `PhoenixDESKTOP_PHOENIX`;
+/// ELF builds place them apart.
 pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
    const NAME: &[u8] = b"Phoenix";
-   let ids = image.find_bytes(b"DESKTOP_PHOENIX");
+   const ID: &[u8] = b"PHOENIX";
+   const PREFIX: &[u8] = b"DESKTOP_";
+   let suffixes = image.find_bytes(ID);
+   let ids: Vec<usize> = suffixes
+      .iter()
+      .filter_map(|&suffix| {
+         let start = suffix.checked_sub(PREFIX.len())?;
+         (image.read(start, PREFIX.len())? == PREFIX).then_some(start)
+      })
+      .chain(suffixes.iter().copied())
+      .collect();
    let mut found: Vec<(usize, usize)> = lea_refs_many(image, &ids)
       .into_iter()
       .flat_map(|(id, loads)| loads.into_iter().map(move |lea| (id, lea)))
@@ -975,7 +1292,12 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
             .windows(3)
             .rposition(|w| w == lea_rip(Register::RAX))?;
          let name = rel32_target(image, start + at + 3)?;
-         (image.read(name, NAME.len())? == NAME).then_some((name, id))
+         let suffix = if image.read(id, ID.len())? == ID {
+            id
+         } else {
+            id + PREFIX.len()
+         };
+         (image.read(name, NAME.len())? == NAME).then_some((name, suffix))
       })
       .collect();
    found.sort_unstable();
@@ -987,7 +1309,8 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
 /// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
 /// lowers so page 24 is always shown.
 pub fn settings_visibility(image: &Image<'_>) -> Found<usize> {
-   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja ...`
+   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja
+   // ...`
    let (guard, imm) = match Abi::of(image) {
       Abi::Win64 => {
          (
@@ -1031,6 +1354,7 @@ pub fn settings_section(image: &Image<'_>) -> Found<Section> {
 }
 
 /// Discord's own GPUI and Mana builders the settings page calls.
+#[derive(Debug, Clone)]
 pub struct Gpui {
    /// The `Location` `div_new` takes, a static in `.rdata`.
    pub caller_loc:       usize,
@@ -1336,7 +1660,6 @@ fn debug_offsets(image: &Image<'_>, func: usize, depth: usize) -> HashMap<String
 
 /// `<StyleRefinement as Debug>::fmt`, the one loader of a `StyleRefinement`
 /// literal that prints `text`, `padding` and `gap`.
-#[expect(clippy::too_many_lines, reason = "one line per decoded field")]
 fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
    let leas = string_leas(image, &[b"StyleRefinement"]);
    let mut funcs: Vec<usize> = leas
@@ -1361,6 +1684,15 @@ fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
          found.len()
       ));
    };
+   style_from_fields(fields, bytes)
+}
+
+/// [`StyleOffsets`] from `StyleRefinement`'s fields by name, as either
+/// architecture's `Debug` reader returns them, checked against its size.
+pub(crate) fn style_from_fields(
+   fields: &HashMap<String, usize>,
+   bytes: usize,
+) -> Found<StyleOffsets> {
    let get = |name: &str| -> Found<usize> {
       fields
          .get(name)
@@ -1649,14 +1981,18 @@ pub struct MessageRow {
 }
 
 /// The one function calling every helper that formats `message-content-{id}`.
+/// Builds since November 2026 keep two copies of the template, one per helper.
 pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
    /// `lea rax, [rcx + disp32]`, the id the template formats.
    const MSG_ID_LEA: Pattern = Pattern::new("48 8D 81 ?? ?? ?? ??");
-   let anchor = one(
-      "message-content template",
-      &image.find_bytes(b"\x10message-content-\xc0\x00"),
-   )?;
-   let leas = lea_refs(image, anchor);
+   let anchors = image.find_bytes(b"\x10message-content-\xc0\x00");
+   if anchors.is_empty() {
+      return Err("message-content template not found".to_owned());
+   }
+   let leas = anchors
+      .into_iter()
+      .flat_map(|anchor| lea_refs(image, anchor))
+      .collect::<Vec<_>>();
    if leas.is_empty() {
       return Err("nothing loads the message-content template".to_owned());
    }
@@ -1733,7 +2069,9 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
       .find(|disp| (0x100..=0x800).contains(disp))
       .ok_or("message body id load not found")?;
    // Three `mov r32, imm32` with consecutive `RowColors` field offsets
-   // `+0xc`, `+0x8` and `+0x4`.
+   // `+0xc`, `+0x8` and `+0x4`. Newer builds take `lea r64, [arg1 + RowColors]`
+   // and pick the fields with `push imm8; pop`.
+   let arg1 = number(Abi::of(image).arg(1));
    let row_colors_offset = head
       .windows(15)
       .enumerate()
@@ -1746,12 +2084,973 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
          );
          (a == c + 4 && c == d + 4 && (0x100..=0x400).contains(&d)).then(|| d - 4)
       })
+      .or_else(|| {
+         mem_operands(head, 0x8D)
+            .find(|&(_, base, disp)| base == arg1 && (0x100..=0x400).contains(&disp))
+            .map(|(_, _, disp)| disp)
+      })
       .ok_or("message body row colors not found")?;
    Ok(MessageBody {
       func,
       msg_id_offset,
       row_colors_offset,
    })
+}
+
+/// A hex displacement as `disasm` prints it, like `1F8h`.
+fn hex_disp(text: &str) -> Option<usize> {
+   usize::from_str_radix(text.strip_suffix('h')?, 16).ok()
+}
+
+/// What the island in front of a hooked call hands its detour after the
+/// callee's own arguments, and what frame slots are read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frame {
+   /// A register of the caller: `rbp`, which Win64 frames address their slots
+   /// from, or a callee-saved register holding a pointer the detour reads.
+   Reg(Register),
+   /// The caller's `rsp` at the call. System V frames address their slots
+   /// from it, keeping no frame pointer.
+   Stack,
+}
+
+impl Frame {
+   /// What `abi` builds address frame slots from.
+   #[must_use]
+   pub const fn of(abi: Abi) -> Self {
+      match abi {
+         Abi::Win64 => Self::Reg(Register::RBP),
+         Abi::SysV => Self::Stack,
+      }
+   }
+
+   /// The island code putting this into `arg`: `mov arg, reg`, or `lea arg,
+   /// [rsp+8]`, since the call into the island pushed a return address.
+   #[must_use]
+   pub fn island(self, arg: Register) -> Vec<u8> {
+      let (to, to_ext) = reg(arg);
+      match self {
+         Self::Reg(from) => {
+            let (from, from_ext) = reg(from);
+            vec![0x48 | from_ext << 2 | to_ext, 0x89, 0xC0 | from << 3 | to]
+         },
+         Self::Stack => vec![0x48 | to_ext << 2, 0x8D, 0x44 | to << 3, 0x24, 0x08],
+      }
+   }
+
+   /// The register as `disasm` prints it.
+   fn base(self) -> String {
+      match self {
+         Self::Reg(register) => reg_name(register),
+         Self::Stack => "rsp".to_owned(),
+      }
+   }
+}
+
+impl std::fmt::Display for Frame {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.write_str(&self.base())
+   }
+}
+
+/// A register as `disasm` prints it, like `r8`.
+fn reg_name(register: Register) -> String {
+   format!("{register:?}").to_lowercase()
+}
+
+/// `[base]` or `[base+disp]` as `disasm` prints a frame operand, like
+/// `[rbp+0DB0h]` or `[rsp+8]`.
+fn slot_of(operand: &str, base: &str) -> Option<usize> {
+   let rest = operand
+      .strip_prefix('[')?
+      .strip_suffix(']')?
+      .strip_prefix(base)?;
+   if rest.is_empty() {
+      return Some(0);
+   }
+   let disp = rest.strip_prefix('+')?;
+   disp.strip_suffix('h').map_or_else(
+      || disp.parse().ok(),
+      |hex| usize::from_str_radix(hex, 16).ok(),
+   )
+}
+
+/// The callee of the call `line` decodes: `call rel32`, or through a pointer
+/// slot as ELF builds call.
+fn callee(image: &Image<'_>, line: &phoenix_hook::x86::Line) -> Option<usize> {
+   if !line.text.starts_with("call ") {
+      return None;
+   }
+   call_target(image, image.read(line.addr, line.len)?, line.addr).map(|(_, callee)| callee)
+}
+
+/// Whether [`Image::hook_call`] can point the call `line` decodes elsewhere.
+fn hookable(image: &Image<'_>, line: &phoenix_hook::x86::Line) -> bool {
+   match image.read(line.addr, 2) {
+      Some([0xE8, _]) => line.len == 5,
+      Some([0xFF, 0x15]) => line.len == 6,
+      _ => false,
+   }
+}
+
+/// The operand an `AnyElement` is copied from for the call at `at`, passed by
+/// reference in `arg`: `movups xmm0, [source]` (or `movaps`), then `movaps
+/// [arg], xmm0` and `movaps [arg+10h], xmm1`.
+fn element_source<'a>(
+   lines: &'a [phoenix_hook::x86::Line],
+   at: usize,
+   arg: &str,
+) -> Option<&'a str> {
+   let args = &lines[at.saturating_sub(12)..at];
+   let copies = args
+      .iter()
+      .any(|line| line.text == format!("movaps [{arg}],xmm0"))
+      && args
+         .iter()
+         .any(|line| line.text == format!("movaps [{arg}+10h],xmm1"));
+   copies
+      .then(|| {
+         args.iter().rev().find_map(|line| {
+            line
+               .text
+               .strip_prefix("movups xmm0,")
+               .or_else(|| line.text.strip_prefix("movaps xmm0,"))
+         })
+      })
+      .flatten()
+}
+
+/// The call before `at` that last wrote `slot`, as its hidden return pointer
+/// (`lea sret, [slot]`, or `mov sret, rsp` for `[rsp]`). A store to `slot`
+/// on the way means no call did.
+fn returned_into(
+   lines: &[phoenix_hook::x86::Line],
+   at: usize,
+   slot: &str,
+   sret: &str,
+) -> Option<usize> {
+   let lea = format!("lea {sret},");
+   let from_rsp = format!("mov {sret},rsp");
+   for call in (0..at).rev() {
+      if written(&lines[call]) == Some(slot) {
+         return None;
+      }
+      if !lines[call].text.starts_with("call ") {
+         continue;
+      }
+      let out = lines[call.saturating_sub(8)..call]
+         .iter()
+         .rev()
+         .find_map(|line| {
+            if let Some(operand) = line.text.strip_prefix(&lea) {
+               return Some(Some(operand));
+            }
+            if line.text == from_rsp {
+               return Some(Some("[rsp]"));
+            }
+            (written(line) == Some(sret)).then_some(None)
+         });
+      if out.flatten() == Some(slot) {
+         return Some(call);
+      }
+   }
+   None
+}
+
+/// The member list's row renderer, and where its name joins the row.
+pub struct MemberRow {
+   pub func: usize,
+   pub name: MemberName,
+}
+
+/// The calls adding a member's name to its row, one per branch.
+///
+/// They are `Div::child` by value, `(sret, div, &name) -> Div`. The row's
+/// closure keeps its environment pointer in a frame slot on Win64 and in a
+/// callee-saved register on System V, and the environment a pointer to the
+/// member's user id.
+#[derive(Clone, Debug)]
+pub struct MemberName {
+   pub sites:        Vec<usize>,
+   /// What the islands hand the detour.
+   pub frame:        Frame,
+   /// `[frame+closure_slot]` holds the environment pointer at the calls;
+   /// without one, `frame` is the environment pointer itself.
+   pub closure_slot: Option<usize>,
+   /// `[environment+env]` holds the pointer to the user id.
+   pub env:          usize,
+}
+
+/// The member row hands its name to a closure building the name's row: the
+/// closure's environment holds the name and, at `+env`, a pointer to the id
+/// slot (`lea rax, [slot]; mov [env_arg+env], rax`). The closure's function
+/// saves the environment pointer (`mov [rbp+closure_slot], r8` on Win64, `mov
+/// rbx, rdx` on System V) and adds the name with calls taking a freshly copied
+/// `AnyElement`: the one each branch's name row was returned into.
+fn member_name(
+   image: &Image<'_>,
+   lines: &[phoenix_hook::x86::Line],
+   slot: &str,
+) -> Option<MemberName> {
+   let abi = Abi::of(image);
+   let env_arg = reg_name(abi.arg(2));
+   let env_store = format!("mov [{env_arg}+");
+   let (store, env) = lines.iter().enumerate().find_map(|(at, line)| {
+      let field = line.text.strip_prefix(&env_store)?.strip_suffix("],rax")?;
+      (lines.get(at.checked_sub(1)?)?.text == format!("lea rax,{slot}"))
+         .then_some((at, hex_disp(field)?))
+   })?;
+   let closure = lines[store..]
+      .iter()
+      .take(40)
+      .find_map(|line| callee(image, line))?;
+   let code = function_code(image, closure, "member name row").ok()?;
+   let body = phoenix_hook::x86::disasm(code, closure, usize::MAX);
+   let base = Frame::of(abi).base();
+   let saved_reg = |line: &phoenix_hook::x86::Line| {
+      let to = line
+         .text
+         .strip_prefix("mov ")?
+         .strip_suffix(&format!(",{env_arg}"))?;
+      [
+         Register::RBX,
+         Register::R12,
+         Register::R13,
+         Register::R14,
+         Register::R15,
+      ]
+      .into_iter()
+      .find(|&register| reg_name(register) == to)
+   };
+   let (saved, frame, closure_slot) = body.iter().enumerate().take(16).find_map(|(at, line)| {
+      if let Some(register) = saved_reg(line) {
+         return Some((at, Frame::Reg(register), None));
+      }
+      let operand = line
+         .text
+         .strip_prefix("mov ")?
+         .strip_suffix(&format!(",{env_arg}"))?;
+      Some((at, Frame::of(abi), Some(slot_of(operand, &base)?)))
+   })?;
+   let sret = reg_name(abi.arg(0));
+   let calls = body
+      .iter()
+      .enumerate()
+      .filter_map(|(at, line)| {
+         let target = callee(image, line)?;
+         Some((at, target, element_source(&body, at, &env_arg)?))
+      })
+      .collect::<Vec<_>>();
+   let child = calls.first()?.1;
+   // Styled names are first wrapped with the name taken from the
+   // environment; the row then gets the element the name row was returned
+   // into, in every branch. Only those calls add to the row itself. ELF builds
+   // keep a copy of `Div::child` per caller crate.
+   let sites = calls
+      .iter()
+      .filter(|&&(at, target, source)| {
+         (target == child || same_code(image, target, child))
+            && hookable(image, &body[at])
+            && returned_into(&body, at, source, &sret).is_some()
+      })
+      .map(|&(at, ..)| at)
+      .collect::<Vec<_>>();
+   // A register handed over must still hold the environment at every site.
+   if let Frame::Reg(register) = frame
+      && closure_slot.is_none()
+   {
+      let name = reg_name(register);
+      let last = *sites.last()?;
+      let clobbered = body[saved + 1..last]
+         .iter()
+         .any(|line| written(line) == Some(name.as_str()) || line.text == format!("pop {name}"));
+      if clobbered {
+         return None;
+      }
+   }
+   (!sites.is_empty()).then(|| {
+      MemberName {
+         sites: sites.into_iter().map(|at| body[at].addr).collect(),
+         frame,
+         closure_slot,
+         env,
+      }
+   })
+}
+
+/// The function formatting `member-{}-{}`, a member row's element id from the
+/// member's user id, and the calls in it adding the member's name to its row.
+pub fn member_row(image: &Image<'_>) -> Found<MemberRow> {
+   let anchors = image.find_bytes(b"member-{}-{}");
+   let mut funcs = anchors
+      .iter()
+      .flat_map(|&anchor| lea_refs(image, anchor))
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+      .collect::<Vec<_>>();
+   funcs.sort_unstable();
+   funcs.dedup();
+   let func = one("member row", &funcs)?;
+   if !prologues(image).row.at(image, func) {
+      return Err("member row prologue changed".to_owned());
+   }
+   let lines =
+      phoenix_hook::x86::disasm(function_code(image, func, "member row")?, func, usize::MAX);
+   // The id is formatted from a frame slot, the fourth argument (`mov r9,
+   // [rbp+slot]` on Win64) of the call taking the template.
+   let abi = Abi::of(image);
+   let id_load = format!("mov {},", reg_name(abi.arg(3)));
+   let base = Frame::of(abi).base();
+   let template = lines
+      .iter()
+      .position(|line| line.target.is_some_and(|target| anchors.contains(&target)))
+      .ok_or("member row template load not found")?;
+   let slot = lines[template.saturating_sub(12)..template]
+      .iter()
+      .rev()
+      .find_map(|line| line.text.strip_prefix(&id_load))
+      .filter(|slot| slot_of(slot, &base).is_some())
+      .ok_or("member row id slot not found")?;
+   Ok(MemberRow {
+      func,
+      name: member_name(image, &lines, slot).ok_or("member name row not decoded")?,
+   })
+}
+
+/// The DM list's row renderer, and where its recipient's name joins the row.
+///
+/// The row adds the box built around the name (`dm-name-bounds`) to a flex row
+/// with `Div::child` by value, `(sret, div, &name) -> Div`. One-to-one DMs keep
+/// their recipient as an `Option<UserId>` copied into two frame slots, the
+/// one the row's presence dot (`dm-status`) is keyed by; group DMs have none.
+#[derive(Clone, Debug)]
+pub struct DmRow {
+   pub func:  usize,
+   /// The call adding the name box.
+   pub site:  usize,
+   /// What the island hands the detour, which the slots are read from.
+   pub frame: Frame,
+   /// `[frame+some]` is the recipient's `Option` tag, zero for none.
+   pub some:  usize,
+   /// `[frame+user]` is the recipient's user id when `some` is set.
+   pub user:  usize,
+}
+
+/// The single function loading `text`, as it is laid out in the string pool.
+fn loader_of(image: &Image<'_>, what: &str, text: &[u8]) -> Found<usize> {
+   let mut funcs = image
+      .find_bytes(text)
+      .iter()
+      .flat_map(|&anchor| lea_refs(image, anchor))
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+      .collect::<Vec<_>>();
+   funcs.sort_unstable();
+   funcs.dedup();
+   one(what, &funcs)
+}
+
+/// The `Option<UserId>` slots read after `anchor`'s `lea`: the id is the first
+/// `mov rax, [frame+user]` after it, and the row copies the option there from
+/// its props, `mov rax, [r]; mov [frame+some], rax; mov rax, [r+8]; mov
+/// [frame+user], rax`, then tests `cmp qword ptr [frame+some], 0`.
+fn option_user_slots(
+   lines: &[phoenix_hook::x86::Line],
+   anchor: usize,
+   base: &str,
+) -> Option<(usize, usize)> {
+   let user = lines
+      .get(anchor..)?
+      .iter()
+      .take(8)
+      .find_map(|line| slot_of(line.text.strip_prefix("mov rax,")?, base))?;
+   let stored = |line: &phoenix_hook::x86::Line| {
+      slot_of(line.text.strip_prefix("mov ")?.strip_suffix(",rax")?, base)
+   };
+   let at = lines.iter().position(|line| stored(line) == Some(user))?;
+   let [load_some, store_some, load_user] = lines.get(at.checked_sub(3)?..at)? else {
+      return None;
+   };
+   let props = load_user
+      .text
+      .strip_prefix("mov rax,[")?
+      .strip_suffix("+8]")?;
+   let some = stored(store_some)?;
+   let tested = lines.iter().any(|line| {
+      line
+         .text
+         .strip_prefix("cmp qword ptr ")
+         .and_then(|rest| rest.strip_suffix(",0"))
+         .and_then(|operand| slot_of(operand, base))
+         == Some(some)
+   });
+   (load_some.text == format!("mov rax,[{props}]") && tested).then_some((some, user))
+}
+
+/// The DM row: the one caller of the function building the box around the
+/// recipient's name, and the call adding that box's element to the row.
+///
+/// ELF builds inline the box into the row, whose element is then the one the
+/// box's last call returns into.
+pub fn dm_row(image: &Image<'_>) -> Found<DmRow> {
+   let abi = Abi::of(image);
+   let frame = Frame::of(abi);
+   let base = frame.base();
+   let element_arg = reg_name(abi.arg(2));
+   let name_box = loader_of(image, "DM name box", b"dm-name-bounds")?;
+   let status = image.find_bytes(b"dm-status");
+   let loads_status = |lines: &[phoenix_hook::x86::Line]| {
+      lines
+         .iter()
+         .position(|line| line.target.is_some_and(|target| status.contains(&target)))
+   };
+   let box_lines = phoenix_hook::x86::disasm(
+      function_code(image, name_box, "DM name box")?,
+      name_box,
+      usize::MAX,
+   );
+   let (func, lines, call) = if loads_status(&box_lines).is_some() {
+      let names = image.find_bytes(b"dm-name-bounds");
+      let built = box_lines
+         .iter()
+         .position(|line| line.target.is_some_and(|target| names.contains(&target)))
+         .ok_or("DM name box load not found")?;
+      let sret = reg_name(abi.arg(0));
+      let at = (built + 1..box_lines.len().min(built + 400))
+         .find(|&at| {
+            callee(image, &box_lines[at]).is_some()
+               && element_source(&box_lines, at, &element_arg).is_some_and(|source| {
+                  returned_into(&box_lines, at, source, &sret).is_some_and(|by| by > built)
+               })
+         })
+         .ok_or("DM name child call not found")?;
+      let child = callee(image, &box_lines[at]).ok_or("DM name child call is indirect")?;
+      let adds_name = box_lines[built..at].iter().any(|line| {
+         callee(image, line).is_some_and(|other| other == child || same_code(image, other, child))
+      });
+      if !adds_name {
+         return Err("DM name child is not Div::child".to_owned());
+      }
+      (name_box, box_lines, at)
+   } else {
+      let funcs = callers(image, name_box).into_iter().collect::<Vec<_>>();
+      let func = one("DM row", &funcs)?;
+      let lines =
+         phoenix_hook::x86::disasm(function_code(image, func, "DM row")?, func, usize::MAX);
+      let built = lines
+         .iter()
+         .position(|line| callee(image, line) == Some(name_box))
+         .ok_or("DM name box call not found")?;
+      let box_arg = format!("lea {},", reg_name(abi.arg(0)));
+      let out = lines[built.saturating_sub(8)..built]
+         .iter()
+         .rev()
+         .find_map(|line| line.text.strip_prefix(&box_arg))
+         .filter(|out| slot_of(out, &base).is_some())
+         .ok_or("DM name box result not found")?;
+      let at = (built + 1..lines.len().min(built + 80))
+         .filter(|&at| lines[at].text.starts_with("call "))
+         .find(|&at| element_source(&lines, at, &element_arg) == Some(out))
+         .ok_or("DM name child call not found")?;
+      let child = callee(image, &lines[at]).ok_or("DM name child call is indirect")?;
+      // The name box adds the name itself with the same `Div::child`.
+      if !box_lines
+         .iter()
+         .any(|line| callee(image, line) == Some(child))
+      {
+         return Err("DM name child is not Div::child".to_owned());
+      }
+      (func, lines, at)
+   };
+   if !hookable(image, &lines[call]) {
+      return Err("DM name child call cannot be hooked".to_owned());
+   }
+   let anchor = loads_status(&lines).ok_or("DM status id not found")?;
+   let (some, user) =
+      option_user_slots(&lines, anchor, &base).ok_or("DM recipient slots not decoded")?;
+   Ok(DmRow {
+      func,
+      site: lines[call].addr,
+      frame,
+      some,
+      user,
+   })
+}
+
+/// The message header's node API, and where each header row adds the author's
+/// name.
+///
+/// Headers are not GPUI `Div`s but Discord's own `Rc<Node>` handles: every
+/// builder call takes the handle and returns it, cloned first when shared.
+#[derive(Clone, Debug)]
+pub struct MessageHeader {
+   /// The calls adding the name, one per display mode.
+   pub sites:      Vec<HeaderSite>,
+   /// What the islands hand the detours, which the slots are read from.
+   pub frame:      Frame,
+   /// `child_node(node, child) -> node`, adding a node as a child.
+   pub child_node: usize,
+   pub svg:        NodeSvg,
+}
+
+/// Discord's node SVG leaf, drawn from an asset path.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeSvg {
+   /// `svg_new(out, path ptr, path len, size: f32)`.
+   pub new:   usize,
+   /// `push_svg(node, &leaf) -> node`, moving the leaf into a boxed child.
+   pub push:  usize,
+   /// The leaf's color tag (`1` when set); the packed color follows it.
+   pub color: usize,
+   /// The leaf's size, which `push_svg` copies.
+   pub size:  usize,
+}
+
+/// A `call child_node` adding the name wrapper to a header row.
+#[derive(Clone, Copy, Debug)]
+pub struct HeaderSite {
+   pub site: usize,
+   /// `[frame+slot]` holds the message id at the call.
+   pub slot: usize,
+}
+
+/// The app tag's element id template, loaded by the two header row builders.
+const HEADER_APP_TAG: &[u8] = b"\x0fheader-app-tag-\xc0\x00";
+/// The most header row builders a build has had.
+pub const MAX_HEADER_BUILDERS: usize = 3;
+/// A bundled icon drawn as a node SVG leaf.
+const NODE_SVG: &[u8] = b"features_ui/partner.svg";
+
+/// `child_node`'s head: the child handle wrapped as a node child, tag 0.
+const fn child_node_head(abi: Abi) -> [u8; 16] {
+   match abi {
+      // `sub rsp,48h; lea rax,[rsp+28h]; and dword ptr [rax],0; mov
+      // [rax+8],rdx`
+      Abi::Win64 => {
+         [
+            0x48, 0x83, 0xEC, 0x48, 0x48, 0x8D, 0x44, 0x24, 0x28, 0x83, 0x20, 0x00, 0x48, 0x89,
+            0x50, 0x08,
+         ]
+      },
+      // `sub rsp,28h; lea rax,[rsp+8]; and dword ptr [rax],0; mov [rax+8],rsi`
+      Abi::SysV => {
+         [
+            0x48, 0x83, 0xEC, 0x28, 0x48, 0x8D, 0x44, 0x24, 0x08, 0x83, 0x20, 0x00, 0x48, 0x89,
+            0x70, 0x08,
+         ]
+      },
+   }
+}
+
+/// The register or memory operand an instruction writes, as `disasm` prints
+/// it: `mov rsi,rax` writes `rsi`.
+fn written(line: &phoenix_hook::x86::Line) -> Option<&str> {
+   let (_, operands) = line.text.split_once(' ')?;
+   Some(operands.split_once(',')?.0)
+}
+
+/// Locates [`MessageHeader`]. `body` is [`message_body`]'s function, whose
+/// auto-moderation avatar fallback draws a node SVG leaf.
+///
+/// Every row builder adds the name with `mov child,from; call child_node`,
+/// where `from`, a register or a frame slot, holds what one function called
+/// only by the builders returned. The message id slot is the format
+/// argument of the app tag's element id.
+pub fn message_header(image: &Image<'_>, body: usize) -> Found<MessageHeader> {
+   let anchor = one("header-app-tag template", &image.find_bytes(HEADER_APP_TAG))?;
+   let mut builders = lea_refs(image, anchor)
+      .into_iter()
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+      .collect::<Vec<_>>();
+   builders.sort_unstable();
+   builders.dedup();
+   // Two on Win64 and on Linux 2233; older Linux builds kept a second copy of
+   // one, taking another argument.
+   if !(2..=MAX_HEADER_BUILDERS).contains(&builders.len()) {
+      return Err(format!(
+         "the app tag template is loaded by {} functions",
+         builders.len()
+      ));
+   }
+   let decoded = builders
+      .iter()
+      .map(|&func| header_builder(image, func, anchor))
+      .collect::<Found<Vec<_>>>()?;
+   let all = builders.iter().copied().collect::<HashSet<_>>();
+   let mut sites = Vec::new();
+   let mut child_node = None;
+   for (slot, adds) in &decoded {
+      let names = adds
+         .iter()
+         .filter(|&&(_, _, producer)| {
+            let by = callers(image, producer);
+            !by.is_empty() && by.is_subset(&all)
+         })
+         .copied()
+         .collect::<Vec<_>>();
+      let (site, callee, _) = one("header name add", &names)?;
+      if child_node.is_some_and(|known| known != callee && !same_code(image, known, callee)) {
+         return Err("the header builders add children differently".to_owned());
+      }
+      child_node = Some(callee);
+      sites.push(HeaderSite { site, slot: *slot });
+   }
+   let child_node = child_node.ok_or("header child_node not found")?;
+   Ok(MessageHeader {
+      sites,
+      frame: Frame::of(Abi::of(image)),
+      child_node,
+      svg: node_svg(image, body)?,
+   })
+}
+
+/// `(site, callee, producer)`: a `call child_node` adding what `producer`
+/// returned.
+type ChildAdd = (usize, usize, usize);
+
+/// A header builder's message id slot, and every call adding a call's result
+/// with `child_node`.
+fn header_builder(image: &Image<'_>, func: usize, anchor: usize) -> Found<(usize, Vec<ChildAdd>)> {
+   let abi = Abi::of(image);
+   let base = Frame::of(abi).base();
+   let head = child_node_head(abi);
+   let is_child_node = |func: usize| image.read(func, 16) == Some(&head[..]);
+   let child_arg = format!("mov {},", reg_name(abi.arg(1)));
+   let lines = phoenix_hook::x86::disasm(
+      function_code(image, func, "header builder")?,
+      func,
+      usize::MAX,
+   );
+   let template = lines
+      .iter()
+      .position(|line| line.target == Some(anchor))
+      .ok_or("header app tag load not decoded")?;
+   let slot = lines[template.saturating_sub(8)..template]
+      .iter()
+      .rev()
+      .find_map(|line| slot_of(line.text.strip_prefix("lea rax,")?, &base))
+      .ok_or("header message id slot not found")?;
+   let mut adds = Vec::new();
+   for at in 1..lines.len() {
+      let line = &lines[at];
+      let Some(callee) = callee(image, line) else {
+         continue;
+      };
+      let Some(from) = lines[at - 1].text.strip_prefix(&child_arg) else {
+         continue;
+      };
+      if !hookable(image, line) || !is_child_node(callee) {
+         continue;
+      }
+      let Some(set) = (0..at - 1)
+         .rev()
+         .find(|&j| written(&lines[j]) == Some(from))
+      else {
+         continue;
+      };
+      if lines[set].text != format!("mov {from},rax") {
+         continue;
+      }
+      // Calls with stacked arguments pop them before the result is kept.
+      let producer = lines[..set]
+         .iter()
+         .rev()
+         .find(|line| line.text != "nop" && !line.text.starts_with("add rsp,"))
+         .and_then(|line| self::callee(image, line));
+      if let Some(producer) = producer {
+         adds.push((line.addr, callee, producer));
+      }
+   }
+   Ok((slot, adds))
+}
+
+fn node_svg(image: &Image<'_>, body: usize) -> Found<NodeSvg> {
+   let abi = Abi::of(image);
+   let base = Frame::of(abi).base();
+   let mut svg_news = image
+      .find_bytes(NODE_SVG)
+      .into_iter()
+      .flat_map(|path| lea_refs(image, path))
+      .filter_map(|lea| {
+         let code = image.read(lea, 0x40)?;
+         phoenix_hook::x86::disasm(code, lea, 12)
+            .iter()
+            .find(|line| line.text.starts_with("call "))
+            .and_then(|line| callee(image, line))
+      })
+      .collect::<Vec<_>>();
+   // The leaf keeps the size, the first float argument (`xmm3` on Win64,
+   // `xmm0` on System V), and the path at `out+10h`; the bundled icon is drawn
+   // as a GPUI `Svg` elsewhere too.
+   let out_path = format!("add {},10h", reg_name(abi.arg(0)));
+   let keeps_size = |line: &phoenix_hook::x86::Line| {
+      match abi {
+         Abi::Win64 => line.text == "movaps xmm6,xmm3",
+         Abi::SysV => line.text.starts_with("movss [rsp+") && line.text.ends_with(",xmm0"),
+      }
+   };
+   svg_news.retain(|&func| {
+      image.read(func, 0x30).is_some_and(|head| {
+         let head = phoenix_hook::x86::disasm(head, func, 8);
+         head.iter().any(keeps_size) && head.iter().any(|line| line.text == out_path)
+      })
+   });
+   svg_news.sort_unstable();
+   svg_news.dedup();
+   let svg_new = one("node svg_new", &svg_news)?;
+
+   // In the body: `lea out,[frame+leaf]; ...; call svg_new`, then
+   // `mov dword ptr [frame+color],1` and the call pushing the leaf.
+   let leaf_arg = format!("lea {},", reg_name(abi.arg(0)));
+   let lines = phoenix_hook::x86::disasm(
+      function_code(image, body, "message body")?,
+      body,
+      usize::MAX,
+   );
+   let (push_svg, svg_color) = lines
+      .iter()
+      .enumerate()
+      .filter(|(_, line)| callee(image, line) == Some(svg_new))
+      .find_map(|(at, _)| {
+         let leaf = lines[at.saturating_sub(8)..at]
+            .iter()
+            .rev()
+            .find_map(|line| slot_of(line.text.strip_prefix(&leaf_arg)?, &base))?;
+         let after = &lines[at + 1..(at + 24).min(lines.len())];
+         let push = after.iter().find(|line| line.text.starts_with("call "))?;
+         let tag = after
+            .iter()
+            .take_while(|line| line.addr < push.addr)
+            .find_map(|line| {
+               slot_of(
+                  line
+                     .text
+                     .strip_prefix("mov dword ptr ")?
+                     .strip_suffix(",1")?,
+                  &base,
+               )
+            })?;
+         Some((callee(image, push)?, tag.checked_sub(leaf)?))
+      })
+      .ok_or("node SVG leaf push not found in the message body")?;
+   if !(4..0x30).contains(&svg_color) {
+      return Err(format!("node SVG color at {svg_color:#x}"));
+   }
+   // `push_svg` boxes the leaf first: `push size; pop size_arg` before the
+   // allocation, which takes the alignment first.
+   let size_pop = format!("pop {}", reg_name(abi.arg(1)));
+   let convert = calls_in(image, push_svg, 0x40)
+      .first()
+      .ok_or("push_svg calls nothing")?
+      .1;
+   let code = image
+      .read(convert, 0x80)
+      .ok_or("the leaf box is unmapped")?;
+   let head = phoenix_hook::x86::disasm(code, convert, 32);
+   let leaf_size = head
+      .windows(2)
+      .find_map(|pair| {
+         (pair[1].text == size_pop)
+            .then(|| hex_disp(pair[0].text.strip_prefix("push ")?))
+            .flatten()
+      })
+      .filter(|&size| svg_color + 8 <= size && size <= 0x100)
+      .ok_or("node SVG leaf size not found")?;
+   Ok(NodeSvg {
+      new:   svg_new,
+      push:  push_svg,
+      color: svg_color,
+      size:  leaf_size,
+   })
+}
+
+/// A bundled icon every build so far draws with `svg().path(..)`, which the
+/// SVG builders and the asset loader are found from.
+const BUNDLED_SVG: &[u8] = b"features_ui/platform-spotify.svg";
+
+/// GPUI's `Svg` element builders.
+#[derive(Clone, Copy, Debug)]
+pub struct SvgBuilders {
+   /// `svg()`: `(sret, &caller_location) -> Svg`.
+   pub new:       usize,
+   /// `Svg::path`: `(sret, svg, &'static str ptr, len) -> Svg`.
+   pub path:      usize,
+   /// `Svg::into_any_element`: `(sret, svg) -> AnyElement`.
+   pub into_any:  usize,
+   /// `Svg`'s size, which `into_any` moves.
+   pub size:      usize,
+   /// Where `Svg` keeps its boxed `StyleRefinement`.
+   pub style_box: usize,
+}
+
+/// The function drawing [`BUNDLED_SVG`]: `svg()` is the call before the path
+/// is loaded, `path` the call after it, and `into_any` the call writing the
+/// function's `sret`. A style setter on the way reads the style box.
+pub fn svg_builders(image: &Image<'_>) -> Found<SvgBuilders> {
+   let abi = Abi::of(image);
+   let anchors = image.find_bytes(BUNDLED_SVG);
+   let (func, lea) = anchors
+      .iter()
+      .flat_map(|&anchor| lea_refs(image, anchor))
+      .find_map(|lea| Some((image.function_bounds(lea)?.0, lea)))
+      .ok_or("no code draws the bundled SVG")?;
+   let lines = phoenix_hook::x86::disasm(function_code(image, func, "SVG icon")?, func, usize::MAX);
+   let at = lines
+      .iter()
+      .position(|line| line.addr == lea)
+      .ok_or("SVG path load not decoded")?;
+   let call_target = |line: &phoenix_hook::x86::Line| callee(image, line);
+   let new = lines[..at]
+      .iter()
+      .rev()
+      .find_map(call_target)
+      .ok_or("svg() call not found")?;
+   let after = lines[at..]
+      .iter()
+      .filter_map(call_target)
+      .collect::<Vec<_>>();
+   let path = *after.first().ok_or("Svg::path call not found")?;
+   // `mov rax, [svg+box]` at the head of a style setter taking the `Svg`.
+   let box_load = format!("mov rax,[{}+", reg_name(abi.arg(1)));
+   let style_box = after
+      .iter()
+      .take(4)
+      .find_map(|&callee| {
+         let head = image.read(callee, 0x20)?;
+         phoenix_hook::x86::disasm(head, callee, 6)
+            .iter()
+            .find_map(|line| hex_disp(line.text.strip_prefix(&box_load)?.strip_suffix(']')?))
+      })
+      .filter(|&offset| (0x100..0x800).contains(&offset))
+      .ok_or("Svg style box not found")?;
+   // The last call, whose result the function returns.
+   let ret = lines
+      .iter()
+      .position(|line| line.text == "ret")
+      .ok_or("SVG icon return not found")?;
+   let into_any = lines[at..ret]
+      .iter()
+      .rev()
+      .find_map(call_target)
+      .ok_or("Svg::into_any call not found")?;
+   // It moves the `Svg` with a copy of its size, the third argument.
+   let size_load = format!("mov {},", reg_name(abi.arg(2).full_register32()));
+   let size = image
+      .read(into_any, 0x30)
+      .map(|head| phoenix_hook::x86::disasm(head, into_any, 8))
+      .and_then(|head| {
+         head
+            .iter()
+            .find_map(|line| hex_disp(line.text.strip_prefix(&size_load)?))
+      })
+      .filter(|&size| (style_box..0x1000).contains(&size))
+      .ok_or("Svg size not found")?;
+   Ok(SvgBuilders {
+      new,
+      path,
+      into_any,
+      size,
+      style_box,
+   })
+}
+
+/// Discord's asset loader, `(sret, path ptr, path len) -> Option<Vec<u8>>`.
+///
+/// It ends at the bundle holding [`BUNDLED_SVG`]. The bundle sorts records
+/// `{path ptr, path len, index}`; its descriptor points at their start, and the
+/// loader loads the descriptor. ELF images also hold the descriptor's address
+/// as relocation addends, which no code loads.
+pub fn asset_load(image: &Image<'_>) -> Found<usize> {
+   let record = |slot: usize| {
+      let ptr = image.read_usize(slot)?;
+      let len = image.read_usize(slot + 8)?;
+      let index = image.read_usize(slot + 16)?;
+      let path = image
+         .read(ptr, len)
+         .filter(|_| (3..=200).contains(&len) && index < 100_000)?;
+      path
+         .iter()
+         .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(byte))
+         .then_some(())
+   };
+   let mut slots = image
+      .find_bytes(BUNDLED_SVG)
+      .into_iter()
+      .flat_map(|string| image.pointers_to(string))
+      .filter(|&slot| {
+         image.read_usize(slot + 8) == Some(BUNDLED_SVG.len()) && record(slot).is_some()
+      })
+      .collect::<Vec<_>>();
+   slots.dedup();
+   let mut start = one("bundled SVG record", &slots)?;
+   while let Some(previous) = start.checked_sub(24)
+      && record(previous).is_some()
+   {
+      start = previous;
+   }
+   let descriptors = image
+      .pointers_to(start)
+      .into_iter()
+      .filter(|&descriptor| !lea_refs(image, descriptor).is_empty())
+      .collect::<Vec<_>>();
+   let descriptor = one("asset bundle", &descriptors)?;
+   let mut loaders = lea_refs(image, descriptor)
+      .into_iter()
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+      .filter(|&func| prologues(image).asset_load.at(image, func))
+      .collect::<Vec<_>>();
+   loaders.sort_unstable();
+   loaders.dedup();
+   one("asset loader", &loaders)
+}
+
+/// The `jne rel32` that leaves the composer's Nitro gift button out.
+///
+/// The composer fills an `Option` for the button: its block, after the
+/// `gift-button.wrap` id, stores `Some` (`mov qword [rax - 8], 1`) and jumps
+/// past the `None` store, `and qword [rsp + disp32], 0`. The first `jne` to
+/// just before that store skips the button. Rewriting its two opcode bytes as
+/// `nop; jmp` keeps the displacement, and the locator checks both bytes share
+/// a word so the rewrite is one atomic store.
+pub fn composer_gift(image: &Image<'_>) -> Found<usize> {
+   const SOME_THEN_JMP: [u8; 9] = [0x48, 0xC7, 0x40, 0xF8, 0x01, 0x00, 0x00, 0x00, 0xE9];
+   const NONE_STORE: [u8; 4] = [0x48, 0x83, 0xA4, 0x24];
+
+   let ids = literal(image, b"gift-button.wrap")
+      .into_iter()
+      .flat_map(|text| lea_refs(image, text))
+      .collect::<Vec<_>>();
+   let id = one("gift button id", &ids)?;
+   let (start, _) = image
+      .function_bounds(id)
+      .ok_or("gift button has no function bounds")?;
+   let block = image.read(id, 0x200).ok_or("gift button is unmapped")?;
+   let some = block
+      .windows(SOME_THEN_JMP.len())
+      .position(|window| window == SOME_THEN_JMP)
+      .ok_or("gift button stores no Some")?;
+   let after = rel32_target(image, id + some + SOME_THEN_JMP.len())
+      .ok_or("gift button jump does not decode")?;
+   let none = after.checked_sub(9).ok_or("gift button jumps to 0")?;
+   match image.read(none, 9) {
+      Some(store) if store.starts_with(&NONE_STORE) && store[8] == 0 => {},
+      _ => {
+         return Err(format!(
+            "gift button jumps to {after:#x}, after no None store"
+         ));
+      },
+   }
+   let code = none
+      .checked_sub(start)
+      .and_then(|len| image.read(start, len))
+      .ok_or("gift button's None store is outside its function")?;
+   (0..code.len().saturating_sub(6))
+      .find(|&at| {
+         code[at..at + 2] == [0x0F, 0x85]
+            && rel32_target(image, start + at + 2)
+               .is_some_and(|to| (none - 0x20..=none).contains(&to))
+      })
+      .map(|at| start + at)
+      .filter(|&jne| jne % 8 != 7)
+      .ok_or_else(|| format!("no jne skips the gift button before {none:#x}"))
 }
 
 /// `Store::delete_message`, the client's optimistic delete. It shares the map
@@ -1974,10 +3273,10 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
       ));
    }
 
-   // Right after `MessageContextMenu`'s anchor call, the 4th call computes
-   // message permissions and reads `&message.channel_id` into its second
-   // argument, `lea arg1, [msg + disp32]`.
-   let post_anchor_calls = calls_in(image, anchor_lea, 0x80);
+   // Soon after `MessageContextMenu`'s anchor call, a call computes message
+   // permissions and reads `&message.channel_id` into its second argument,
+   // `lea arg1, [msg + disp32]`, as far as anchor + 0x7D on Linux.
+   let post_anchor_calls = calls_in(image, anchor_lea, 0xC0);
    let channel_id_offset = post_anchor_calls
       .iter()
       .find_map(|&(_, callee)| {
@@ -1989,7 +3288,8 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
       .ok_or("MessageContextMenu channel_id offset not found")?;
 
    // Find the `Copy Message ID` and `Delete Message` `lea`s inside `build_fn`
-   // directly (scanning only the ~19 KiB function instead of the whole `.text`).
+   // directly (scanning only the ~19 KiB function instead of the whole
+   // `.text`).
    let build_bytes = image
       .read(build_fn, build_end - build_fn)
       .ok_or("MessageContextMenu body is unmapped")?;
@@ -2416,13 +3716,13 @@ pub struct WaylandFrame {
 
 /// Locates [`WaylandFrame`] from `frame`'s start and the `request_frame` that
 /// moves `status` from idle to requested and pings, on System V builds.
+///
+/// `frame` loads `force_render` with the first `movzx r8d, byte [state +
+/// disp32]`, whose state register changed from r13 to r12 after build 2233.
 pub fn wayland_frame(image: &Image<'_>) -> Found<WaylandFrame> {
    const FRAME: Pattern = Pattern::new(
-      "55 41 57 41 56 41 55 41 54 53 48 81 EC ?? ?? ?? ?? 48 8B 6F 10 C6 45 10 01 4C 8B 2F 49 83 \
-       7D 10 00 0F 85 ?? ?? ?? ?? 41 C6 85 ?? ?? ?? ?? 00 41 80 BD ?? ?? ?? ?? 02 0F 93 C0 4C 8B \
-       67 08 49 83 7C 24 10 00 0F 85 ?? ?? ?? ?? 45 0F B6 85",
+      "55 41 57 41 56 41 55 41 54 53 48 81 EC ?? ?? ?? ?? 48 8B 6F 10 C6 45 10 01 4C 8B",
    );
-   const FRAME_LEN: usize = 78;
    /// `status` at +0x10, idle 7 to requested 5, `requested` at +0x20 set to
    /// `Instant::now()`, then a tail call to `Ping::ping(&self.ping)` at +0x18.
    const REQUEST: Pattern = Pattern::new(
@@ -2432,8 +3732,15 @@ pub fn wayland_frame(image: &Image<'_>) -> Found<WaylandFrame> {
    );
    const REQUEST_LEN: usize = 71;
    let frame = one("Wayland frame", &image.scan(FRAME))?;
-   let force_render =
-      imm32(image, frame + FRAME_LEN).ok_or("Wayland frame force_render did not decode")?;
+   let force_render = image
+      .read(frame, 0x80)
+      .and_then(|code| {
+         phoenix_hook::x86::disasm(code, frame, 24)
+            .into_iter()
+            .find(|line| line.text.starts_with("movzx r8d,byte ptr ["))
+      })
+      .and_then(|line| imm32(image, line.addr + line.len - 4))
+      .ok_or("Wayland frame force_render did not decode")?;
    let request = one("Wayland request_frame", &image.scan(REQUEST))?;
    let ping = rel32_target(image, request + REQUEST_LEN)
       .and_then(|slot| image.read_usize(slot))
@@ -2906,6 +4213,7 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    const READ_PANIC: &[u8] = b"readmana_gpui::components::rich_text::state::RichTextState";
    const TEXT_INPUT_TYPE: &[u8] = b"mana_html::hosted::text_input::TextInput";
    const TEXT_AREA_TYPE: &[u8] = b"mana_html::hosted::text_area::TextArea";
+   const LOCK_DEC: [u8; 4] = [0xF0, 0x48, 0xFF, 0x08];
 
    let abi = Abi::of(image);
    let (ctor_single, ctor_multi, inner_a) = field_state_new(image, abi)?;
@@ -3017,7 +4325,8 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
             .map(|w| usize::from(w[3]))
       })
    };
-   // `text_get` is the member of C called by the most other members of C (>= 3).
+   // `text_get` is the member of C called by the most other members of C (>=
+   // 3).
    let mut caller_counts: HashMap<usize, usize> = HashMap::new();
    for (func, calls) in &c_calls {
       let mut seen = HashSet::new();
@@ -3060,6 +4369,15 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
          .iter()
          .any(|load| code.windows(load.len()).any(|w| w == load.as_slice()))
    };
+   // ELF repeats the store on the unwind path.
+   let cleared_slots = |body: &[u8]| {
+      let mut stores = none_stores(body);
+      if stores.is_empty() {
+         stores = none_stores_through(body);
+      }
+      stores.dedup();
+      stores
+   };
    let set_value_hits: Vec<(usize, &Vec<(usize, usize)>)> = c_calls
       .iter()
       .filter(|(func, calls)| {
@@ -3080,49 +4398,82 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
          let Some(body) = image.read(start, end - start) else {
             return false;
          };
-         // ELF repeats the store on the unwind path.
-         let mut stores = none_stores(body);
-         stores.dedup();
+         let stores = cleared_slots(body);
          stores.len() == 1 && loads_len(body)
       })
       .map(|(f, calls)| (*f, calls))
       .collect();
-   if set_value_hits.len() != 1 {
+   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48
+   // FF 08`), or, where the drop is outlined, tail-jumped to after it at the
+   // end of the `SharedString` drop's own tail jump.
+   let outlined_drop_slow = |drop: usize| {
+      let tail = |func: usize| {
+         let (start, end) = image
+            .function_bounds(func)
+            .filter(|&(start, end)| end - start <= 0x20)?;
+         let body = image.read(start, end - start)?;
+         let target = phoenix_hook::x86::disasm(body, start, usize::MAX)
+            .into_iter()
+            .filter_map(|line| jump_target(image, image.read(line.addr, line.len)?, line.addr))
+            .find(|&target| !(start..end).contains(&target))?;
+         Some((body, target))
+      };
+      let (_, inner) = tail(drop)?;
+      let (body, target) = tail(inner)?;
+      body.windows(4).any(|w| w == LOCK_DEC).then_some(target)
+   };
+   let set_value_callees = |sv_calls: &[(usize, usize)]| -> Found<(usize, bool, usize)> {
+      let inline = sv_calls.iter().find_map(|&(site, callee)| {
+         let before = image.read(site.saturating_sub(24), 24)?;
+         before.windows(4).any(|w| w == LOCK_DEC).then_some(callee)
+      });
+      let arc_drop_slow = inline
+         .or_else(|| {
+            sv_calls
+               .iter()
+               .find_map(|&(_, callee)| outlined_drop_slow(callee))
+         })
+         .ok_or("Arc<str>::drop_slow not found in FieldState::set_value")?;
+
+      // `update_entity_dyn` is called in `set_value` right after the name's
+      // length and begins with `inc qword ptr [arg0 + disp32]`.
+      let update_entity_dyn = sv_calls
+         .iter()
+         .find_map(|&(site, callee)| {
+            if !loads_len(image.read(site.saturating_sub(32), 32)?) {
+               return None;
+            }
+            let head = image.read(callee, 0x40)?;
+            head
+               .windows(3)
+               .any(|w| w == inc_disp32(abi.arg(0)))
+               .then_some(callee)
+         })
+         .ok_or("App::update_entity_dyn not found in FieldState::set_value")?;
+      Ok((arc_drop_slow, inline.is_some(), update_entity_dyn))
+   };
+   // ELF can keep two copies of `set_value` from different codegen units,
+   // one with its drops outlined, each calling its own `Arc<str>::drop_slow`.
+   let resolved = set_value_hits
+      .iter()
+      .map(|&(func, calls)| Ok((func, set_value_callees(calls)?)))
+      .collect::<Found<Vec<(usize, (usize, bool, usize))>>>()?;
+   let Some(&(set_value, (arc_drop_slow, _, update_entity_dyn))) = resolved
+      .iter()
+      .find(|(_, (_, inline, _))| *inline)
+      .or_else(|| resolved.first())
+   else {
+      return Err("FieldState::set_value matched 0 functions".to_owned());
+   };
+   if resolved
+      .iter()
+      .any(|&(_, (_, _, found))| found != update_entity_dyn)
+   {
       return Err(format!(
-         "FieldState::set_value matched {} functions",
-         set_value_hits.len()
+         "FieldState::set_value matched {} functions that disagree",
+         resolved.len()
       ));
    }
-   let (set_value, sv_calls) = set_value_hits[0];
-
-   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48 FF
-   // 08`).
-   let arc_drop_slow = sv_calls
-      .iter()
-      .find_map(|&(site, callee)| {
-         let before = image.read(site.saturating_sub(24), 24)?;
-         before
-            .windows(4)
-            .any(|w| w == [0xF0, 0x48, 0xFF, 0x08])
-            .then_some(callee)
-      })
-      .ok_or("Arc<str>::drop_slow not found in FieldState::set_value")?;
-
-   // `update_entity_dyn` is called in `set_value` right after the name's
-   // length and begins with `inc qword ptr [arg0 + disp32]`.
-   let update_entity_dyn = sv_calls
-      .iter()
-      .find_map(|&(site, callee)| {
-         if !loads_len(image.read(site.saturating_sub(32), 32)?) {
-            return None;
-         }
-         let head = image.read(callee, 0x40)?;
-         head
-            .windows(3)
-            .any(|w| w == inc_disp32(abi.arg(0)))
-            .then_some(callee)
-      })
-      .ok_or("App::update_entity_dyn not found in FieldState::set_value")?;
 
    // Several hosted elements share `HOSTED_NEW`, so each is the one that fills
    // its own size.
@@ -3179,7 +4530,7 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
 
    // `FieldState::new` ends by writing `None` into its three
    // `Option<SharedString>`s; the one `set_value` clears is the pending value.
-   let pending_value = none_stores(function_code(image, set_value, "FieldState::set_value")?)[0];
+   let pending_value = cleared_slots(function_code(image, set_value, "FieldState::set_value")?)[0];
    let slots = field_slots(image, inner_a)
       .filter(|slots| slots.contains(&pending_value))
       .ok_or("FieldState::new no longer clears three SharedString slots")?;
@@ -3291,12 +4642,9 @@ pub fn settings_layer(image: &Image<'_>) -> Found<usize> {
    Ok(func)
 }
 
-/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
-///
-/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
-/// and the desktop runtime hooks the function to unwrap custom badge icon
-/// URLs (`/badge-icons/phx_u_<hex>`).
-pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
+/// The `tracing::Callsite` static naming `"media_fetch"` /
+/// `"libdiscord_media::fetch"`, the same data on every platform.
+pub(crate) fn media_fetch_callsite(image: &Image<'_>) -> Found<usize> {
    let name = one(
       "media_fetch tracing name",
       &image.find_bytes(b"media_fetchlibdiscord_media::fetch"),
@@ -3328,8 +4676,16 @@ pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
          pos = off + 8;
       }
    }
-   let callsite = one("media_fetch callsite", &callsites)?;
+   one("media_fetch callsite", &callsites)
+}
 
+/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
+///
+/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
+/// and the desktop runtime hooks the function to unwrap custom badge icon
+/// URLs (`/badge-icons/phx_u_<hex>`).
+pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
+   let callsite = media_fetch_callsite(image)?;
    let mut funcs: Vec<usize> = lea_refs(image, callsite)
       .into_iter()
       .filter_map(|site| Some(image.function_bounds(site)?.0))
@@ -3434,4 +4790,99 @@ fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + 
          (addr + pos + 6).checked_add_signed(disp as isize)?,
       ))
    })
+}
+
+/// Mana's icon names in id order: a `MenuItem`'s icon is the index of its
+/// name in this list.
+///
+/// The icon table pairs each name with `icons/<Name>.svg`; the paths are read
+/// in a run from `icons/A.svg`, and the ids are their names sorted, which
+/// Discord's own menu icons (`Copy` 0x99, `Id` 0x15b, `Link` 0x177, `Trash`
+/// 0x280 on 2026-11 builds) confirm.
+pub fn icon_names(image: &Image<'_>) -> Found<Vec<String>> {
+   /// How far apart two paths in the table may sit, a name between them.
+   const GAP: usize = 128;
+   let start = image
+      .find_bytes_iter(b"icons/A.svg")
+      .next()
+      .ok_or("icon table not found")?;
+   let mut names = Vec::new();
+   let mut at = start;
+   while let Some(window) = image.read(at, GAP) {
+      let Some(path) = window.windows(6).position(|w| w == b"icons/") else {
+         break;
+      };
+      let Some(rest) = image.read(at + path + 6, GAP) else {
+         break;
+      };
+      let Some(end) = rest.windows(4).position(|w| w == b".svg") else {
+         break;
+      };
+      let Ok(name) = std::str::from_utf8(&rest[..end]) else {
+         break;
+      };
+      at += path + 6 + end + 4;
+      // `Name.secondary.svg` is a second layer of `Name`, with no id.
+      if name.contains('.') {
+         continue;
+      }
+      if !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+         || (name == "A" && !names.is_empty())
+      {
+         break;
+      }
+      names.push(name.to_owned());
+   }
+   names.sort_unstable();
+   names.dedup();
+   let has = |name: &str| {
+      names
+         .binary_search_by(|probe| probe.as_str().cmp(name))
+         .is_ok()
+   };
+   if names.len() < 100 || !["Copy", "Id", "Link", "Trash"].into_iter().all(has) {
+      return Err(format!("icon table holds {} names", names.len()));
+   }
+   Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn islands_hand_over_the_frame() {
+      let text = |frame: Frame, arg: Register| {
+         let code = frame.island(arg);
+         let lines = phoenix_hook::x86::disasm(&code, 0, usize::MAX);
+         assert_eq!(lines.iter().map(|line| line.len).sum::<usize>(), code.len());
+         lines
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("; ")
+      };
+      assert_eq!(text(Frame::Reg(Register::RBP), Register::R9), "mov r9,rbp");
+      assert_eq!(text(Frame::Reg(Register::RBP), Register::R8), "mov r8,rbp");
+      assert_eq!(
+         text(Frame::Reg(Register::RBX), Register::RCX),
+         "mov rcx,rbx"
+      );
+      assert_eq!(
+         text(Frame::Reg(Register::R14), Register::RCX),
+         "mov rcx,r14"
+      );
+      assert_eq!(text(Frame::Stack, Register::RCX), "lea rcx,[rsp+8]");
+      assert_eq!(text(Frame::Stack, Register::RDX), "lea rdx,[rsp+8]");
+      assert_eq!(text(Frame::Stack, Register::R9), "lea r9,[rsp+8]");
+   }
+
+   #[test]
+   fn frame_slots_parse() {
+      assert_eq!(slot_of("[rbp+0DB0h]", "rbp"), Some(0xDB0));
+      assert_eq!(slot_of("[rsp+8]", "rsp"), Some(8));
+      assert_eq!(slot_of("[rsp]", "rsp"), Some(0));
+      assert_eq!(slot_of("[rsp+8]", "rbp"), None);
+      assert_eq!(slot_of("[rsp+rax]", "rsp"), None);
+   }
 }
