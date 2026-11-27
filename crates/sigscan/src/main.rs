@@ -253,6 +253,26 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|page| format!("{} (length {})", at(page.name), at(page.len))),
          );
          report(
+            "sidebar sections",
+            desktop::settings_sections(image).map(|sections| {
+               sections
+                  .staff
+                  .iter()
+                  .zip(&sections.other)
+                  .map(|(staff, other)| {
+                     format!(
+                        "staff {:?} @ {}, other {:?} @ {}",
+                        staff.pages,
+                        at(staff.pages_field),
+                        other.pages,
+                        at(other.pages_field)
+                     )
+                  })
+                  .collect::<Vec<_>>()
+                  .join("; ")
+            }),
+         );
+         report(
             "upload limit",
             desktop::upload_limit(image)
                .map(|limit| format!("{} (field +{:#x})", at(limit.func), limit.field)),

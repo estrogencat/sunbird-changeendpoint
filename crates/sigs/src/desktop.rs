@@ -1387,6 +1387,68 @@ pub fn settings_spare_page(image: &Image<'_>) -> Found<SparePage> {
    one("spare settings page loader", &found)
 }
 
+/// A sidebar section's page list: the pointer and length fields of its static
+/// entry, and the pages it lists.
+#[derive(Clone, Debug)]
+pub struct SidebarSection {
+   pub pages_field: usize,
+   pub len_field:   usize,
+   pub pages:       Vec<u8>,
+}
+
+/// Every copy of the `Staff Only` section, which lists page 23, and of the
+/// last one (`Other`), which lists page 24. Discord keeps the table twice.
+#[derive(Clone, Debug)]
+pub struct SidebarSections {
+   pub staff: Vec<SidebarSection>,
+   pub other: Vec<SidebarSection>,
+}
+
+/// Each section entry holds a flag, then its id, name, translation key and
+/// pages, so the page list sits `0x28` past the pointer to the id.
+pub fn settings_sections(image: &Image<'_>) -> Found<SidebarSections> {
+   fn sections(image: &Image<'_>, id: &[u8], page: u8) -> Found<Vec<SidebarSection>> {
+      let read_u64 = |at: usize| {
+         image
+            .read(at, 8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(|bytes| usize::try_from(u64::from_le_bytes(bytes)).unwrap_or(usize::MAX))
+      };
+      let found: Vec<(usize, usize, usize)> = image
+         .find_bytes(id)
+         .into_iter()
+         .flat_map(|text| image.pointers_to(text))
+         .filter(|&slot| read_u64(slot + 8) == Some(id.len()))
+         .filter_map(|slot| {
+            let pages = read_u64(slot + 0x28)?;
+            let len = read_u64(slot + 0x30)?;
+            (1..=16).contains(&len).then_some((slot, pages, len))
+         })
+         .filter(|&(_, pages, len)| image.read(pages, len).is_some_and(|list| list.contains(&page)))
+         .collect();
+      found
+         .into_iter()
+         .map(|(slot, pages, len)| {
+            Ok(SidebarSection {
+               pages_field: slot + 0x28,
+               len_field:   slot + 0x30,
+               pages:       image.read(pages, len).ok_or("section pages unmapped")?.to_vec(),
+            })
+         })
+         .collect()
+   }
+   let staff = sections(image, b"USER_SETTINGS_STAFF_ONLY_SECTION", 23)?;
+   let other = sections(image, b"USER_SETTINGS_UTILITY_SECTION", 24)?;
+   if staff.is_empty() || staff.len() != other.len() {
+      return Err(format!(
+         "sidebar sections matched {} staff and {} other",
+         staff.len(),
+         other.len()
+      ));
+   }
+   Ok(SidebarSections { staff, other })
+}
+
 /// The function building the account's perks, and where its answer keeps the
 /// upload limit in bytes.
 #[derive(Clone, Copy, Debug)]

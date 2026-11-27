@@ -15,8 +15,9 @@
 //!    string xref and `.pdata` function bounds) so when active page `== 24`, it
 //!    builds and returns a native GPUI `AnyElement` directly into Discord's
 //!    User Settings scroll viewport.
-//! 4. Rename staff-only page `23` (`Developer Options`, right above Sunbird)
-//!    to `Servers`, show it the same way, and draw the Servers page there.
+//! 4. Rename staff-only page `23` (`Developer Options`) to `Servers`, move
+//!    it from the `Staff Only` section to right below Sunbird, show it the
+//!    same way, and draw the Servers page there.
 
 use std::{
    ffi::c_void,
@@ -66,6 +67,9 @@ pub fn install(image: &Image<'static>) {
    patch_sidebar_label(image);
    let native = gpui::locate(image);
    let servers = native && patch_servers_label(image);
+   if servers {
+      move_servers_entry(image);
+   }
    patch_page_visibility(image, servers);
    if native {
       hook_section_render(image);
@@ -230,6 +234,46 @@ fn patch_servers_label(image: &Image<'static>) -> bool {
          false
       },
    }
+}
+
+/// Points each section's page list at a copy with page 23 moved from `Staff
+/// Only` to right after page 24. Discord reads the lists through these
+/// pointers, so the copies live for the whole process.
+fn move_servers_entry(image: &Image<'static>) {
+   let sections = match desktop::settings_sections(image) {
+      Ok(sections) => sections,
+      Err(err) => {
+         log::warn!("desktop settings: {err}, servers stay under Staff Only");
+         return;
+      },
+   };
+   let staff = sections.staff.iter().map(|section| {
+      let pages: Vec<u8> = section.pages.iter().copied().filter(|&page| page != SERVERS_PAGE).collect();
+      (section, pages)
+   });
+   let other = sections.other.iter().map(|section| {
+      let mut pages: Vec<u8> = section.pages.clone();
+      let at = pages.iter().position(|&page| page == SUNBIRD_PAGE).map_or(pages.len(), |at| at + 1);
+      pages.insert(at, SERVERS_PAGE);
+      (section, pages)
+   });
+   for (section, pages) in other.chain(staff) {
+      let pages: &'static [u8] = Box::leak(pages.into_boxed_slice());
+      let pointer = (pages.as_ptr() as usize).to_le_bytes();
+      let len = pages.len().to_le_bytes();
+      // SAFETY: a section's pointer and length words in `.rdata`, from
+      // `prepare` before Discord's threads run; the list they name is leaked.
+      let written = unsafe {
+         image
+            .write_code(section.pages_field, &pointer)
+            .and_then(|()| image.write_code(section.len_field, &len))
+      };
+      if let Err(err) = written {
+         log::warn!("desktop settings: moving servers failed: {err}");
+         return;
+      }
+   }
+   log::info!("desktop settings: servers moved below Sunbird");
 }
 
 fn patch_page_visibility(image: &Image<'static>, servers: bool) {
