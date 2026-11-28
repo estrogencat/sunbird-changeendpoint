@@ -33,8 +33,6 @@ use crate::gpui::{
    gpui_px,
 };
 
-/// Discord's blurple.
-pub const ACCENT: u32 = 0xFF58_65F2;
 pub const DURATION: Duration = Duration::from_secs(5);
 
 /// The newest banners shown at once. The others wait until one is closed.
@@ -43,11 +41,6 @@ const MAX_SHOWN: usize = 3;
 const MAX_KEPT: usize = 50;
 const WIDTH: f32 = 340.0;
 const MARGIN: f32 = 16.0;
-
-const BACKGROUND: u32 = 0xFA2B_2D31;
-const BORDER: u32 = 0xFF3F_4147;
-const TITLE: u32 = 0xFFF2_F3F5;
-const MUTED: u32 = 0xFFB5_BAC1;
 
 const POSITION_ABSOLUTE: u8 = 1;
 /// `CursorStyle::PointingHand`, GPUI's sixth cursor.
@@ -59,7 +52,8 @@ pub struct Notice {
    pub source:    String,
    pub title:     String,
    pub body:      Option<String>,
-   pub accent:    u32,
+   /// Explicit ARGB accent, or `None` to follow the live Mana theme accent.
+   pub accent:    Option<u32>,
    /// How long it stays, or until it is dismissed.
    pub duration:  Option<Duration>,
    /// Whether it has an Open button, which runs the plugin's `onPress`.
@@ -73,7 +67,7 @@ impl Notice {
          source:    source.to_owned(),
          title:     title.to_owned(),
          body:      body.map(str::to_owned),
-         accent:    ACCENT,
+         accent:    None,
          duration:  Some(DURATION),
          pressable: false,
       }
@@ -243,7 +237,8 @@ unsafe fn close_press(
 /// Ends `header` with a plain `×` that closes banner `id`, light enough to keep
 /// the header as tall as its text.
 fn push_close(header: RawDiv, id: u64) -> Option<RawDiv> {
-   let mut cross = text("\u{d7}", MUTED, 16.0)?;
+   let muted = crate::mana_theme::color_to_argb(crate::mana_theme::sunbird_palette().text_muted);
+   let mut cross = text("\u{d7}", muted, 16.0)?;
    gpui::style_div(&mut cross, |s| {
       s.lengths(&[s.at.padding[1], s.at.padding[3]], gpui_px(4.0));
       s.set(s.at.mouse_cursor, CURSOR_POINTING_HAND);
@@ -255,14 +250,19 @@ fn push_close(header: RawDiv, id: u64) -> Option<RawDiv> {
 /// How many banners wait behind the shown ones, in a pill on the right styled
 /// like the cards, so it stays readable over chat and pictures.
 fn waiting_pill(waiting: usize) -> Option<RawDiv> {
-   let mut pill = text(&format!("+{waiting} more"), MUTED, 12.0)?;
+   let pal = crate::mana_theme::sunbird_palette();
+   let mut pill = text(
+      &format!("+{waiting} more"),
+      crate::mana_theme::color_to_argb(pal.text_muted),
+      12.0,
+   )?;
    gpui::style_div(&mut pill, |s| {
       s.lengths(&[s.at.padding[0], s.at.padding[2]], gpui_px(2.0));
       s.lengths(&[s.at.padding[1], s.at.padding[3]], gpui_px(8.0));
       s.lengths(&s.at.corner_radii, gpui_px(10.0));
       s.lengths(&s.at.border_widths, gpui_px(1.0));
-      s.hsla(s.at.border_color, argb_to_hsla(BORDER));
-      s.solid_background(argb_to_hsla(BACKGROUND));
+      s.hsla(s.at.border_color, crate::mana_theme::color_to_hsla(pal.border, None));
+      s.solid_background(crate::mana_theme::color_to_hsla(pal.bg_surface, Some(0.98)));
    });
    // An empty first child pushes the pill to the right.
    let row = gpui::push_div(gpui::h_row(0.0, true)?, gpui::raw_div()?);
@@ -283,15 +283,22 @@ fn text(text: &str, argb: u32, font_px: f32) -> Option<RawDiv> {
 /// One banner. Button IDs go by `slot`, so they stay a handful however many
 /// banners come and go.
 fn banner(slot: usize, id: u64, notice: &Notice) -> Option<RawDiv> {
+   let pal = crate::mana_theme::sunbird_palette();
+   let accent_hsla = notice.accent.map_or_else(
+      || crate::mana_theme::color_to_hsla(pal.accent, None),
+      argb_to_hsla,
+   );
+   let muted_argb = crate::mana_theme::color_to_argb(pal.text_muted);
+   let title_argb = crate::mana_theme::color_to_argb(pal.text);
    let mut dot = gpui::raw_div()?;
    gpui::style_div(&mut dot, |s| {
       s.lengths(&s.at.size, gpui_px(8.0));
       s.lengths(&s.at.corner_radii, gpui_px(4.0));
-      s.solid_background(argb_to_hsla(notice.accent));
+      s.solid_background(accent_hsla);
    });
    let mut source = gpui::h_row(6.0, false)?;
    source = gpui::push_div(source, dot);
-   source = gpui::push_div(source, text(&notice.source, MUTED, 12.0)?);
+   source = gpui::push_div(source, text(&notice.source, muted_argb, 12.0)?);
    let mut header = gpui::h_row(8.0, true)?;
    header = gpui::push_div(header, source);
    header = push_close(header, id)?;
@@ -301,14 +308,14 @@ fn banner(slot: usize, id: u64, notice: &Notice) -> Option<RawDiv> {
       s.lengths(&s.at.padding, gpui_px(12.0));
       s.lengths(&s.at.corner_radii, gpui_px(8.0));
       s.lengths(&s.at.border_widths, gpui_px(1.0));
-      s.hsla(s.at.border_color, argb_to_hsla(BORDER));
-      s.solid_background(argb_to_hsla(BACKGROUND));
+      s.hsla(s.at.border_color, crate::mana_theme::color_to_hsla(pal.border, None));
+      s.solid_background(crate::mana_theme::color_to_hsla(pal.bg_surface, Some(0.98)));
    });
    card = gpui::push_div(card, header);
    let mut words = gpui::v_stack(4.0)?;
-   words = gpui::push_div(words, text(&notice.title, TITLE, 14.0)?);
+   words = gpui::push_div(words, text(&notice.title, title_argb, 14.0)?);
    if let Some(body) = notice.body.as_deref().filter(|body| !body.is_empty()) {
-      words = gpui::push_div(words, text(body, MUTED, 13.0)?);
+      words = gpui::push_div(words, text(body, muted_argb, 13.0)?);
    }
    card = gpui::push_div(card, words);
    if notice.pressable
@@ -365,6 +372,9 @@ pub fn build() -> Option<RawDiv> {
       s.length(s.at.inset[2], gpui_px(MARGIN));
       s.length(s.at.size[0], gpui_px(WIDTH));
    });
+   // A press on a banner stays on it: under Settings lies its backdrop, which
+   // would close Settings, and elsewhere the chat.
+   crate::modal::swallow_presses(&mut stack);
    if waiting > 0 {
       stack = gpui::push_div(stack, waiting_pill(waiting)?);
    }

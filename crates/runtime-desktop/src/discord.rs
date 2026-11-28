@@ -57,12 +57,9 @@ use phoenix_runtime::{
       Response,
    },
 };
-use phoenix_sigs::{
-   desktop,
-   http::{
-      self,
-      DesktopHttpTransport,
-   },
+use phoenix_sigs::http::{
+   self,
+   DesktopHttpTransport,
 };
 use serde::Deserialize;
 
@@ -499,21 +496,14 @@ pub fn install(image: &Image<'static>) {
    // It opens with the same register saves and `sub rsp` as a render frame.
    // SAFETY: runs from `prepare` before Discord's own code, and `send_detour`
    // matches `send`'s Rust ABI.
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
-   let trampoline = match unsafe {
-      image.hook_entry(
-         found.send_fn,
-         pro.pattern,
-         pro.len,
-         send_detour as *const () as usize,
-      )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("discord desktop: HTTP send not hooked: {err}");
-         return;
-      },
-   };
+   let trampoline =
+      match unsafe { image.hook_entry(found.send_fn, send_detour as *const () as usize) } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("discord desktop: HTTP send not hooked: {err}");
+            return;
+         },
+      };
    // SAFETY: `DesktopHttpTransport::locate` verified every target against
    // `.pdata`, and the trampoline replays `send`'s prologue.
    let poll = match found.response {

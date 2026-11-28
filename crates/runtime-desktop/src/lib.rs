@@ -13,12 +13,12 @@ mod account_switch;
 mod attachments;
 mod audio;
 mod badges;
+mod call_idle;
 mod channel_icons;
 mod channel_order;
 mod composer;
 mod config;
 mod context_menu;
-#[cfg(target_arch = "x86_64")]
 mod counts;
 mod discord;
 mod discord_version;
@@ -30,12 +30,14 @@ mod fetch;
 mod gateway_send;
 mod gifs;
 mod gpui;
+mod gpui_font;
 mod gpui_theme;
 mod headers;
 mod health;
 mod icons;
 mod js;
 mod login_form;
+pub mod mana_theme;
 mod members;
 mod message;
 mod modal;
@@ -53,8 +55,8 @@ mod servers;
 mod settings;
 mod shortcuts;
 mod sidebar;
+mod spotify;
 mod staff;
-mod theme_css;
 mod toolbar;
 mod tweaks;
 mod upload_limit;
@@ -73,10 +75,7 @@ use std::{
    time::Duration,
 };
 
-use phoenix_hook::{
-   image::Image,
-   x86::Abi,
-};
+use phoenix_hook::image::Image;
 use phoenix_runtime::{
    Error,
    Notice,
@@ -103,10 +102,6 @@ use phoenix_runtime::{
    },
 };
 use phoenix_sigs::{
-   desktop::{
-      Prologue,
-      Prologues,
-   },
    index::{
       Index,
       Isa,
@@ -162,8 +157,8 @@ struct HealthReply {
 /// what they locate stays off.
 pub(crate) const X86_CODE: bool = cfg!(all(target_arch = "x86_64", not(target_os = "macos")));
 
-/// Hooks `target` with `detour` past the prologue `pick` chooses, and returns
-/// the trampoline as `F`, or logs the error after `what`.
+/// Hooks `target` with `detour` and returns the trampoline as `F`, or logs the
+/// error after `what`.
 ///
 /// # Safety
 ///
@@ -171,15 +166,13 @@ pub(crate) const X86_CODE: bool = cfg!(all(target_arch = "x86_64", not(target_os
 /// is its function pointer type.
 pub(crate) unsafe fn hook<F: Copy>(
    image: &Image<'static>,
-   pick: impl FnOnce(Prologues) -> Prologue,
    target: usize,
    detour: usize,
    what: &str,
 ) -> Option<F> {
    const { assert!(size_of::<F>() == size_of::<usize>()) };
-   let prologue = pick(Prologues::of(Abi::of(image)));
    // SAFETY: forwarded from the caller.
-   match unsafe { image.hook_entry(target, prologue.pattern, prologue.len, detour) } {
+   match unsafe { image.hook_entry(target, detour) } {
       // SAFETY: the trampoline runs `target`'s displaced instructions, so it
       // has `F`'s ABI.
       Ok(trampoline) => Some(unsafe { std::mem::transmute_copy::<usize, F>(&trampoline) }),
@@ -200,19 +193,17 @@ pub(crate) unsafe fn hook<F: Copy>(
 /// sret ABI, and `F` is its function pointer type.
 pub(crate) unsafe fn hook_sret<F: Copy>(
    image: &Image<'static>,
-   pick: impl FnOnce(Prologues) -> Prologue,
    target: usize,
    detour: usize,
    what: &str,
 ) -> Option<F> {
    const { assert!(size_of::<F>() == size_of::<usize>()) };
-   let prologue = pick(Prologues::of(Abi::of(image)));
    // SAFETY: forwarded from the caller.
    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-   let hooked = unsafe { image.hook_sret_entry(target, prologue.pattern, prologue.len, detour) };
+   let hooked = unsafe { image.hook_sret_entry(target, detour) };
    // SAFETY: forwarded from the caller.
    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-   let hooked = unsafe { image.hook_entry(target, prologue.pattern, prologue.len, detour) };
+   let hooked = unsafe { image.hook_entry(target, detour) };
    let orig = match hooked {
       Ok(orig) => orig,
       Err(err) => {
@@ -292,20 +283,24 @@ pub fn prepare() -> Result<(), Error> {
    if let Some(header) = header {
       feature("headers", || headers::install(&image, header));
       feature("message", || message::install(&image));
-      #[cfg(target_arch = "x86_64")]
-      feature("counts", || counts::install(&image));
    } else {
       #[cfg(target_os = "macos")]
       feature("headers", || headers::arm64::install(&image));
    }
+   feature("counts", || counts::install(&image, &ix));
    feature("icons", || icons::install(&image));
    feature("composer", || composer::install(&image));
+   feature("spotify", || spotify::install(&ix));
    feature("sidebar", || sidebar::install(&image));
    feature("toolbar", || toolbar::install(&image));
    feature("badges", || badges::install(&image, &ix));
    feature("emoji", || emoji::install(&image, &ix));
-   #[cfg(windows)]
-   feature("gpui_theme", || gpui_theme::install(&image));
+   feature("call_idle_dm", || call_idle::install_dm(&image, &ix));
+   feature("call_idle_afk", || call_idle::install_guild_afk(&image, &ix));
+   #[cfg(target_arch = "x86_64")]
+   feature("gpui_font", || gpui_font::install(&image));
+   feature("mana_theme", || mana_theme::install(&image, &ix));
+   feature("gpui_theme", || gpui_theme::install(&image, &ix));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
    let registry = phoenix_runtime::hook(&image);
    critical(
@@ -324,7 +319,7 @@ pub fn prepare() -> Result<(), Error> {
       feature("optimistic_delete", || {
          accessories::install_optimistic_delete(&image, &ix);
       });
-      feature("ready", || ready::install(&image));
+      feature("ready", || ready::install(&image, &ix));
    }
    #[cfg(target_os = "macos")]
    feature("message_writer", || message::writer::install(&image));
@@ -350,6 +345,7 @@ pub fn open_gate_only() -> Result<(), Error> {
 
 /// Starts phoenix inside Desktop Phoenix, on what [`prepare`] hooked.
 pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
+   mana_theme::load_persisted(&home);
    // `recovery` stages plugins for the loader it installs on every OS.
    phoenix_runtime::update::adopt_staged(&home, &home.join("plugins"));
    let prepared = PREPARED
@@ -670,12 +666,82 @@ impl Platform for Desktop {
                modal_rendered: modal::rendered(),
             }))
          },
+         ("GET", "/themes/tokens") => {
+            let names = remote::query_param(&request.query, "names").and_then(|raw| {
+               let list: Vec<String> = raw
+                  .split(',')
+                  .map(|part| part.trim().to_owned())
+                  .filter(|part| !part.is_empty())
+                  .collect();
+               (!list.is_empty()).then_some(list)
+            });
+            Some(remote::ok_json(&mana_theme::debug_tokens(names.as_deref())))
+         },
+         ("POST", "/themes/reload") => {
+            #[derive(serde::Serialize)]
+            struct ReloadReply {
+               reloaded: bool,
+               active:   bool,
+            }
+            if mana_theme::is_supported() {
+               match mana_theme::reload_active() {
+                  Ok(reloaded) => {
+                     Some(remote::ok_json(&ReloadReply {
+                        reloaded: reloaded.is_some(),
+                        active:   reloaded.unwrap_or(false),
+                     }))
+                  },
+                  Err(err) => Some(remote::err("400 Bad Request", &err)),
+               }
+            } else {
+               Some(remote::err(
+                  "503 Service Unavailable",
+                  "themes are not supported on this build",
+               ))
+            }
+         },
+         ("GET", "/themes/quick-css") => {
+            #[derive(serde::Serialize)]
+            struct QuickCssReply {
+               quick_css: String,
+            }
+            Some(remote::ok_json(&QuickCssReply {
+               quick_css: mana_theme::quick_css(),
+            }))
+         },
+         ("POST", "/themes/quick-css") => {
+            #[derive(serde::Deserialize)]
+            struct QuickCssBody {
+               css: String,
+            }
+            #[derive(serde::Serialize)]
+            struct QuickCssSaved {
+               saved: bool,
+            }
+            if !mana_theme::is_supported() {
+               return Some(remote::err(
+                  "503 Service Unavailable",
+                  "themes are not supported on this build",
+               ));
+            }
+            let Ok(parsed) = serde_json::from_slice::<QuickCssBody>(&request.body) else {
+               return Some(remote::err(
+                  "400 Bad Request",
+                  "expected JSON body {\"css\": \"...\"}",
+               ));
+            };
+            match mana_theme::set_quick_css(&parsed.css) {
+               Ok(()) => Some(remote::ok_json(&QuickCssSaved { saved: true })),
+               Err(err) => Some(remote::err("409 Conflict", &err)),
+            }
+         },
          _ => None,
       }
    }
 
    fn routes(&self) -> &'static str {
-      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health"
+      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens, \
+       POST /themes/reload, GET /themes/quick-css, POST /themes/quick-css"
    }
 }
 

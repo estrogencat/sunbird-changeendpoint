@@ -41,9 +41,9 @@ use sha2::{
 };
 
 /// `web/discord.json` on main, where CI publishes the builds that passed, so a
-/// ready build needs no site release. A worker on the assets host serves it,
-/// sparing phones raw.githubusercontent.com's rate limits.
-const BUILDS: &str = "https://assets.sunbird.tools/discord.json";
+/// ready build needs no site release. A Cloudflare worker serves it, sparing
+/// phones raw.githubusercontent.com's rate limits.
+const BUILDS: &str = "https://update.sunbird.tools/discord.json";
 /// Under [`fetch::LIMIT`], which caps one response.
 const CHUNK: usize = 4 << 20;
 /// This phone's ABI split and the directory its libraries sit in.

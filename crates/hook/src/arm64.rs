@@ -649,73 +649,19 @@ pub fn absolute_jump(to: usize) -> [u8; JUMP_LEN] {
    jump
 }
 
-/// `ldr x3, #16; ldr x16, #20; br x16; nop; .quad fallback; .quad detour`:
-/// jumps to `detour` with `fallback` in `x3`, preserving `x0..=x2`.
+/// `ldr x3, #16; ldr x3, [x3]; ldr x16, #16; br x16; .quad slot; .quad
+/// detour`: jumps to `detour` with the word at `slot` in `x3`, preserving
+/// `x0..=x2`.
 #[must_use]
-pub fn pass_x3_stub(detour: usize, fallback: usize) -> [u8; 32] {
+pub fn pass_x3_stub(detour: usize, slot: usize) -> [u8; 32] {
    let mut stub = [0; 32];
    stub[..4].copy_from_slice(&0x5800_0083u32.to_le_bytes());
-   stub[4..8].copy_from_slice(&0x5800_00B0u32.to_le_bytes());
-   stub[8..12].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
-   stub[12..16].copy_from_slice(&0xD503_201Fu32.to_le_bytes());
-   stub[16..24].copy_from_slice(&(fallback as u64).to_le_bytes());
+   stub[4..8].copy_from_slice(&0xF940_0063u32.to_le_bytes());
+   stub[8..12].copy_from_slice(&0x5800_0090u32.to_le_bytes());
+   stub[12..16].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
+   stub[16..24].copy_from_slice(&(slot as u64).to_le_bytes());
    stub[24..32].copy_from_slice(&(detour as u64).to_le_bytes());
    stub
-}
-
-/// `code`, the instructions displaced from `from`, rewritten to run anywhere:
-/// PC-relative ones load or branch to their absolute target through `x16`
-/// instead. `None` when one can't be moved, like a literal load.
-#[must_use]
-pub fn relocate(code: &[u8], from: usize) -> Option<Vec<u8>> {
-   const LDR_X16_8: u32 = 0x5800_0050;
-   const BR_X16: u32 = 0xD61F_0200;
-   const SKIP_LITERAL: u32 = 0x1400_0003;
-
-   let mut out = Vec::new();
-   let mut words = |words: &[u32]| words.iter().for_each(|word| out.extend(word.to_le_bytes()));
-   for (at, &raw) in code.as_chunks::<4>().0.iter().enumerate() {
-      let pc = from + at * 4;
-      let word = u32::from_le_bytes(raw);
-      let quad = |value: usize| {
-         let bytes = (value as u64).to_le_bytes();
-         [
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-         ]
-      };
-      // Conditional branches keep their condition and land on a local veneer
-      // two words on: `cond +8; b past; ldr x16, #8; br x16; .quad target`.
-      let veneer = |word: u32, target: usize| {
-         let [low, high] = quad(target);
-         [word, 0x1400_0005, LDR_X16_8, BR_X16, low, high]
-      };
-      match decode(word, pc) {
-         Insn::Adrp { rd, page: target } => {
-            let [low, high] = quad(target);
-            words(&[0x5800_0040 | u32::from(rd), SKIP_LITERAL, low, high]);
-         },
-         Insn::B { target } => {
-            let [low, high] = quad(target);
-            words(&[LDR_X16_8, BR_X16, low, high]);
-         },
-         Insn::Bl { target } => {
-            // `ldr x16, #12; blr x16; b past; .quad target`.
-            let [low, high] = quad(target);
-            words(&[0x5800_0070, 0xD63F_0200, SKIP_LITERAL, low, high]);
-         },
-         Insn::BCond { target, .. } | Insn::Cbz { target, .. } => {
-            words(&veneer((word & 0xFF00_001F) | (2 << 5), target));
-         },
-         Insn::Tbz { target, .. } => words(&veneer((word & 0xFFF8_001F) | (2 << 5), target)),
-         // `adr` and literal loads.
-         _ if word & 0x9F00_0000 == 0x1000_0000 || word & 0x3B00_0000 == 0x1800_0000 => {
-            return None;
-         },
-         _ => words(&[word]),
-      }
-   }
-   Some(out)
 }
 
 /// `mov xd, xm`.
@@ -776,32 +722,6 @@ pub fn sret_callee(detour: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
    use super::*;
-
-   #[test]
-   fn relocates_branches_to_their_absolute_targets() {
-      // bl +0x100 at 0x1000, then a plain `mov x29, sp`.
-      let code = [0x9400_0040u32, 0x9100_03FD]
-         .iter()
-         .flat_map(|word| word.to_le_bytes())
-         .collect::<Vec<u8>>();
-      let moved = relocate(&code, 0x1000).expect("movable");
-      let words = moved
-         .as_chunks::<4>()
-         .0
-         .iter()
-         .map(|&word| u32::from_le_bytes(word))
-         .collect::<Vec<u32>>();
-      assert_eq!(words, [
-         0x5800_0070,
-         0xD63F_0200,
-         0x1400_0003,
-         0x1100,
-         0,
-         0x9100_03FD
-      ]);
-      // `adr x0, #0` has no absolute form here.
-      assert_eq!(relocate(&0x1000_0000u32.to_le_bytes(), 0), None);
-   }
 
    #[test]
    fn sret_thunks_reach_their_targets() {

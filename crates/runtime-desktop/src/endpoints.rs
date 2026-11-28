@@ -329,8 +329,6 @@ pub fn install(image: &Image<'static>) {
    let trampoline = match unsafe {
       image.hook_entry(
          found.func,
-         desktop::ENDPOINTS_PROLOGUE.pattern,
-         desktop::ENDPOINTS_PROLOGUE.len,
          for_stack as *const () as usize,
       )
    } {
@@ -385,8 +383,6 @@ fn install_token_user_id(image: &Image<'static>) -> Result<(), String> {
    let trampoline = unsafe {
       image.hook_entry(
          found.func,
-         desktop::ENDPOINTS_PROLOGUE.pattern,
-         desktop::ENDPOINTS_PROLOGUE.len,
          token_user_id as *const () as usize,
       )
    }

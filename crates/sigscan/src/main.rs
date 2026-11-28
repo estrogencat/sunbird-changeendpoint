@@ -255,7 +255,7 @@ fn check(
       }
    };
    let at = |addr: usize| format!("{addr:#x}");
-   let registry = GatewayRegistry::locate(image).map_err(|err| err.to_string());
+   let registry = ix.registry();
    report(
       "gateway registry",
       registry
@@ -272,16 +272,12 @@ fn check(
                desktop::windows_restart_script(image).map(at),
             );
          }
-         let prologues = desktop::Prologues::of(abi);
          let http = DesktopHttpTransport::locate(image);
          report(
             "http transport",
             http.as_ref().map_err(Clone::clone).and_then(|http| {
-               prologues
-                  .frame
-                  .at(image, http.send_fn)
-                  .then(|| format!("{} request {:x?}", at(http.send_fn), http.request))
-                  .ok_or_else(|| "send prologue changed".to_owned())
+               desktop::entry_moved(image, http.send_fn)
+                  .map(|_| format!("{} request {:x?}", at(http.send_fn), http.request))
             }),
          );
          report(
@@ -539,39 +535,8 @@ fn check(
             }),
          );
          report("composer gift", desktop::composer_gift(image).map(at));
+         report("resolve font", desktop::resolve_font(image).map(at));
          if abi == x86::Abi::Win64 {
-            report(
-               "ready text",
-               registry
-                  .as_ref()
-                  .map_err(|_| "needs the registry".to_owned())
-                  .and_then(|registry| {
-                     let id = registry.id("READY").ok_or("no READY")?;
-                     desktop::ready_parse(image, registry.entry(id).handler)
-                        .and_then(|parse| desktop::ready_text(image, parse))
-                  })
-                  .map(at),
-            );
-            report(
-               "ready session",
-               registry
-                  .as_ref()
-                  .map_err(|_| "needs the registry".to_owned())
-                  .and_then(|registry| {
-                     let id = registry.id("READY").ok_or("no READY")?;
-                     desktop::ready_parse(image, registry.entry(id).handler)
-                        .and_then(|parse| desktop::ready_session(image, parse))
-                  })
-                  .map(|session| {
-                     format!(
-                        "{} (kind +{:#x} = {}, raw +{:#x})",
-                        at(session.func),
-                        session.kind,
-                        session.raw_kind,
-                        session.raw
-                     )
-                  }),
-            );
             report(
                "channel toolbar",
                desktop::channel_toolbar(image).map(|toolbar| {
@@ -597,64 +562,7 @@ fn check(
                   )
                }),
             );
-            report(
-               "scene draw",
-               desktop::scene_draw(image).map(|found| {
-                  format!(
-                     "{} quads +{:#x}, mono +{:#x}, subpixel +{:#x}",
-                     at(found.draw),
-                     found.quads,
-                     found.mono,
-                     found.subpixel
-                  )
-               }),
-            );
          }
-         let pending = desktop::pending_counts(image);
-         let moved = |func: usize| {
-            desktop::hook_point(image, func).map(|point| {
-               match point {
-                  desktop::HookPoint::Entry(prologue) => {
-                     format!("{} ({} bytes moved)", at(func), prologue.len)
-                  },
-                  desktop::HookPoint::Slots(slots) => {
-                     format!("{} (through slots {slots:x?})", at(func))
-                  },
-               }
-            })
-         };
-         report(
-            "pending counts",
-            pending.as_ref().map_err(Clone::clone).and_then(|found| {
-               let badges = found
-                  .badges
-                  .iter()
-                  .map(|&badge| moved(badge))
-                  .collect::<Found<Vec<String>>>()?;
-               Ok(format!(
-                  "badges {}, friend requests {}",
-                  badges.join(", "),
-                  moved(found.friend_requests)?
-               ))
-            }),
-         );
-         let friend_requests = pending
-            .as_ref()
-            .map(|found| found.friend_requests)
-            .map_err(|_| "needs the pending counts".to_owned());
-         report(
-            "home count",
-            friend_requests
-               .clone()
-               .and_then(|func| desktop::home_count(image, func))
-               .and_then(moved),
-         );
-         report(
-            "home badge",
-            friend_requests
-               .and_then(|func| desktop::home_badge(image, func))
-               .and_then(moved),
-         );
          let json = desktop::message_json(image);
          report(
             "message json",

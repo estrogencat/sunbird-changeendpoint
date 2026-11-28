@@ -30,10 +30,8 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static LIMITS: Mutex<Option<HashMap<String, Option<u64>>>> = Mutex::new(None);
 
 pub fn install(image: &Image<'static>) {
-   let found = desktop::upload_limit(image).and_then(|found| {
-      desktop::entry_prologue(image, found.func).map(|prologue| (found, prologue))
-   });
-   let (found, prologue) = match found {
+   let found = desktop::upload_limit(image);
+   let found = match found {
       Ok(found) => found,
       Err(err) => {
          log::warn!("upload limit: {err}, keeping Phoenix's");
@@ -45,8 +43,6 @@ pub fn install(image: &Image<'static>) {
    let trampoline = match unsafe {
       image.hook_entry(
          found.func,
-         prologue.pattern,
-         prologue.len,
          detour as *const () as usize,
       )
    } {

@@ -50,20 +50,23 @@ use rquickjs::{
    },
 };
 
-#[cfg(target_arch = "x86_64")]
-use crate::counts::{
-   self,
-   Count,
-};
 use crate::{
    accessories::{
       self,
       RenderedAccessory,
    },
+   call_idle::{
+      self,
+      Timer,
+   },
    composer,
    context_menu::{
       self,
       ActionMeta,
+   },
+   counts::{
+      self,
+      Count,
    },
    double_click,
    emoji,
@@ -83,6 +86,10 @@ use crate::{
    },
    shortcuts,
    sidebar,
+   spotify::{
+      self,
+      Tweak,
+   },
    toolbar,
 };
 
@@ -1147,6 +1154,56 @@ fn collapse_channels<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Func
    })
 }
 
+fn hold_spotify<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   tweak: Tweak,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HOLD: AtomicU64 = AtomicU64::new(1);
+
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   if !spotify::acquire(tweak) {
+      return noop_handle(ctx);
+   }
+   let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+   registry
+      .spotify
+      .borrow_mut()
+      .push((hold, plugin.to_owned(), tweak));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut holds = registry.spotify.borrow_mut();
+      let before = holds.len();
+      holds.retain(|&(held, ..)| held != hold);
+      if holds.len() != before {
+         spotify::release(tweak);
+      }
+   })
+}
+
+fn spotify_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
+   let object = Object::new(ctx.clone())?;
+   for (name, tweak) in [
+      ("keepPlayingInVoice", Tweak::NoAutoPause),
+      ("keepActivityWhenIdle", Tweak::IdleActivity),
+   ] {
+      if spotify::ready(tweak) {
+         let owner = plugin.to_owned();
+         object.set(
+            name,
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+               hold_spotify(&ctx, &owner, tweak)
+            })?,
+         )?;
+      }
+   }
+   Ok(object)
+}
+
 /// `phoenix.ui.addHeaderButton`: a button after the member list toggle in the
 /// channel header toolbar. `update` changes its icon or label.
 fn add_header_button<'js>(
@@ -1404,9 +1461,7 @@ fn notify<'js>(
       .get::<_, Option<String>>("title")?
       .unwrap_or_default();
    let body = options.get::<_, Option<String>>("body")?;
-   let accent = options
-      .get::<_, Option<f64>>("accent")?
-      .map_or(notices::ACCENT, to_argb);
+   let accent = options.get::<_, Option<f64>>("accent")?.map(to_argb);
    let duration = match options.get::<_, Option<f64>>("durationMs")? {
       Some(ms) if ms <= 0.0 => None,
       Some(ms) => Some(Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(notices::DURATION)),
@@ -1458,8 +1513,8 @@ pub fn press_notice(id: u64) {
    });
 }
 
-/// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick`, and
-/// `phoenix.commands` onto the plugin's API objects.
+/// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick` /
+/// `onStickerPick`, and `phoenix.commands` onto the plugin's API objects.
 pub fn desktop_patch_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
@@ -1482,6 +1537,12 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
       )?,
    )?;
+   messages.set(
+      "onStickerPick",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, _function: Opt<Value<'js>>| {
+         noop_handle(&ctx)
+      })?,
+   )?;
    let commands = Object::new(ctx.clone())?;
    commands.set(
       "register",
@@ -1494,7 +1555,9 @@ pub fn desktop_patch_api<'js>(
       Function::new(ctx.clone(), |ctx: Ctx<'js>| rquickjs::Array::new(ctx))?,
    )?;
    api.set("commands", commands)?;
+   api.set("fonts", crate::js::fonts::object(ctx, plugin)?)?;
    api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
+   api.set("spotify", spotify_object(ctx, plugin)?)?;
    api.set("ui", desktop_ui_object(ctx, plugin)?)
 }
 
@@ -1531,6 +1594,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       "hideCount",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>, name: String| {
          hide_count(&ctx, &count_owner, &name)
+      })?,
+   )?;
+
+   let idle_owner = plugin.to_owned();
+   ui.set(
+      "disableCallIdle",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, name: String| {
+         disable_call_idle(&ctx, &idle_owner, &name)
       })?,
    )?;
 
@@ -1825,7 +1896,6 @@ fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function
 }
 
 /// `phoenix.ui.hideCount`, until the returned remover runs.
-#[cfg(target_arch = "x86_64")]
 fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result<Function<'js>> {
    static NEXT_HIDE: AtomicU64 = AtomicU64::new(1);
 
@@ -1852,10 +1922,35 @@ fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result
    })
 }
 
-/// macOS has no pending count locators yet, so the counts stay.
-#[cfg(not(target_arch = "x86_64"))]
-fn hide_count<'js>(ctx: &Ctx<'js>, _plugin: &str, _name: &str) -> rquickjs::Result<Function<'js>> {
-   noop_handle(ctx)
+/// `phoenix.ui.disableCallIdle`, until the returned remover runs.
+fn disable_call_idle<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   name: &str,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_HOLD: AtomicU64 = AtomicU64::new(1);
+
+   let timer = name.parse::<Timer>().map_err(|()| {
+      Exception::throw_type(
+         ctx,
+         &format!("unknown call idle timer {name:?}, expected \"dmCall\" or \"guildAfk\""),
+      )
+   })?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let hold = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+   let mut off = registry.idle_off.borrow_mut();
+   off.push((hold, plugin.to_owned(), timer));
+   call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut off = registry.idle_off.borrow_mut();
+      off.retain(|&(held, ..)| held != hold);
+      call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+   })
 }
 
 pub fn on_send<'js>(

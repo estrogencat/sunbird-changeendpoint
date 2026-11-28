@@ -20,6 +20,7 @@ const WINHTTP_ADDREQ_FLAG_ADD: u32 = 0x2000_0000;
 const WINHTTP_ADDREQ_FLAG_REPLACE: u32 = 0x8000_0000;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+const WINHTTP_OPTION_IPV6_FAST_FALLBACK: u32 = 140;
 const INTERNET_SCHEME_HTTP: i32 = 1;
 const INTERNET_SCHEME_HTTPS: i32 = 2;
 
@@ -59,6 +60,7 @@ unsafe extern "system" {
       send: i32,
       receive: i32,
    ) -> i32;
+   fn WinHttpSetOption(handle: *mut c_void, option: u32, buffer: *const c_void, len: u32) -> i32;
    fn WinHttpCrackUrl(
       url: *const u16,
       url_len: u32,
@@ -209,6 +211,17 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
    // SAFETY: `session.0` is a live session handle.
    unsafe {
       WinHttpSetTimeouts(session.0, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS);
+   }
+   let fast_fallback = 1u32;
+   // Older Windows rejects the option, so the result is ignored.
+   // SAFETY: `session.0` is a live session handle and `fast_fallback` is a 4-byte BOOL.
+   unsafe {
+      WinHttpSetOption(
+         session.0,
+         WINHTTP_OPTION_IPV6_FAST_FALLBACK,
+         (&raw const fast_fallback).cast(),
+         4,
+      );
    }
 
    // SAFETY: `host_buf` is NUL-terminated UTF-16.

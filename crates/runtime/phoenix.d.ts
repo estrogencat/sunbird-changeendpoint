@@ -1046,6 +1046,33 @@ declare namespace Phoenix {
     readonly bridge: Bridge;
     /// `.theme.css` themes on Desktop Phoenix.
     readonly themes?: Themes;
+    /// Spotify behaviors to turn off, on Desktop Phoenix.
+    readonly spotify?: Spotify;
+    /// Discord's fonts swapped for installed ones on Desktop Phoenix.
+    readonly fonts?: Fonts;
+  }
+
+  /// Each method is absent when this build's code for it was not found. The change applies while
+  /// any plugin holds it, until the returned function runs.
+  interface Spotify {
+    /// Spotify keeps playing after 30 seconds of talking in voice, instead of pausing.
+    keepPlayingInVoice?(): Remover;
+    /// The Spotify activity stays in your presence while you are idle. Discord's setting for
+    /// showing Spotify still applies.
+    keepActivityWhenIdle?(): Remover;
+  }
+
+  /// Installed font family names, like `"Pretendard"`. An empty or missing one keeps Discord's.
+  /// A family the system doesn't have falls back to its UI font. Unloading the plugin that set
+  /// them brings back Discord's.
+  interface Fonts {
+    /// Whether this Discord build's text system could be hooked.
+    supported(): boolean;
+    /// Installed families by their English name, sorted. Windows only.
+    list?(): string[];
+    /// `main` replaces gg sans and ABC Ginto, `mono` replaces gg sans mono (code blocks).
+    set(fonts: { main?: string; mono?: string }): void;
+    clear(): void;
   }
 
   interface InstalledTheme {
@@ -1057,8 +1084,8 @@ declare namespace Phoenix {
   }
 
   /// A theme sets `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--bg-elevated`,
-  /// `--accent-color`, `--text-normal`, `--text-muted`, `--ui-border-color`, `--radius-scale` and
-  /// `--override-nitro` in a `.theme.css` file. Unloading the plugin that applied one brings back
+  /// `--accent-color`, `--text-normal`, `--text-muted`, `--ui-border-color`, and `--radius-scale`
+  /// in a `.theme.css` or `.theme.json` file. Unloading the plugin that applied one brings back
   /// Discord's colors.
   interface Themes {
     /// Whether this Discord build's renderer could be themed.
@@ -1069,6 +1096,10 @@ declare namespace Phoenix {
     apply(id: string): void;
     /// Applies stylesheet text, such as a bundled preset. Returns whether it themes anything.
     setCss(css: string): boolean;
+    /// Reloads the active theme file applied by this plugin from disk.
+    reload(): boolean;
+    /// Returns the persisted quick-CSS overlay from `themes.json`.
+    quickCss(): string;
     clear(): void;
     openThemesDir(): void;
   }
@@ -1230,6 +1261,10 @@ declare namespace Phoenix {
     /// Reactions and the rest keep the lock, and nothing else about Nitro changes. Desktop has no
     /// picker presses to report: the handler is never called there, only the unlock applies.
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
+    /// Runs when a sticker is pressed in the picker under the message box, with its id. Return
+    /// `true` to take the press, so Phoenix neither sends the sticker nor shows a Nitro ad, or
+    /// nothing to leave it to Phoenix. Desktop has no picker presses to report.
+    onStickerPick(handler: (stickerId: string, ctx: UiContext) => boolean | void): Remover;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.
@@ -1513,10 +1548,14 @@ declare namespace Phoenix {
     /// function to restore it. Desktop only knows `"composer.gift"`.
     hide(accessibilityId: string): Remover;
     /// Hides the count of pending friend requests (the DM list's Friends row, the inbox's Friends
-    /// tab and their share of the Home button's count) or message requests (the DM list's
-    /// Message Requests row) until the returned function runs. The requests themselves stay
-    /// listed. Desktop only.
+    /// tab, the Friends page's Pending tab and their share of the Home button's count) or message
+    /// requests (the DM list's Message Requests row) until the returned function runs. The
+    /// requests themselves stay listed. Desktop only.
     hideCount?(count: "friendRequests" | "messageRequests"): Remover;
+    /// Turns off Desktop Phoenix's solo DM call disconnect after 3 minutes (`"dmCall"`) or the
+    /// guild AFK move and disconnect (`"guildAfk"`) until the returned function runs. Desktop
+    /// only.
+    disableCallIdle?(timer: "dmCall" | "guildAfk"): Remover;
     /// Collapses the channel sidebar to the server rail until the returned function runs, the
     /// way Discord's member list toggle hides members. The width the user dragged it to comes
     /// back on restore. Available on Windows Desktop Phoenix builds with a recognized sidebar.

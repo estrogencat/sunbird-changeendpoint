@@ -99,7 +99,7 @@ impl Prologue {
    }
 }
 
-/// The prologues of the functions the runtime hooks.
+/// The prologues locators tell functions apart by.
 #[derive(Clone, Copy)]
 pub struct Prologues {
    /// `MessageRow::render`, `build_message_body` and `MessageContextMenu`.
@@ -107,16 +107,8 @@ pub struct Prologues {
    /// `host::section`, `Workspace::render_overlays`, `Store::delete_message`
    /// and `ReqwestTransport::send`.
    pub frame:       Prologue,
-   pub media_fetch: Prologue,
    /// The asset loader, [`asset_load`].
    pub asset_load:  Prologue,
-   /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
-   /// Win64, five on System V, up to the `jne`.
-   pub emoji_check: Prologue,
-   /// READY's parse, [`ready_parse`]. Only seen on Win64 so far.
-   pub ready_parse: Option<Prologue>,
-   /// [`ready_text`], Win64 only.
-   pub ready_text:  Option<Prologue>,
 }
 
 impl Prologues {
@@ -139,45 +131,21 @@ impl Prologues {
                   pattern: FRAME_PROLOGUE,
                   len:     FRAME_PROLOGUE_LEN,
                },
-               media_fetch: Prologue {
-                  pattern: MEDIA_FETCH_PROLOGUE,
-                  len:     MEDIA_FETCH_PROLOGUE_LEN,
-               },
                asset_load:  Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               emoji_check: Prologue {
-                  pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
-                  len:     14,
-               },
-               // `push rbp; push rsi; sub rsp, imm32; lea rbp, [rsp + imm32]`.
-               ready_parse: Some(Prologue {
-                  pattern: Pattern::new("55 56 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
-                  len:     17,
-               }),
-               ready_text:  Some(Prologue {
-                  pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
-                  len:     15,
-               }),
             }
          },
          Abi::SysV => {
             Self {
                row:         SYSV_FRAME,
                frame:       SYSV_FRAME,
-               media_fetch: SYSV_FRAME,
                // Four pushes and `sub rsp, imm32`.
                asset_load:  Prologue {
                   pattern: Pattern::new("41 57 41 56 41 54 53 48 81 EC ?? ?? ?? ??"),
                   len:     14,
                },
-               emoji_check: Prologue {
-                  pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
-                  len:     14,
-               },
-               ready_parse: None,
-               ready_text:  None,
             }
          },
       }
@@ -996,142 +964,6 @@ pub fn dave_downgrade_allow(image: &Image<'_>) -> Found<usize> {
    Ok(one("DAVE version check", &image.scan(check))? + 4)
 }
 
-/// The id the DM list gives its pending friend requests badge.
-pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
-/// The id the DM list gives its message requests badge.
-pub const MESSAGE_REQUESTS_BADGE: &[u8] = b"dm-message-requests-badge";
-
-/// What draws Phoenix's pending friend and message request counts.
-#[derive(Clone, Debug)]
-pub struct PendingCounts {
-   /// The DM list's row badge, `fn(out, id: &str, count: u32, _, _) -> out`,
-   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only. Linux
-   /// builds give each id its own copy of it.
-   pub badges:          Vec<usize>,
-   /// `u32 f(&RelationshipStore)`, the incoming friend and game friend
-   /// requests the DM list's Friends row and the inbox's Friends tab show.
-   pub friend_requests: usize,
-}
-
-/// The DM list draws both badges through one builder, each call just after the
-/// `lea` of its id. The friends count comes from the call whose `eax` the
-/// count argument was copied from.
-pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
-   let (friends_call, badge) = badge_call(image, FRIENDS_BADGE)?;
-   let (_, requests_badge) = badge_call(image, MESSAGE_REQUESTS_BADGE)?;
-   let badges = if badge == requests_badge {
-      vec![badge]
-   } else if same_shape(image, badge, requests_badge) {
-      vec![badge, requests_badge]
-   } else {
-      return Err(format!(
-         "the DM badges are drawn by {badge:#x} and {requests_badge:#x}"
-      ));
-   };
-   let friend_requests = count_source(image, friends_call)?;
-   function_code(image, friend_requests, "friend requests count")?;
-   if !counts_incoming(image, friend_requests) {
-      return Err(format!(
-         "friend requests count at {friend_requests:#x} compares no type with 3"
-      ));
-   }
-   Ok(PendingCounts {
-      badges,
-      friend_requests,
-   })
-}
-
-/// Whether `first` and `second` run the same instructions, whatever they
-/// branch to or call. Each copy of a generic calls its own copies of others.
-fn same_shape(image: &Image<'_>, first: usize, second: usize) -> bool {
-   let shape = |func: usize| {
-      function_code(image, func, "").map(|code| {
-         phoenix_hook::x86::disasm(code, func, usize::MAX)
-            .into_iter()
-            .map(|line| {
-               match line.target {
-                  Some(_) => line.text.split(' ').next().unwrap_or_default().to_owned(),
-                  None => line.text,
-               }
-            })
-            .collect::<Vec<String>>()
-      })
-   };
-   matches!((shape(first), shape(second)), (Ok(first), Ok(second)) if first == second)
-}
-
-/// `u32 f(&RelationshipStore)`, the number on the Home button.
-///
-/// It adds the DM mentions to the friend requests `friend_requests` counts,
-/// inlined but for its one call, which counts the game friend requests. The
-/// Home button is the other caller of that which counts incoming requests and
-/// returns a plain count.
-pub fn home_count(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
-   let game_requests = game_requests(image, friend_requests)?;
-   let counts = callers(image, game_requests)
-      .into_iter()
-      .filter(|&func| {
-         func != friend_requests && !returns_badge(image, func) && counts_incoming(image, func)
-      })
-      .collect::<Vec<_>>();
-   one("Home count", &counts)
-}
-
-/// `(state, count) f(&Store, _)`, a badge built from the same counts as
-/// [`home_count`].
-///
-/// State 2 is a count, state 1 an unread dot. The badge is the caller of the
-/// game friend requests count which returns a count in `edx`.
-pub fn home_badge(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
-   let game_requests = game_requests(image, friend_requests)?;
-   let badges = callers(image, game_requests)
-      .into_iter()
-      .filter(|&func| func != friend_requests && returns_badge(image, func))
-      .collect::<Vec<_>>();
-   one("Home badge", &badges)
-}
-
-/// The one call `friend_requests` makes, which counts the game friend requests.
-fn game_requests(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
-   let calls = straight_calls(image, friend_requests);
-   let [(_, game_requests)] = calls[..] else {
-      return Err(format!(
-         "friend requests count at {friend_requests:#x} makes {} calls, not 1",
-         calls.len()
-      ));
-   };
-   Ok(game_requests)
-}
-
-/// Whether `func` compares a relationship type with 3, an incoming request, as
-/// it opens.
-fn counts_incoming(image: &Image<'_>, func: usize) -> bool {
-   function_code(image, func, "").is_ok_and(|code| {
-      phoenix_hook::x86::disasm(code, func, 0x80)
-         .iter()
-         .any(|line| line.text.starts_with("cmp byte ptr [") && line.text.ends_with("],3"))
-   })
-}
-
-/// Whether `func` can answer state 2 in `eax` and sets `edx` just before its
-/// epilogue.
-fn returns_badge(image: &Image<'_>, func: usize) -> bool {
-   let Ok(code) = function_code(image, func, "") else {
-      return false;
-   };
-   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
-   let Some(ret) = lines.iter().position(|line| line.text == "ret") else {
-      return false;
-   };
-   let body = &lines[..ret];
-   let sets_count = body
-      .iter()
-      .rev()
-      .find(|line| !line.text.starts_with("pop ") && !line.text.starts_with("add rsp,"))
-      .is_some_and(|line| line.text.starts_with("mov edx,"));
-   sets_count && body.iter().any(|line| line.text == "mov eax,2")
-}
-
 /// The one `lea` of the UI id `id`.
 fn id_lea(image: &Image<'_>, id: &[u8]) -> Found<usize> {
    // The ids are packed back to back without a NUL, so `literal` misses them.
@@ -1143,124 +975,12 @@ fn id_lea(image: &Image<'_>, id: &[u8]) -> Found<usize> {
    one(&format!("{} lea", String::from_utf8_lossy(id)), &leas)
 }
 
-/// The site and callee of the `call` that draws the badge with id `id`, the
-/// first after the `lea` of the id.
-fn badge_call(image: &Image<'_>, id: &[u8]) -> Found<(usize, usize)> {
-   let lea = id_lea(image, id)?;
-   calls_in(image, lea, 0x40).first().copied().ok_or_else(|| {
-      format!(
-         "no call follows the {} lea at {lea:#x}",
-         String::from_utf8_lossy(id)
-      )
-   })
-}
-
-/// Follows the count argument of the `call` at `site` back through register
-/// copies to the call that returned it in `eax`.
-fn count_source(image: &Image<'_>, site: usize) -> Found<usize> {
-   let func = image
-      .function_containing(site)
-      .ok_or_else(|| format!("badge call at {site:#x} is in no function"))?;
-   let code = image
-      .read(func, site - func)
-      .ok_or_else(|| format!("DM list at {func:#x} is unmapped"))?;
-   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
-   let mut reg = reg32_name(Abi::of(image).arg(3));
-   for (at, line) in lines.iter().enumerate().rev() {
-      let Some(source) = line.text.strip_prefix(&format!("mov {reg},")) else {
-         continue;
-      };
-      if source != "eax" {
-         if source.contains('[') {
-            return Err(format!(
-               "the friends badge count is loaded from memory at {:#x}",
-               line.addr
-            ));
-         }
-         source.clone_into(&mut reg);
-         continue;
-      }
-      // Win64 pads calls that can unwind with a `nop`.
-      let before = lines[..at].iter().rev().find(|prev| prev.text != "nop");
-      return match before {
-         Some(call) if call.text.starts_with("call ") => {
-            call_target(image, &code[call.addr - func..], call.addr)
-               .map(|(_, target)| target)
-               .ok_or_else(|| format!("call at {:#x} has no target", call.addr))
-         },
-         _ => Err(format!("{reg} at {:#x} is no call's result", line.addr)),
-      };
-   }
-   Err(format!("the badge call at {site:#x} has no count source"))
-}
-
-/// The 32-bit name of a 64-bit general register, as the disassembly prints it.
-fn reg32_name(register: Register) -> String {
-   let name = reg_name(register);
-   match name.strip_prefix('r') {
-      Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("{name}d"),
-      Some(rest) => format!("e{rest}"),
-      None => name,
-   }
-}
-
-/// The `jmp [rip]` and 8-byte target [`Image::hook_entry`] writes.
-const ENTRY_JUMP_LEN: usize = 14;
-
-/// The whole instructions opening `func` that an absolute jump covers, for a
-/// hook on a function no fixed prologue describes.
-pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
-   let head = image
-      .read(func, 32)
-      .ok_or_else(|| format!("{func:#x} is unmapped"))?;
-   let mut len = 0;
-   for line in phoenix_hook::x86::disasm(head, func, head.len()) {
-      len += line.len;
-      if len < ENTRY_JUMP_LEN {
-         continue;
-      }
-      if !phoenix_hook::x86::relocatable(&head[..len], func) {
-         return Err(format!("{func:#x} opens with code that cannot move"));
-      }
-      let hex = head[..len]
-         .iter()
-         .map(|byte| format!("{byte:02X}"))
-         .collect::<Vec<_>>()
-         .join(" ");
-      let pattern = Pattern::leak(hex).ok_or("prologue bytes make no pattern")?;
-      return Ok(Prologue { pattern, len });
-   }
-   Err(format!("{func:#x} opens with less than a jump's bytes"))
-}
-
-/// How the runtime sends a function's calls to a detour.
-#[derive(Clone, Debug)]
-pub enum HookPoint {
-   /// Its opening instructions move to a trampoline.
-   Entry(Prologue),
-   /// Its opening cannot move, and code only reaches it through these slots.
-   /// The function itself stays callable as the original.
-   Slots(Vec<usize>),
-}
-
-/// [`entry_prologue`], or else the slots every call to `func` reads.
-pub fn hook_point(image: &Image<'_>, func: usize) -> Found<HookPoint> {
-   let entry = match entry_prologue(image, func) {
-      Ok(prologue) => return Ok(HookPoint::Entry(prologue)),
-      Err(err) => err,
-   };
-   if !image.rip_refs(func..func + 1).is_empty() {
-      return Err(entry);
-   }
-   let slots = image
-      .pointers_to(func)
-      .into_iter()
-      .filter(|&slot| !image.rip_refs(slot..slot + 1).is_empty())
-      .collect::<Vec<usize>>();
-   if slots.is_empty() {
-      return Err(format!("{entry}, and no code reads a pointer to it"));
-   }
-   Ok(HookPoint::Slots(slots))
+/// How many bytes of `func`'s opening `Image::hook_entry` moves to a
+/// trampoline, or why it cannot.
+pub fn entry_moved(image: &Image<'_>, func: usize) -> Found<usize> {
+   phoenix_hook::x86::displaced(image, func)
+      .map(|displaced| displaced.iter().map(iced_x86::Instruction::len).sum())
+      .map_err(|err| format!("{func:#x}: {err}"))
 }
 
 /// Page 23's sidebar name, `Developer Options`, and the immediate holding its
@@ -2891,6 +2611,27 @@ pub fn svg_builders(image: &Image<'_>) -> Found<SvgBuilders> {
    })
 }
 
+/// GPUI's `TextSystem::resolve_font(&self, font: &Font) -> FontId`, the one
+/// caller of the cold path that panics with `"failed to resolve font"`. Every
+/// font passes through it before GPUI's caches.
+pub fn resolve_font(image: &Image<'_>) -> Found<usize> {
+   // The message starts with a length byte, so the load can point before it.
+   let mut panics = image
+      .find_bytes(b"failed to resolve font")
+      .into_iter()
+      .flat_map(|text| [text - 1, text])
+      .flat_map(|at| lea_refs(image, at))
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
+      .collect::<Vec<_>>();
+   panics.sort_unstable();
+   panics.dedup();
+   let panic = one("resolve_font panic", &panics)?;
+   one(
+      "resolve_font",
+      &callers(image, panic).into_iter().collect::<Vec<_>>(),
+   )
+}
+
 /// Discord's asset loader, `(sret, path ptr, path len) -> Option<Vec<u8>>`.
 ///
 /// It ends at the bundle holding [`BUNDLED_SVG`]. The bundle sorts records
@@ -2943,100 +2684,6 @@ pub fn asset_load(image: &Image<'_>) -> Found<usize> {
 
 /// GPUI's renderer `draw(&mut self, scene: &Scene)`.
 ///
-/// Also where `Scene` keeps the primitive lists a theme recolors before they
-/// are drawn, each a `Vec` (`cap`, `ptr`, `len`) at the offset given.
-#[derive(Clone, Copy, Debug)]
-pub struct SceneDraw {
-   pub draw:     usize,
-   pub quads:    usize,
-   pub mono:     usize,
-   pub subpixel: usize,
-}
-
-/// [`SceneDraw`], from the renderer's error for a frame it cannot draw.
-///
-/// `"scene too large: {} paths, {} shadows, {} quads, ..."`. A closure formats
-/// it, reading each list's `len` off the scene, its second argument, in the
-/// order the template names them. `draw` is the closure's one caller.
-pub fn scene_draw(image: &Image<'_>) -> Found<SceneDraw> {
-   const ANCHOR: &[u8] = b"scene too large:";
-   if Abi::of(image) != Abi::Win64 {
-      return Err("scene draw locator requires Win64".to_owned());
-   }
-   let text = one("scene template", &image.find_bytes(ANCHOR))?;
-   // The template starts with a length byte, so the load can point before
-   // the text.
-   let loads = [text - 1, text]
-      .iter()
-      .flat_map(|&at| lea_refs(image, at))
-      .collect::<Vec<_>>();
-   let load = one("scene template load", &loads)?;
-   let (formatter, _) = image
-      .function_bounds(load)
-      .ok_or("scene formatter has no function bounds")?;
-
-   let tail = image
-      .read(text + ANCHOR.len(), 0x100)
-      .ok_or("scene template is unmapped")?;
-   let tail = &tail[..tail.iter().position(|&b| b == 0).unwrap_or(tail.len())];
-   let names = tail
-      .split(|b| !b.is_ascii_lowercase())
-      .filter(|name| !name.is_empty())
-      .collect::<Vec<_>>();
-
-   // `mov r64, [scene + disp32]`, the scene in the second argument register.
-   let (scene, scene_ext) = reg(Abi::of(image).arg(1));
-   let code = image
-      .read(formatter, load - formatter)
-      .ok_or("scene formatter is unmapped")?;
-   let lens = (0..code.len().saturating_sub(7))
-      .filter(|&at| {
-         code[at] & 0xFB == 0x48
-            && code[at] & 1 == scene_ext
-            && code[at + 1] == 0x8B
-            && code[at + 2] & 0xC7 == 0x80 | scene
-      })
-      .map(|at| {
-         u32::from_le_bytes([code[at + 3], code[at + 4], code[at + 5], code[at + 6]]) as usize
-      })
-      .collect::<Vec<_>>();
-   if lens.len() != names.len() {
-      return Err(format!(
-         "scene formatter reads {} lengths for {} names",
-         lens.len(),
-         names.len()
-      ));
-   }
-   let vec_of = |name: &[u8]| {
-      names
-         .iter()
-         .position(|&n| n == name)
-         .and_then(|i| lens[i].checked_sub(0x10))
-         .ok_or_else(|| format!("scene template has no {}", String::from_utf8_lossy(name)))
-   };
-
-   let sites = call_sites(image, |callee| callee == formatter);
-   let (site, _) = one("scene formatter call", &sites)?;
-   let (draw, end) = image
-      .function_bounds(site)
-      .ok_or("renderer draw has no function bounds")?;
-   let found = SceneDraw {
-      draw,
-      quads: vec_of(b"quads")?,
-      mono: vec_of(b"mono")?,
-      subpixel: vec_of(b"subpixel")?,
-   };
-   // `draw` walks the quads through their `ptr`, right before `len`.
-   let ptr = u32::try_from(found.quads + 8).map_err(|_| "quads offset overflows")?;
-   let body = image
-      .read(draw, end - draw)
-      .ok_or("renderer draw is unmapped")?;
-   if !body.windows(4).any(|w| w == ptr.to_le_bytes()) {
-      return Err(format!("renderer draw never reads the quads at {ptr:#x}"));
-   }
-   Ok(found)
-}
-
 /// The `jne rel32` that leaves the composer's Nitro gift button out.
 ///
 /// The composer fills an `Option` for the button: its block, after the
@@ -3351,126 +2998,6 @@ fn toolbar_append(
       return None;
    }
    imm32(image, append_fn + at + 60)
-}
-
-/// `serde_json::from_slice::<Ready>`, `fn(out, &mut SliceRead)`, the first
-/// call of the `READY` handler. Phoenix's session parses READY with it too,
-/// past the registry, so a hook here sees every READY.
-pub fn ready_parse(image: &Image<'_>, ready: usize) -> Found<usize> {
-   let prologue = prologues(image)
-      .ready_parse
-      .ok_or("READY's parse is only known on Win64")?;
-   let &(_, parse) = calls_in(image, ready, 0x80)
-      .first()
-      .ok_or_else(|| format!("READY handler at {ready:#x} makes no call"))?;
-   if prologue.at(image, parse) {
-      Ok(parse)
-   } else {
-      Err(format!(
-         "READY's first call at {parse:#x} opens unlike its parse"
-      ))
-   }
-}
-
-/// The session's READY parse for text under 2 MB, `fn(out, ptr, len) -> out`:
-/// the caller of [`ready_parse`] that builds its reader from the text it takes.
-///
-/// ```text
-/// push r14; push rsi; push rdi; push rbx; sub rsp, imm32; mov rdi, r8
-/// ...
-/// mov [rsp + 0x20], rdx; mov [rsp + 0x28], r8
-/// ```
-pub fn ready_text(image: &Image<'_>, parse: usize) -> Found<usize> {
-   const READER: Pattern = Pattern::new("48 89 54 24 20 4C 89 44 24 28");
-   let prologue = prologues(image)
-      .ready_text
-      .ok_or("READY's text parse is only known on Win64")?;
-   let mut callers = call_sites(image, |callee| callee == parse)
-      .into_iter()
-      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
-      .filter(|&func| {
-         prologue.at(image, func)
-            && image
-               .read(func, 0x40)
-               .is_some_and(|head| !READER.find_in(head).is_empty())
-      })
-      .collect::<Vec<_>>();
-   callers.sort_unstable();
-   callers.dedup();
-   one("READY text parse", &callers)
-}
-
-/// Phoenix's session READY handler, `fn(out, payload)`, which owns the gateway
-/// payload and parses READY itself, past the registry.
-#[derive(Clone, Copy, Debug)]
-pub struct ReadySession {
-   pub func:     usize,
-   /// The payload's kind byte, and the kind whose READY is parsed from the raw
-   /// text. Other kinds carry the gateway's own parse of it.
-   pub kind:     usize,
-   pub raw_kind: u8,
-   /// The raw text's pointer and length.
-   pub raw:      usize,
-   pub raw_len:  usize,
-}
-
-/// The caller of [`ready_parse`] that opens by checking the payload's kind:
-///
-/// ```text
-/// cmp byte ptr [rdx + kind], raw_kind ; 80 BA <kind> <raw_kind>
-/// jne value                           ; 0F 85 <rel32>
-/// mov rdi, [rdx + raw]                ; 48 8B BA <raw>
-/// mov rbx, [rdx + raw_len]            ; 48 8B 9A <raw_len>
-/// ```
-pub fn ready_session(image: &Image<'_>, parse: usize) -> Found<ReadySession> {
-   const CHECK: Pattern = Pattern::new(
-      "80 BA ?? ?? ?? ?? ?? 0F 85 ?? ?? ?? ?? 48 8B BA ?? ?? ?? ?? 48 8B 9A ?? ?? ?? ??",
-   );
-   let disp = |bytes: &[u8], at: usize| {
-      bytes
-         .get(at..at + 4)
-         .and_then(|word| Some(u32::from_le_bytes(word.try_into().ok()?) as usize))
-   };
-   let mut callers = call_sites(image, |callee| callee == parse)
-      .into_iter()
-      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
-      .collect::<Vec<_>>();
-   callers.sort_unstable();
-   callers.dedup();
-   let mut found = Vec::new();
-   for func in callers {
-      if !prologues(image).row.at(image, func) {
-         continue;
-      }
-      let Some(head) = image.read(func, 0x100) else {
-         continue;
-      };
-      let Some(&at) = CHECK.find_in(head).first() else {
-         continue;
-      };
-      let check = &head[at..];
-      if let (Some(kind), Some(raw), Some(raw_len)) =
-         (disp(check, 2), disp(check, 16), disp(check, 23))
-      {
-         found.push(ReadySession {
-            func,
-            kind,
-            raw_kind: check[6],
-            raw,
-            raw_len,
-         });
-      }
-   }
-   match found.as_slice() {
-      [session] if session.raw_len == session.raw + 8 => Ok(*session),
-      [session] => {
-         Err(format!(
-            "READY session at {:#x} reads no &str",
-            session.func
-         ))
-      },
-      _ => Err(format!("{} READY sessions", found.len())),
-   }
 }
 
 /// `MessageContextMenu` builder and native `MenuItem` helpers for injecting
@@ -4111,11 +3638,6 @@ pub struct LinuxPrimaryDisplay {
    pub primary_display: usize,
    pub displays:        usize,
 }
-
-pub const LINUX_PRIMARY_DISPLAY_PROLOGUE: Prologue = Prologue {
-   pattern: Pattern::new("41 57 41 56 53 48 83 EC ?? 48 B8 FF FF FF FF FF FF FF 7F"),
-   len:     19,
-};
 
 pub fn linux_primary_display(image: &Image<'_>) -> Found<LinuxPrimaryDisplay> {
    const PRIMARY: Pattern = Pattern::new(

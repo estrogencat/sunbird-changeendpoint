@@ -1,6 +1,7 @@
 //! The desktop share of the `phoenix` object: `phoenix.ui` and message
 //! accessories, and `phoenix.native` for the console.
 
+pub mod fonts;
 pub mod native;
 pub mod themes;
 pub mod ui;
@@ -17,15 +18,18 @@ use rquickjs::{
    JsLifetime,
 };
 
-#[cfg(target_arch = "x86_64")]
-use crate::counts::{
-   self,
-   Count,
-};
 use crate::{
    accessories,
+   call_idle::{
+      self,
+      Timer,
+   },
    composer,
    context_menu,
+   counts::{
+      self,
+      Count,
+   },
    double_click,
    emoji,
    js::ui::{
@@ -36,6 +40,10 @@ use crate::{
    members::Place,
    shortcuts,
    sidebar,
+   spotify::{
+      self,
+      Tweak,
+   },
    toolbar,
 };
 
@@ -64,13 +72,16 @@ pub struct Desktop<'js> {
    pub hides:          RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.collapseChannels` holds by id and plugin.
    pub collapses:      RefCell<Vec<(u64, String)>>,
+   /// `phoenix.spotify` holds by id, plugin and tweak.
+   pub spotify:        RefCell<Vec<(u64, String, Tweak)>>,
    /// `phoenix.ui.addHeaderButton` handlers by id and plugin.
    pub header_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.addShortcut` handlers by id and plugin.
    pub shortcuts:      RefCell<Vec<(u64, String, Shortcut, Function<'js>)>>,
    /// `phoenix.ui.hideCount` holds by id and plugin.
-   #[cfg(target_arch = "x86_64")]
    pub hidden_counts:  RefCell<Vec<(u64, String, Count)>>,
+   /// `phoenix.ui.disableCallIdle` holds by id and plugin.
+   pub idle_off:       RefCell<Vec<(u64, String, Timer)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -89,9 +100,9 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, banners, emoji pick handlers, hidden counts, sidebar collapses,
-/// header buttons and shortcuts `name` registered and redraws Discord without
-/// them.
+/// callbacks, banners, emoji pick handlers, hidden counts, call idle holds,
+/// sidebar collapses, header buttons and shortcuts `name` registered and
+/// redraws Discord without them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -162,6 +173,14 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       !held
    });
 
+   registry.spotify.borrow_mut().retain(|&(_, ref plugin, tweak)| {
+      let held = plugin == name;
+      if held {
+         spotify::release(tweak);
+      }
+      !held
+   });
+
    registry
       .header_buttons
       .borrow_mut()
@@ -184,12 +203,14 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
          !held
       });
 
-   #[cfg(target_arch = "x86_64")]
-   {
-      let mut hidden = registry.hidden_counts.borrow_mut();
-      hidden.retain(|(_, plugin, _)| plugin != name);
-      counts::hide(hidden.iter().map(|&(.., count)| count));
-   }
+   let mut hidden = registry.hidden_counts.borrow_mut();
+   hidden.retain(|(_, plugin, _)| plugin != name);
+   counts::hide(hidden.iter().map(|&(.., count)| count));
 
+   let mut off = registry.idle_off.borrow_mut();
+   off.retain(|(_, plugin, _)| plugin != name);
+   call_idle::turn_off(off.iter().map(|&(.., timer)| timer));
+
+   fonts::unload(name);
    themes::unload(name);
 }

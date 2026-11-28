@@ -4,10 +4,7 @@ use std::{
    sync::{Mutex, OnceLock, PoisonError},
 };
 
-use phoenix_hook::{
-   image::Image,
-   x86::{self, Abi},
-};
+use phoenix_hook::{image::Image, x86};
 use phoenix_sigs::desktop;
 
 use crate::servers;
@@ -40,14 +37,11 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
-   let prologue = desktop::Prologues::of(Abi::of(image)).frame;
    // SAFETY: runs from `prepare` before Discord's threads, and `detour` takes
    // the switch's seven arguments and returns what it returns.
    let trampoline = match unsafe {
       image.hook_entry(
          func,
-         prologue.pattern,
-         prologue.len,
          detour as *const () as usize,
       )
    } {

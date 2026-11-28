@@ -56,10 +56,8 @@ struct Watch {
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
 pub fn install(image: &Image<'static>) {
-   let found = desktop::network_watch(image).and_then(|found| {
-      desktop::entry_prologue(image, found.connection).map(|prologue| (found, prologue))
-   });
-   let (found, prologue) = match found {
+   let found = desktop::network_watch(image);
+   let found = match found {
       Ok(found) => found,
       Err(err) => {
          log::warn!("net refresh: {err}, images may stall after long idle");
@@ -84,8 +82,6 @@ pub fn install(image: &Image<'static>) {
    let trampoline = match unsafe {
       image.hook_entry(
          found.connection,
-         prologue.pattern,
-         prologue.len,
          connection_detour as *const () as usize,
       )
    } {

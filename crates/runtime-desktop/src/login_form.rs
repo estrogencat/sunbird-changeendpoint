@@ -1,9 +1,6 @@
 use std::{ffi::c_void, sync::OnceLock};
 
-use phoenix_hook::{
-   image::Image,
-   x86::{self, Abi},
-};
+use phoenix_hook::{image::Image, x86};
 use phoenix_sigs::desktop;
 
 use crate::{
@@ -32,14 +29,11 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
-   let prologue = desktop::Prologues::of(Abi::of(image)).frame;
    // SAFETY: runs from `prepare` before Discord's threads, and `detour` has the
    // form builder's six-argument sret ABI.
    let trampoline = match unsafe {
       image.hook_entry(
          func,
-         prologue.pattern,
-         prologue.len,
          detour as *const () as usize,
       )
    } {

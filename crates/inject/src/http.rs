@@ -22,6 +22,7 @@ use misstep::ResultExt as _;
 const ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
 const FLAG_SECURE: u32 = 0x0080_0000;
 const QUERY_STATUS_CODE_NUMBER: u32 = 0x13 | 0x2000_0000;
+const OPTION_IPV6_FAST_FALLBACK: u32 = 140;
 /// How long a read may wait on a silent connection.
 const STALL: Duration = Duration::from_secs(30);
 
@@ -42,6 +43,7 @@ unsafe extern "system" {
       send: i32,
       receive: i32,
    ) -> i32;
+   fn WinHttpSetOption(handle: *mut c_void, option: u32, buffer: *const c_void, len: u32) -> i32;
    fn WinHttpConnect(
       session: *mut c_void,
       host: *const u16,
@@ -192,6 +194,17 @@ fn get(
       },
       "WinHttpSetTimeouts",
    )?;
+   let fast_fallback = 1u32;
+   // Older Windows rejects the option, so the result is ignored.
+   // SAFETY: a live session and a 4-byte BOOL.
+   unsafe {
+      WinHttpSetOption(
+         session.0,
+         OPTION_IPV6_FAST_FALLBACK,
+         (&raw const fast_fallback).cast(),
+         4,
+      );
+   }
    let host = wide(target.host);
    // SAFETY: a live session and a NUL-terminated host.
    let connect = Handle::new(

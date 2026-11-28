@@ -88,10 +88,8 @@ fn has_icon(id: u64) -> bool {
 }
 
 pub fn install(image: &Image<'static>) {
-   let found = desktop::channel_row_picture(image).and_then(|found| {
-      desktop::entry_prologue(image, found.lookup).map(|prologue| (found, prologue))
-   });
-   let (found, prologue) = match found {
+   let found = desktop::channel_row_picture(image);
+   let found = match found {
       Ok(found) => found,
       Err(err) => {
          log::warn!("channel icons: {err}, keeping Phoenix's");
@@ -109,8 +107,6 @@ pub fn install(image: &Image<'static>) {
    let trampoline = match unsafe {
       image.hook_entry(
          found.lookup,
-         prologue.pattern,
-         prologue.len,
          detour as *const () as usize,
       )
    } {
@@ -128,10 +124,9 @@ pub fn install(image: &Image<'static>) {
 }
 
 fn hook(image: &Image<'static>, func: usize, detour: usize) -> Result<usize, String> {
-   let prologue = desktop::entry_prologue(image, func)?;
    // SAFETY: each detour takes and returns what the function it replaces
    // does.
-   unsafe { image.hook_entry(func, prologue.pattern, prologue.len, detour) }
+   unsafe { image.hook_entry(func, detour) }
       .map_err(|err| err.to_string())
 }
 

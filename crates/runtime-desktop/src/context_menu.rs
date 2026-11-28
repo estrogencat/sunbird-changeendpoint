@@ -310,7 +310,6 @@ pub fn install(image: &Image<'static>) {
    let Some(orig_build) = (unsafe {
       crate::hook::<BuildMenuFn>(
          image,
-         |pro| pro.row,
          menu.build_fn,
          build_context_menu_detour as *const () as usize,
          "desktop context menu: hook failed",
@@ -625,7 +624,6 @@ mod arm64 {
       let Some(orig) = (unsafe {
          crate::hook::<BuildFn>(
             image,
-            |pro| pro.frame,
             menu.build_fn,
             detour as *const () as usize,
             "desktop context menu: hook failed",

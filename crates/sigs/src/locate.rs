@@ -2,13 +2,22 @@
 //! every binary of its [`Family`], whatever the ISA.
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod call_idle;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod counts;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod message;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod ready;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod settings;
+pub mod spotify;
 pub mod staff;
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod gpui;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod mana_theme;
 
 use crate::{
    Found,
@@ -16,6 +25,7 @@ use crate::{
       Func,
       Index,
       Op,
+      Step,
    },
 };
 
@@ -50,6 +60,16 @@ pub const LOCATORS: &[Locator] = &[
       name:     "media fetch",
       families: DESKTOP,
       run:      |ix| media_fetch(ix).map(|func| format!("{func:?}")),
+   },
+   Locator {
+      name:     "spotify auto pause",
+      families: DESKTOP,
+      run:      |ix| spotify::auto_pause(ix).map(|patch| format!("{patch:x?}")),
+   },
+   Locator {
+      name:     "spotify idle activity",
+      families: DESKTOP,
+      run:      |ix| spotify::idle_activity(ix).map(|patch| format!("{patch:x?}")),
    },
    #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
    Locator {
@@ -154,6 +174,44 @@ pub const LOCATORS: &[Locator] = &[
    },
    #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
    Locator {
+      name:     "mana theme",
+      families: DESKTOP,
+      run:      |ix| {
+         mana_theme::mana_theme(ix).and_then(|found| {
+            Ok(format!(
+               "set_global {}, pool {:#x}, sync {:#x}, drop {:#x}, size {:#x}, get_mut {:#x}, \
+                colors {:#x}, {:x?}",
+               hookable(ix, found.set_global)?,
+               found.sync_pool,
+               found.sync_theme,
+               found.drop_in_place,
+               found.size,
+               found.get_mut,
+               found.colors_size,
+               found.layout,
+            ))
+         })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "scene draw",
+      families: DESKTOP,
+      run:      |ix| {
+         mana_theme::scene_draw(ix).and_then(|found| {
+            Ok(format!(
+               "draw {}, quads +{:#x}, shadows {}",
+               hookable(ix, found.draw)?,
+               found.quads,
+               found
+                  .shadows
+                  .map_or_else(|| "off".to_owned(), |at| format!("+{at:#x}"))
+            ))
+         })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
       name:     "optimistic delete",
       families: DESKTOP,
       run:      |ix| {
@@ -165,6 +223,94 @@ pub const LOCATORS: &[Locator] = &[
                found.sibling
             )
          })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "call idle",
+      families: DESKTOP,
+      run:      |ix| {
+         let dm = call_idle::dm_idle(ix)?;
+         let afk = call_idle::guild_afk(ix)?;
+         Ok(format!(
+            "dm {}, afk move {}, afk disconnect {}",
+            hookable(ix, dm)?,
+            hookable(ix, afk.move_poll)?,
+            hookable(ix, afk.disconnect_poll)?
+         ))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "pending counts",
+      families: DESKTOP,
+      run:      |ix| {
+         let found = counts::pending_counts(ix)?;
+         let badges = found
+            .badges
+            .iter()
+            .map(|&badge| hookable(ix, badge))
+            .collect::<Found<Vec<String>>>()?;
+         Ok(format!(
+            "badges {}, friend requests {}",
+            badges.join(", "),
+            hookable(ix, found.friend_requests)?
+         ))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "home count",
+      families: DESKTOP,
+      run:      |ix| {
+         let found = counts::pending_counts(ix)?;
+         hookable(ix, counts::home_count(ix, found.friend_requests)?)
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "home badge",
+      families: DESKTOP,
+      run:      |ix| {
+         let found = counts::pending_counts(ix)?;
+         hookable(ix, counts::home_badge(ix, found.friend_requests)?)
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "relationship counts",
+      families: DESKTOP,
+      run:      |ix| {
+         counts::relationship_counts(ix)?
+            .into_iter()
+            .map(|tally| hookable(ix, tally))
+            .collect::<Found<Vec<String>>>()
+            .map(|tallies| tallies.join(", "))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "ready text",
+      families: DESKTOP,
+      run:      |ix| {
+         let parse = ready_parse(ix)?;
+         hookable(ix, ready::ready_text(ix, &parse)?)
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "ready session",
+      families: DESKTOP,
+      run:      |ix| {
+         let parse = ready_parse(ix)?;
+         let session = ready::ready_session(ix, &parse)?;
+         Ok(format!(
+            "{} (kind +{:#x} = {}, raw +{:#x})",
+            hookable(ix, session.func)?,
+            session.kind,
+            session.raw_kind,
+            session.raw
+         ))
       },
    },
 ];
@@ -213,19 +359,18 @@ pub struct EmojiCheck {
 pub fn emoji_check(ix: &Index<'_>) -> Found<EmojiCheck> {
    const HEAD: usize = 8;
    let context = ix.isa.arg(1).ok_or("no second argument register")?;
-   let checks = ix.heads(HEAD, |head| {
-      let [first, rest @ ..] = head else {
-         return false;
-      };
-      let ops = rest.iter().map(|step| step.op);
-      matches!(first.op, Op::Load { base, size: 1, .. } if base == context)
-         && ops
-            .clone()
-            .any(|op| matches!(op, Op::Cmp { value: 14, .. }))
-         && ops.clone().any(|op| matches!(op, Op::Imm { value: 3, .. }))
-         && ops.clone().any(|op| op == Op::Ret)
-         && ops.clone().any(|op| matches!(op, Op::Branch(_)))
-   });
+   let opens = |step: &Step| matches!(step.op, Op::Load { base, size: 1, .. } if base == context);
+   // Rejecting on the first instruction keeps the scan of every function to one decode each.
+   let checks = ix
+      .heads(1, |head| head.first().is_some_and(opens))
+      .filter(|func| {
+         let head = func.head(HEAD);
+         let ops = head.iter().skip(1).map(|step| step.op);
+         ops.clone().any(|op| matches!(op, Op::Cmp { value: 14, .. }))
+            && ops.clone().any(|op| matches!(op, Op::Imm { value: 3, .. }))
+            && ops.clone().any(|op| op == Op::Ret)
+            && ops.clone().any(|op| matches!(op, Op::Branch(_)))
+      });
    let func = checks.one("emoji check")?;
    let Some(Op::Load { offset, .. }) = func.steps().first().map(|step| step.op) else {
       return Err(format!("emoji check at {func:?} reads no context byte"));
@@ -237,15 +382,47 @@ pub fn emoji_check(ix: &Index<'_>) -> Found<EmojiCheck> {
    })
 }
 
+/// [`ready::ready_parse`] from the registry's READY handler.
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+fn ready_parse<'ix>(ix: &'ix Index<'ix>) -> Found<Func<'ix>> {
+   let registry = ix.registry()?;
+   let id = registry.id("READY").ok_or("the registry has no READY")?;
+   ready::ready_parse(ix, registry.entry(id).handler)
+}
+
 /// `func` with the whole instructions an x86-64 entry hook displaces there.
 /// arm64 hooks always displace four.
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 fn hookable(ix: &Index<'_>, func: usize) -> Found<String> {
    match ix.isa {
       crate::index::Isa::X86_64 { .. } => {
-         crate::desktop::entry_prologue(ix.image, func)
-            .map(|prologue| format!("{func:#x} (prologue {})", prologue.len))
+         crate::desktop::entry_moved(ix.image, func)
+            .map(|moved| format!("{func:#x} ({moved} bytes moved)"))
       },
-      _ => Ok(format!("{func:#x}")),
+      _ => entry_hookable(ix, func).map(|()| format!("{func:#x}")),
    }
+}
+
+/// Whether sunhook can hook `func`'s entry. On arm64 it jumps back from the
+/// moved opening through `x17`, or `x16` when the opening sets `x17`, so an
+/// opening that sets both has no register left for the jump.
+pub fn entry_hookable(ix: &Index<'_>, func: usize) -> Found<()> {
+   /// The instructions an arm64 entry hook displaces.
+   const DISPLACED: usize = 4;
+   /// `x16` and `x17`.
+   const SCRATCH: u32 = 3 << 16;
+   if ix.isa != crate::index::Isa::Aarch64 {
+      return Ok(());
+   }
+   let sets = ix
+      .func(func)?
+      .head(DISPLACED)
+      .iter()
+      .fold(0, |seen, step| seen | step.writes & SCRATCH);
+   if sets == SCRATCH {
+      return Err(format!(
+         "{func:#x} sets x16 and x17 as it opens, leaving sunhook no register to jump back through"
+      ));
+   }
+   Ok(())
 }
