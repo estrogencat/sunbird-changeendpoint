@@ -133,7 +133,8 @@ pub fn media_url(url: &str) -> Option<String> {
    }
    let installed = INSTALLED.get()?;
    let (cdn, media) = if servers::routes().active() {
-      let server = servers::media_server()?;
+      let server = signed_in_owner(url)
+         .map_or_else(servers::media_server, servers::media_server_of)?;
       (server.cdn, server.media)
    } else {
       (installed.target.cdn.clone(), installed.target.media.clone())
@@ -153,6 +154,19 @@ pub fn media_url(url: &str) -> Option<String> {
          log::info!("endpoints: first media fetch rewritten to {rewritten}");
       }
    })
+}
+
+/// The signed-in account a user image belongs to. The account switcher shows
+/// every account's avatar while another one is on screen.
+fn signed_in_owner(url: &str) -> Option<servers::Identity> {
+   let path = url.strip_prefix("https://cdn.discordapp.com/")?;
+   let mut parts = path.split('/');
+   let user = match parts.next()? {
+      "avatars" | "banners" => parts.next()?,
+      "guilds" => parts.nth(2)?,
+      _ => return None,
+   };
+   servers::identity_of_user(user.parse().ok()?)
 }
 
 const DISCORD_APP_ASSETS: [&str; 2] = [

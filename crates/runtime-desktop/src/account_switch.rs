@@ -22,6 +22,7 @@ type SwitchFn = unsafe extern "C" fn(
 static ORIGINAL: OnceLock<SwitchFn> = OnceLock::new();
 
 const ACCOUNT_SIZE: usize = 48;
+const USER_WORD: usize = 3;
 
 /// Account numbers and whose they are, learned this session. Phoenix renumbers
 /// accounts on restart.
@@ -84,6 +85,13 @@ fn account_index(account: *const u8) -> Option<usize> {
    Some(usize::from_le_bytes(*last)).filter(|&index| index < 64)
 }
 
+/// The record's fourth word is the account's user ID.
+fn account_user(account: *const u8) -> Option<u64> {
+   let bytes = x86::read_memory(account as usize, ACCOUNT_SIZE)?;
+   let word = bytes.as_chunks::<8>().0.get(USER_WORD)?;
+   Some(u64::from_le_bytes(*word)).filter(|&id| id != 0)
+}
+
 unsafe extern "C" fn detour(
    app: *mut c_void,
    account: *const u8,
@@ -93,17 +101,23 @@ unsafe extern "C" fn detour(
    c: usize,
    d: usize,
 ) -> usize {
-   let index = if account.is_null() {
-      None
+   let (index, user) = if account.is_null() {
+      (None, None)
    } else {
-      account_index(account)
+      (account_index(account), account_user(account))
    };
    if let Some(index) = index {
-      let known = KNOWN
-         .lock()
-         .unwrap_or_else(PoisonError::into_inner)
-         .as_ref()
-         .and_then(|known| known.get(&index).copied());
+      let named = user.and_then(servers::identity_of_user);
+      if let Some(identity) = named {
+         learn(index, identity);
+      }
+      let known = named.or_else(|| {
+         KNOWN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|known| known.get(&index).copied())
+      });
       if let Some(identity) = known {
          servers::set_viewer(identity);
       }

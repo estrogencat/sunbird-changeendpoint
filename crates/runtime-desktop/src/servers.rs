@@ -225,6 +225,7 @@ static LEGACY: OnceLock<Server> = OnceLock::new();
 static ROUTES: Mutex<Option<(Option<SystemTime>, Arc<Routes>)>> = Mutex::new(None);
 static ACTIVE: Mutex<Option<(Option<SystemTime>, Option<u64>)>> = Mutex::new(None);
 static VIEWER: Mutex<Option<Identity>> = Mutex::new(None);
+static SEEN: Mutex<BTreeMap<u64, Identity>> = Mutex::new(BTreeMap::new());
 
 fn viewer_file() -> PathBuf {
    crate::endpoints::data_dir().join("sunbird").join("viewer")
@@ -429,12 +430,43 @@ fn active_user() -> Option<u64> {
    user
 }
 
-pub fn identity(authorization: &str) -> Identity {
-   let token = authorization
+fn bare_token(authorization: &str) -> &str {
+   authorization
       .strip_prefix("Bearer ")
       .or_else(|| authorization.strip_prefix("Bot "))
       .unwrap_or(authorization)
-      .trim();
+      .trim()
+}
+
+/// Notes whose account each signed-in user is, so a switch to one can pick
+/// its image server before it loads anything.
+fn remember(authorization: &str, who: Identity) {
+   let user = match who {
+      Identity::Jwt(id) => Some(id),
+      Identity::Discord => discord_user_id(bare_token(authorization)),
+      Identity::Unreadable => None,
+   };
+   if let Some(user) = user {
+      SEEN.lock().unwrap_or_else(PoisonError::into_inner).insert(user, who);
+   }
+}
+
+/// Discord tokens open with the user ID in base64.
+fn discord_user_id(token: &str) -> Option<u64> {
+   let first = token.split('.').next()?;
+   std::str::from_utf8(&base64url(first.as_bytes())?).ok()?.parse().ok()
+}
+
+/// Whose account `user` is, once it is linked or has made a request.
+pub fn identity_of_user(user: u64) -> Option<Identity> {
+   if routes().accounts.contains_key(&user) {
+      return Some(Identity::Jwt(user));
+   }
+   SEEN.lock().unwrap_or_else(PoisonError::into_inner).get(&user).copied()
+}
+
+pub fn identity(authorization: &str) -> Identity {
+   let token = bare_token(authorization);
    let mut parts = token.split('.');
    let header = parts.next().unwrap_or_default();
    let is_jwt = base64url(header.as_bytes())
@@ -558,6 +590,9 @@ pub fn route(method: &str, url: &str, authorization: Option<&str>) -> Route {
       return Route::Keep;
    };
    let who = authorization.map(identity);
+   if let (Some(authorization), Some(who)) = (authorization, who) {
+      remember(authorization, who);
+   }
    if let Some(viewer @ (Identity::Discord | Identity::Jwt(_))) = who
       && loads_history(method, rest)
    {
@@ -626,11 +661,18 @@ pub fn gateway_for(token: &str) -> Option<Gateway> {
    }
 }
 
+/// The server `identity`'s images come from, `None` for Discord's.
+pub fn media_server_of(identity: Identity) -> Option<Server> {
+   match identity {
+      Identity::Jwt(id) => routes().of_user(id).or_else(|| LEGACY.get()).cloned(),
+      Identity::Discord | Identity::Unreadable => None,
+   }
+}
+
 pub fn media_server() -> Option<Server> {
    let routes = routes();
    match viewer() {
-      Some(Identity::Jwt(id)) => return routes.of_user(id).or_else(|| LEGACY.get()).cloned(),
-      Some(Identity::Discord) => return None,
+      Some(identity @ (Identity::Jwt(_) | Identity::Discord)) => return media_server_of(identity),
       Some(Identity::Unreadable) | None => {},
    }
    match active_user() {
