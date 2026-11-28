@@ -25,6 +25,7 @@ license = "EUPL-1.2"
 version = "0.3.1"
 
 [workspace.dependencies]
+aes-gcm                 = { features = [ "getrandom" ], version = "0.10" }
 android_logger          = { default-features = false, version = "0.15" }
 crc32fast               = "1"
 flub                    = "0.1"
@@ -54,6 +55,8 @@ rquickjs                = { features = [ "parallel" ], version = "0.14" }
 rusqlite                = { default-features = false, features = [ "bundled" ], version = "0.43" }
 serde                   = { features = [ "derive" ], version = "1" }
 serde_json              = { features = [ "raw_value" ], version = "1" }
+str0m                   = { default-features = false, version = "0.26" }
+str0m-rust-crypto       = "0.7"
 sunhook-sys             = { git = "https://github.com/sunbird-tools/sunhook" }
 zip                     = { default-features = false, version = "9" }
 

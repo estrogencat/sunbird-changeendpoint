@@ -18,6 +18,11 @@ rquickjs           = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+aes-gcm           = { workspace = true }
+str0m             = { workspace = true }
+str0m-rust-crypto = { workspace = true }
+
 [target.'cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
 libc = { workspace = true }
 

@@ -7,6 +7,7 @@
 
 mod sanitise;
 mod upstream;
+mod voice;
 mod wire;
 
 use std::{
@@ -61,6 +62,7 @@ pub fn gateway() -> Option<String> {
 }
 
 struct Upgrade {
+   path: String,
    query: String,
    headers: Vec<(String, String)>,
 }
@@ -70,6 +72,7 @@ fn handshake(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>) -> io::R
    reader.read_line(&mut line)?;
    let target = line.split(' ').nth(1).unwrap_or("/");
    let query = target.find('?').map_or("", |at| &target[at..]).to_owned();
+   let path = target.split('?').next().unwrap_or(target).to_owned();
    let mut key = None;
    let mut headers = Vec::new();
    loop {
@@ -102,7 +105,11 @@ fn handshake(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>) -> io::R
       "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
       wire::accept_key(&key)
    )?;
-   Ok(Upgrade { query, headers })
+   Ok(Upgrade {
+      path,
+      query,
+      headers,
+   })
 }
 
 /// The token of an identify (op 2) or resume (op 6). Never logged.
@@ -130,6 +137,9 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
    let mut reader = BufReader::new(stream.try_clone()?);
    let upgrade = handshake(&mut stream, &mut reader)?;
    let writer: Writer = Arc::new(Mutex::new(stream));
+   if let Some(host) = upgrade.path.strip_prefix("/r/") {
+      return voice::bridge(&mut reader, writer, host, &upgrade.headers);
+   }
    let mut pending = Vec::new();
    let token = loop {
       let message = wire::read_message(&mut reader, &writer)?;
@@ -221,7 +231,9 @@ fn pump_down(socket: &Socket, writer: &Writer, spacebar: Option<servers::Tweaks>
          Ok(message) => {
             let message = match message {
                Message::Text(bytes) => {
-                  let fixed = spacebar.and_then(|tweaks| sanitise::dispatch(&bytes, tweaks));
+                  let fixed = spacebar.and_then(|tweaks| {
+                     voice_server(&bytes).or_else(|| sanitise::dispatch(&bytes, tweaks))
+                  });
                   Message::Text(fixed.unwrap_or(bytes))
                },
                other => other,
@@ -242,6 +254,21 @@ fn pump_down(socket: &Socket, writer: &Writer, spacebar: Option<servers::Tweaks>
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
       .shutdown(Shutdown::Both);
+}
+
+/// Sends Phoenix's voice connection through the relay, which speaks WebRTC
+/// to Spacebar's voice server for it.
+fn voice_server(frame: &[u8]) -> Option<Vec<u8>> {
+   let head = &frame[..frame.len().min(64)];
+   let name = b"\"t\":\"VOICE_SERVER_UPDATE\"";
+   if !head.windows(name.len()).any(|window| window == name) {
+      return None;
+   }
+   let relay = gateway()?;
+   let mut payload = serde_json::from_slice::<serde_json::Value>(frame).ok()?;
+   let endpoint = payload.get_mut("d")?.get_mut("endpoint")?;
+   *endpoint = serde_json::Value::String(voice::bridged(&relay, endpoint.as_str()?)?);
+   serde_json::to_vec(&payload).ok()
 }
 
 /// A Spacebar-safe copy of a text frame from Phoenix.

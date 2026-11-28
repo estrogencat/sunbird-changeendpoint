@@ -1,6 +1,6 @@
 export default {
    description: "Fixes Spacebar payloads that Phoenix cannot decode",
-   version: "0.4.2",
+   version: "0.4.3",
    author: "softgaypaws",
    unlisted: true,
    permissions: ["gateway", "discord", "http"],
