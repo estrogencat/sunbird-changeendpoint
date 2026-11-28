@@ -39,6 +39,8 @@ mod login_form;
 mod members;
 mod message;
 mod modal;
+#[cfg(windows)]
+mod net_refresh;
 mod notices;
 mod onboarding;
 mod os;
@@ -264,6 +266,8 @@ pub fn prepare() -> Result<(), Error> {
    );
    #[cfg(windows)]
    feature("restart", || restart::install(&image));
+   #[cfg(windows)]
+   feature("net_refresh", || net_refresh::install(&image));
    feature("staff", || staff::prepare(&ix));
    feature("login_form", || login_form::install(&image));
    feature("account_switch", || account_switch::install(&image));

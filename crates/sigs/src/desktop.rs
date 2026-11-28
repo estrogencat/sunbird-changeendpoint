@@ -1407,6 +1407,61 @@ pub fn upload_limit(image: &Image<'_>) -> Found<UploadLimit> {
    Ok(UploadLimit { func: outer, field })
 }
 
+/// Phoenix's network watcher.
+///
+/// The import slots it registers and cancels through, the callback it
+/// registers for interface changes, and the check that lists the adapters that
+/// are up, answering 0 when none are.
+#[derive(Clone, Copy, Debug)]
+pub struct NetworkWatch {
+   pub register:   usize,
+   pub cancel:     usize,
+   pub callback:   usize,
+   pub connection: usize,
+}
+
+/// The watcher registering `NotifyIpInterfaceChange` and
+/// `NotifyUnicastIpAddressChange` with one context, cancelling the first when
+/// the second fails.
+pub fn network_watch(image: &Image<'_>) -> Found<NetworkWatch> {
+   const REGISTER: Pattern = Pattern::new("48 8D 15 ?? ?? ?? ?? 31 C9 49 89 F8 45 31 C9 FF 15");
+   const ADAPTERS: Pattern = Pattern::new("6A 2E 5B 4C 8B 3D");
+   let sites = image.scan(REGISTER);
+   let [first, second] = sites[..] else {
+      return Err(format!("network watch registration matched {} times", sites.len()));
+   };
+   let func = image
+      .function_bounds(first)
+      .filter(|bounds| image.function_bounds(second) == Some(*bounds))
+      .ok_or("network watch registrations are in different functions")?;
+   let body = image.read(func.0, func.1 - func.0).ok_or("network watch is unmapped")?;
+   let slots: Vec<usize> = body
+      .windows(2)
+      .enumerate()
+      .filter(|(_, op)| op == &[0xFF, 0x15])
+      .filter_map(|(offset, _)| rel32_target(image, func.0 + offset + 2))
+      .collect();
+   let [register, _, cancel] = slots[..] else {
+      return Err(format!("network watch makes {} import calls", slots.len()));
+   };
+   if register != rel32_target(image, first + 17).unwrap_or_default() {
+      return Err("network watch registers through another slot".to_owned());
+   }
+   let adapters = image.scan(ADAPTERS);
+   let [adapters] = adapters[..] else {
+      return Err(format!("network adapter check matched {} times", adapters.len()));
+   };
+   let connection = image
+      .function_containing(adapters)
+      .ok_or("network adapter check has no unwind entry")?;
+   Ok(NetworkWatch {
+      register,
+      cancel,
+      callback: rel32_target(image, first + 3).ok_or("network watch callback is unreadable")?,
+      connection,
+   })
+}
+
 /// The sidebar's channel row picture, which only group DM and user rows use.
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelRowPicture {

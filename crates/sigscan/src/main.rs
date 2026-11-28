@@ -399,6 +399,20 @@ fn check(
                   .join("; ")
             }),
          );
+         if abi == x86::Abi::Win64 {
+            report(
+               "network watch",
+               desktop::network_watch(image).map(|found| {
+                  format!(
+                     "register {} cancel {} callback {} connection {}",
+                     at(found.register),
+                     at(found.cancel),
+                     at(found.callback),
+                     at(found.connection)
+                  )
+               }),
+            );
+         }
          report(
             "upload limit",
             desktop::upload_limit(image)
