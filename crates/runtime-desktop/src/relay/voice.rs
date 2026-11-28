@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use str0m::{
    Candidate, Event, IceConnectionState, Input, Output, Rtc,
    change::{SdpAnswer, SdpPendingOffer},
-   media::{Direction, MediaKind, Mid, Pt},
+   media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt},
    net::{Protocol, Receive},
    rtp::{RtpPacket, RtpWrite, SeqNo, Ssrc},
 };
@@ -35,7 +35,17 @@ const MODE: &str = "aead_aes256_gcm_rtpsize";
 /// The payload type Phoenix plays Opus from.
 const PHOENIX_OPUS: u8 = 120;
 const OPUS: u8 = 111;
+/// What the voice server asks browsers for, so viewers can decode it.
+const H264_PROFILE: u32 = 0x42_e0_1f;
 const PHOENIX_HEARTBEAT_MS: u64 = 13_750;
+const RTCP_HEADER: usize = 8;
+const PSFB: u8 = 206;
+const PLI: u8 = 1;
+const FIR: u8 = 4;
+const KEYFRAME_GAP: Duration = Duration::from_millis(300);
+/// Some voice servers ask for a keyframe only once per viewer and never
+/// resend lost packets, and a screen share sends none on its own.
+const KEYFRAME_REFRESH: Duration = Duration::from_secs(3);
 const DISCOVERY_LEN: usize = 74;
 const TAG_LEN: usize = 16;
 const NONCE_TAIL: usize = 4;
@@ -71,8 +81,10 @@ fn valid_host(host: &str) -> bool {
 enum Work {
    Phoenix(Vec<u8>, SocketAddr),
    Server(Vec<u8>, SocketAddr, SocketAddr),
-   Select(Option<String>),
+   Select(Value),
    Answer(Value),
+   Video(Value),
+   Remote(Value),
    Announce(Duration),
    Stop,
 }
@@ -133,7 +145,7 @@ pub fn bridge(
       return Ok(());
    }
    log::info!("voice: connecting to {host}");
-   let upstream = match Socket::connect(&format!("wss://{host}/?v=9"), headers) {
+   let upstream = match Socket::connect(&voice_url(host), headers) {
       Ok(socket) => Arc::new(socket),
       Err(err) => {
          wire::close(&phoenix, 4015, b"voice server unreachable");
@@ -185,6 +197,21 @@ pub fn bridge(
       }
    }
    Ok(())
+}
+
+/// Servers on a local network have no certificate for their address, so
+/// those are reached without TLS.
+fn voice_url(host: &str) -> String {
+   let ip = host
+      .parse::<SocketAddr>()
+      .map(|addr| addr.ip())
+      .or_else(|_| host.parse::<std::net::IpAddr>());
+   let local = ip.is_ok_and(|ip| match ip {
+      std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+      std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+   });
+   let scheme = if local { "ws" } else { "wss" };
+   format!("{scheme}://{host}/?v=9")
 }
 
 fn spawn(name: &str, run: impl FnOnce() + Send + 'static) -> io::Result<()> {
@@ -241,8 +268,10 @@ fn from_phoenix(shared: &Shared, bytes: &[u8]) {
          shared.to_server(0, &d);
       },
       1 => {
-         let id = d.get("rtc_connection_id").and_then(Value::as_str).map(str::to_owned);
-         let _ = shared.work.send(Work::Select(id));
+         let _ = shared.work.send(Work::Select(d));
+      },
+      12 => {
+         let _ = shared.work.send(Work::Video(d));
       },
       5 => {
          let ours = shared.our_ssrc.load(Ordering::Relaxed);
@@ -253,7 +282,7 @@ fn from_phoenix(shared: &Shared, bytes: &[u8]) {
          }
          shared.to_server(5, &d);
       },
-      12 | 16 | 21 | 23 => {},
+      16 | 21 | 23 => {},
       op => shared.to_server(op, &d),
    }
 }
@@ -308,6 +337,9 @@ fn from_server(shared: &Arc<Shared>) {
             let _ = shared.work.send(Work::Answer(frame.d));
          },
          6 => {},
+         12 => {
+            let _ = shared.work.send(Work::Remote(frame.d));
+         },
          11 => {
             for delay in [500, 2000] {
                let _ = shared.work.send(Work::Announce(Duration::from_millis(delay)));
@@ -337,12 +369,44 @@ fn beat(shared: &Shared, generation: &AtomicU64, mine: u64, interval: Duration) 
    }
 }
 
+/// Phoenix's H264 payload types, used on both sides so video needs no
+/// rewriting.
+#[derive(Clone, Copy)]
+struct VideoCodec {
+   pt: u8,
+   rtx: Option<u8>,
+}
+
+impl VideoCodec {
+   fn from_codecs(codecs: Option<&Value>) -> Option<Self> {
+      let codec = codecs?.as_array()?.iter().find(|codec| {
+         codec
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("H264"))
+      })?;
+      let pt = |name: &str| {
+         codec
+            .get(name)
+            .and_then(Value::as_u64)
+            .and_then(|pt| u8::try_from(pt).ok())
+            .filter(|pt| (96..128).contains(pt) && ![OPUS, PHOENIX_OPUS].contains(pt))
+      };
+      let main = pt("payload_type")?;
+      Some(Self {
+         pt: main,
+         rtx: pt("rtx_payload_type").filter(|&rtx| rtx != main),
+      })
+   }
+}
+
 struct Webrtc {
    rtc: Rtc,
    socket: UdpSocket,
    mid: Mid,
+   video: Option<(Mid, VideoCodec)>,
    pending: Option<SdpPendingOffer>,
-   extmaps: Vec<String>,
+   offer: String,
    connected: bool,
 }
 
@@ -357,9 +421,16 @@ struct Media {
    webrtc: Option<Webrtc>,
    ready: bool,
    out_seq: u64,
+   video_seq: u64,
    sent: u64,
    published: bool,
    speakers: HashSet<u32>,
+   /// Phoenix's last video state, with its own SSRCs.
+   outgoing: Option<Value>,
+   phoenix_video: u32,
+   our_video: (u32, u32),
+   last_keyframe: Option<Instant>,
+   fir_seq: u8,
    announce_at: Vec<Instant>,
    next_timeout: Option<Instant>,
 }
@@ -379,9 +450,15 @@ impl Media {
          webrtc: None,
          ready: false,
          out_seq: 0,
+         video_seq: 0,
          sent: 0,
          published: false,
          speakers: HashSet::new(),
+         outgoing: None,
+         phoenix_video: 0,
+         our_video: (0, 0),
+         last_keyframe: None,
+         fir_seq: 0,
          announce_at: Vec::new(),
          next_timeout: None,
       }
@@ -395,6 +472,7 @@ impl Media {
             .iter()
             .copied()
             .chain(self.next_timeout)
+            .chain(self.refresh_due())
             .min()
             .unwrap_or(now + IDLE);
          let wait = deadline.saturating_duration_since(now);
@@ -402,8 +480,10 @@ impl Media {
             Ok(Work::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Work::Phoenix(packet, from)) => self.phoenix_packet(&packet, from),
             Ok(Work::Server(packet, source, destination)) => self.server_packet(&packet, source, destination),
-            Ok(Work::Select(id)) => {
-               if let Err(err) = self.start(id) {
+            Ok(Work::Video(d)) => self.outgoing_video(d),
+            Ok(Work::Remote(d)) => self.remote_video(&d),
+            Ok(Work::Select(select)) => {
+               if let Err(err) = self.start(&select) {
                   log::warn!("voice: could not start WebRTC: {err}");
                   self.shared.close(4000, "voice setup failed");
                }
@@ -418,6 +498,9 @@ impl Media {
             Err(RecvTimeoutError::Timeout) => {},
          }
          let now = Instant::now();
+         if self.refresh_due().is_some_and(|at| at <= now) {
+            self.ask_phoenix_for_keyframe();
+         }
          if self.next_timeout.is_some_and(|at| at <= now) {
             self.next_timeout = None;
             self.mutate(|rtc| rtc.handle_input(Input::Timeout(now)).map_err(|err| err.to_string()));
@@ -444,11 +527,13 @@ impl Media {
    fn drain(&mut self) {
       let mut packets = Vec::new();
       let mut connected = false;
+      let mut keyframe = false;
       let mut failed = None;
       {
          let Some(webrtc) = self.webrtc.as_mut() else {
             return;
          };
+         let video_mid = webrtc.video.map(|(mid, _)| mid);
          loop {
             match webrtc.rtc.poll_output() {
                Ok(Output::Timeout(at)) => {
@@ -460,6 +545,9 @@ impl Media {
                },
                Ok(Output::Event(Event::RtpPacket(packet))) => packets.push(packet),
                Ok(Output::Event(Event::Connected)) => connected = true,
+               Ok(Output::Event(Event::KeyframeRequest(request))) => {
+                  keyframe |= Some(request.mid) == video_mid;
+               },
                Ok(Output::Event(Event::IceConnectionStateChange(IceConnectionState::Disconnected))) => {
                   failed = Some("the voice connection dropped");
                },
@@ -481,6 +569,9 @@ impl Media {
       for packet in packets {
          self.play(&packet);
       }
+      if keyframe {
+         self.ask_phoenix_for_keyframe();
+      }
       if connected {
          log::info!("voice: connected to {}", self.host);
          let now = Instant::now();
@@ -493,35 +584,38 @@ impl Media {
       }
    }
 
-   fn start(&mut self, rtc_connection_id: Option<String>) -> Result<(), String> {
+   fn start(&mut self, select: &Value) -> Result<(), String> {
       if self.webrtc.is_some() {
          return Ok(());
       }
+      let rtc_connection_id = select.get("rtc_connection_id").and_then(Value::as_str);
+      let codec = VideoCodec::from_codecs(select.get("codecs"));
       let local_ip = local_ip(&self.host).map_err(|err| format!("no route to {}: {err}", self.host))?;
       let socket = UdpSocket::bind((local_ip, 0)).map_err(|err| err.to_string())?;
       socket.set_read_timeout(Some(READ_TIMEOUT)).map_err(|err| err.to_string())?;
       let local = socket.local_addr().map_err(|err| err.to_string())?;
       let now = Instant::now();
-      let mut rtc = Rtc::builder()
+      let mut config = Rtc::builder()
          .set_rtp_mode(true)
          .clear_codecs()
          .enable_opus(true, false)
-         .set_crypto_provider(Arc::new(str0m_rust_crypto::default_provider()))
-         .build(now);
+         .set_crypto_provider(Arc::new(str0m_rust_crypto::default_provider()));
+      if let Some(codec) = codec {
+         config
+            .codec_config()
+            .add_h264(Pt::from(codec.pt), codec.rtx.map(Pt::from), true, H264_PROFILE);
+      }
+      let mut rtc = config.build(now);
       let candidate = Candidate::host(local, "udp").map_err(|err| err.to_string())?;
       rtc.add_local_candidate(candidate);
       let mut change = rtc.sdp_api();
       let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+      let video = codec.map(|codec| {
+         let mid = change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None);
+         (mid, codec)
+      });
       let (offer, pending) = change.apply().ok_or("nothing to offer")?;
       let sdp = offer.to_sdp_string();
-      let extmaps = sdp
-         .lines()
-         .filter(|line| {
-            line.starts_with("a=extmap:")
-               && (line.contains("ssrc-audio-level") || line.contains("transport-wide-cc"))
-         })
-         .map(str::to_owned)
-         .collect();
       let ours = offered_ssrc(&sdp).unwrap_or(0);
       self.shared.our_ssrc.store(ours, Ordering::Relaxed);
       spawn("sunbird-voice-rtc", {
@@ -530,23 +624,34 @@ impl Media {
          move || read_udp(&shared, &socket, Work::Server)
       })
       .map_err(|err| err.to_string())?;
+      let mut codecs = vec![json!({ "name": "opus", "type": "audio", "priority": 1000, "payload_type": OPUS })];
+      if let Some(codec) = codec {
+         codecs.push(json!({
+            "name": "H264",
+            "type": "video",
+            "priority": 1000,
+            "payload_type": codec.pt,
+            "rtx_payload_type": codec.rtx,
+         }));
+      }
       self.webrtc = Some(Webrtc {
          rtc,
          socket,
          mid,
+         video,
          pending: Some(pending),
-         extmaps,
+         offer: sdp.clone(),
          connected: false,
       });
       self.drain();
-      let id = rtc_connection_id.unwrap_or_else(|| format!("{:032x}", OsRng.next_u64()));
+      let id = rtc_connection_id.map_or_else(|| format!("{:032x}", OsRng.next_u64()), str::to_owned);
       self.shared.to_server(
          1,
          &json!({
             "protocol": "webrtc",
             "data": sdp,
             "sdp": sdp,
-            "codecs": [{ "name": "opus", "type": "audio", "priority": 1000, "payload_type": OPUS }],
+            "codecs": codecs,
             "rtc_connection_id": id,
          }),
       );
@@ -557,9 +662,14 @@ impl Media {
       let webrtc = self.webrtc.as_mut().ok_or("no offer was made")?;
       let pending = webrtc.pending.take().ok_or("already answered")?;
       let compact = d.get("sdp").and_then(Value::as_str).unwrap_or_default();
-      let sdp = answer_sdp(compact, &webrtc.mid.to_string(), &webrtc.extmaps);
+      let sdp = answer_sdp(compact, &webrtc.offer, webrtc.mid, webrtc.video);
       let answer = SdpAnswer::from_sdp_string(&sdp).map_err(|err| err.to_string())?;
       webrtc.rtc.sdp_api().accept_answer(pending, answer).map_err(|err| err.to_string())?;
+      if let Some((mid, _)) = webrtc.video
+         && let Some(stream) = webrtc.rtc.direct_api().stream_tx_by_mid(mid, None)
+      {
+         self.our_video = (*stream.ssrc(), stream.rtx().map_or(0, |rtx| *rtx));
+      }
       self.drain();
       self.ready = true;
       let text = |name: &str, fallback: &str| {
@@ -580,7 +690,7 @@ impl Media {
    }
 
    fn server_packet(&mut self, packet: &[u8], source: SocketAddr, destination: SocketAddr) {
-      if let Some(ssrc) = rtp_ssrc(packet) {
+      if let Some(ssrc) = rtp_ssrc(packet).filter(|_| packet[1] & 0x7F == OPUS) {
          self.learn_speaker(ssrc);
       }
       let now = Instant::now();
@@ -631,15 +741,27 @@ impl Media {
          return;
       }
       self.phoenix_addr = Some(from);
-      if packet.len() < 2 || (72..=76).contains(&(packet[1] & 0x7F)) || !self.ready {
+      if packet.len() < 2 || !self.ready {
+         return;
+      }
+      let kind = packet[1] & 0x7F;
+      if (72..=79).contains(&kind) {
+         self.phoenix_rtcp(packet);
          return;
       }
       let Some((payload, timestamp, marker)) = open(&self.cipher, packet) else {
          return;
       };
-      let Some(mid) = self.webrtc.as_ref().map(|webrtc| webrtc.mid) else {
+      let Some(webrtc) = self.webrtc.as_ref() else {
          return;
       };
+      let mid = webrtc.mid;
+      if kind != PHOENIX_OPUS {
+         if let Some((mid, codec)) = webrtc.video.filter(|(_, codec)| codec.pt == kind) {
+            self.send_video(mid, codec, payload, timestamp, marker);
+         }
+         return;
+      }
       self.sent += 1;
       let seq = SeqNo::from(self.out_seq);
       self.out_seq += 1;
@@ -654,13 +776,150 @@ impl Media {
       });
    }
 
+   fn send_video(&mut self, mid: Mid, codec: VideoCodec, payload: Vec<u8>, timestamp: u32, marker: bool) {
+      let seq = SeqNo::from(self.video_seq);
+      self.video_seq += 1;
+      let now = Instant::now();
+      self.mutate(|rtc| {
+         let mut direct = rtc.direct_api();
+         let stream = direct.stream_tx_by_mid(mid, None).ok_or("no video stream to send on")?;
+         stream.write_rtp(
+            RtpWrite::new(Pt::from(codec.pt), seq, timestamp, now, payload)
+               .marker(marker)
+               .nackable(true),
+         );
+         Ok(())
+      });
+   }
+
+   /// Passes Phoenix's keyframe requests for other people's video on to the
+   /// server.
+   fn phoenix_rtcp(&mut self, packet: &[u8]) {
+      let Some(plain) = open_rtcp(&self.cipher, packet) else {
+         return;
+      };
+      for ssrc in keyframe_requests(&plain) {
+         self.mutate(|rtc| {
+            if let Some(stream) = rtc.direct_api().stream_rx(&Ssrc::from(ssrc)) {
+               stream.request_keyframe(KeyframeRequestKind::Pli);
+            }
+            Ok(())
+         });
+      }
+   }
+
+   /// Viewers on the server need a keyframe before they can show our video.
+   fn refresh_due(&self) -> Option<Instant> {
+      let connected = self.webrtc.as_ref().is_some_and(|webrtc| webrtc.connected);
+      (connected && self.phoenix_video != 0)
+         .then(|| self.last_keyframe.map_or_else(Instant::now, |at| at + KEYFRAME_REFRESH))
+   }
+
+   fn ask_phoenix_for_keyframe(&mut self) {
+      let now = Instant::now();
+      if self.phoenix_video == 0 || self.last_keyframe.is_some_and(|at| now - at < KEYFRAME_GAP) {
+         return;
+      }
+      self.last_keyframe = Some(now);
+      let Some(to) = self.phoenix_addr else {
+         return;
+      };
+      self.fir_seq = self.fir_seq.wrapping_add(1);
+      let packet = keyframe_request(
+         self.shared.our_ssrc.load(Ordering::Relaxed),
+         self.phoenix_video,
+         self.fir_seq,
+      );
+      self.counter = self.counter.wrapping_add(1);
+      let (header, body) = packet.split_at(RTCP_HEADER);
+      if let Some(sealed) = seal(&self.cipher, header, body, self.counter) {
+         let _ = self.phoenix_udp.send_to(&sealed, to);
+      }
+   }
+
+   fn outgoing_video(&mut self, d: Value) {
+      let was_on = self.phoenix_video != 0;
+      self.phoenix_video = ssrc_field(&d, "video_ssrc").unwrap_or(0);
+      self.outgoing = Some(d);
+      if !self.published || !self.webrtc.as_ref().is_some_and(|webrtc| webrtc.connected) {
+         return;
+      }
+      let ours = self.shared.our_ssrc.load(Ordering::Relaxed);
+      let turning_on = !was_on && self.phoenix_video != 0;
+      self.shared.to_server(12, &self.media_state(ours, !turning_on));
+      if turning_on {
+         self.announce_at.push(Instant::now() + Duration::from_millis(400));
+      }
+   }
+
+   /// What we send as op 12: Phoenix's video state with our SSRCs in place
+   /// of its own. Spacebar only publishes video that was off in the update
+   /// before, and a Go Live connection starts out with it on, so turning video
+   /// on sends it off first.
+   fn media_state(&self, audio: u32, video_on: bool) -> Value {
+      let (video, rtx) = if !video_on || self.phoenix_video == 0 {
+         (0, 0)
+      } else {
+         self.our_video
+      };
+      let streams: Vec<Value> = self
+         .outgoing
+         .as_ref()
+         .and_then(|d| d.get("streams"))
+         .and_then(Value::as_array)
+         .map(|streams| {
+            streams
+               .iter()
+               .map(|stream| {
+                  let mut stream = stream.clone();
+                  if let Some(object) = stream.as_object_mut() {
+                     object.insert("ssrc".to_owned(), json!(video));
+                     object.insert("rtx_ssrc".to_owned(), json!(rtx));
+                  }
+                  stream
+               })
+               .collect()
+         })
+         .unwrap_or_default();
+      json!({ "audio_ssrc": audio, "video_ssrc": video, "rtx_ssrc": rtx, "streams": streams })
+   }
+
+   /// Someone else's streams, which str0m has to expect before it lets their
+   /// packets through.
+   fn remote_video(&mut self, d: &Value) {
+      if let Some(audio) = ssrc_field(d, "audio_ssrc") {
+         self.learn_speaker(audio);
+      }
+      let mid = self.webrtc.as_ref().and_then(|webrtc| webrtc.video).map(|(mid, _)| mid);
+      if let (Some(mid), Some(video)) = (mid, ssrc_field(d, "video_ssrc"))
+         && (self.speakers.contains(&video) || self.speakers.len() < MAX_SPEAKERS)
+      {
+         self.speakers.insert(video);
+         let rtx = ssrc_field(d, "rtx_ssrc").map(Ssrc::from);
+         self.mutate(|rtc| {
+            rtc.direct_api().expect_stream_rx(Ssrc::from(video), rtx, mid, None);
+            Ok(())
+         });
+      }
+      self.shared.to_phoenix(12, d);
+   }
+
    fn play(&mut self, packet: &RtpPacket) {
       let Some(to) = self.phoenix_addr.filter(|_| self.ready) else {
          return;
       };
+      let pt = *packet.header.payload_type;
+      let video = self.webrtc.as_ref().and_then(|webrtc| webrtc.video).map(|(_, codec)| codec.pt);
+      let pt = if pt == OPUS {
+         PHOENIX_OPUS
+      } else if Some(pt) == video {
+         pt
+      } else {
+         return;
+      };
       let mut header = [0u8; 12];
       header[0] = 0x80;
-      header[1] = PHOENIX_OPUS | if packet.header.marker { 0x80 } else { 0 };
+      header[1] = pt | if packet.header.marker { 0x80 } else { 0 };
       header[2..4].copy_from_slice(&packet.header.sequence_number.to_be_bytes());
       header[4..8].copy_from_slice(&packet.header.timestamp.to_be_bytes());
       header[8..12].copy_from_slice(&(*packet.header.ssrc).to_be_bytes());
@@ -683,7 +942,7 @@ impl Media {
       if ours == 0 {
          return;
       }
-      if self.sent == 0 {
+      if self.sent == 0 && self.phoenix_video == 0 {
          self.announce_at.push(Instant::now() + Duration::from_millis(500));
          return;
       }
@@ -694,11 +953,15 @@ impl Media {
          self.announce_at.push(Instant::now() + Duration::from_millis(400));
          0
       };
-      self.shared.to_server(
-         12,
-         &json!({ "audio_ssrc": audio, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] }),
-      );
+      self.shared.to_server(12, &self.media_state(audio, audio != 0));
    }
+}
+
+fn ssrc_field(d: &Value, name: &str) -> Option<u32> {
+   d.get(name)
+      .and_then(Value::as_u64)
+      .and_then(|ssrc| u32::try_from(ssrc).ok())
+      .filter(|&ssrc| ssrc != 0)
 }
 
 /// The SSRC our offer announces, which str0m only sets up a stream for once
@@ -763,18 +1026,86 @@ fn open(cipher: &Aes256Gcm, packet: &[u8]) -> Option<(Vec<u8>, u32, bool)> {
       let words = u16::from_be_bytes([packet[head - 2], packet[head - 1]]);
       plain.drain(..(usize::from(words) * 4).min(plain.len()));
    }
+   if packet[0] & 0x20 != 0 {
+      let padding = usize::from(*plain.last()?);
+      plain.truncate(plain.len().checked_sub(padding)?);
+   }
+   if plain.is_empty() {
+      return None;
+   }
    let timestamp = u32::from_be_bytes(*packet.get(4..8)?.first_chunk::<4>()?);
    Some((plain, timestamp, packet[1] & 0x80 != 0))
 }
 
-fn seal(cipher: &Aes256Gcm, header: &[u8; 12], payload: &[u8], counter: u32) -> Option<Vec<u8>> {
+/// Phoenix's RTCP packet, decrypted. Only its first 8 bytes travel in the
+/// clear.
+fn open_rtcp(cipher: &Aes256Gcm, packet: &[u8]) -> Option<Vec<u8>> {
+   let body_end = packet.len().checked_sub(TAG_LEN + NONCE_TAIL)?;
+   if body_end < RTCP_HEADER {
+      return None;
+   }
+   let mut nonce = [0u8; 12];
+   nonce[..NONCE_TAIL].copy_from_slice(&packet[packet.len() - NONCE_TAIL..]);
+   let mut plain = packet[RTCP_HEADER..body_end].to_vec();
+   let tag = Tag::from_slice(&packet[body_end..body_end + TAG_LEN]);
+   cipher
+      .decrypt_in_place_detached(Nonce::from_slice(&nonce), &packet[..RTCP_HEADER], &mut plain, tag)
+      .ok()?;
+   let mut out = packet[..RTCP_HEADER].to_vec();
+   out.extend_from_slice(&plain);
+   Some(out)
+}
+
+/// The SSRCs a compound RTCP packet asks keyframes for (PLI or FIR).
+fn keyframe_requests(compound: &[u8]) -> Vec<u32> {
+   let mut found = Vec::new();
+   let mut rest = compound;
+   while let [first, kind, high, low, ..] = *rest {
+      let len = (usize::from(u16::from_be_bytes([high, low])) + 1) * 4;
+      let Some(packet) = rest.get(..len) else {
+         break;
+      };
+      let at = match first & 0x1F {
+         PLI => 8,
+         FIR => 12,
+         _ => usize::MAX,
+      };
+      if kind == PSFB
+         && let Some(ssrc) = packet.get(at..at.saturating_add(4)).and_then(|bytes| bytes.first_chunk::<4>())
+      {
+         found.push(u32::from_be_bytes(*ssrc));
+      }
+      rest = &rest[len..];
+   }
+   found
+}
+
+/// A compound RTCP packet asking `media` for a keyframe: an empty receiver
+/// report first, as compound packets must start with one, then a PLI and a
+/// FIR.
+fn keyframe_request(sender: u32, media: u32, fir_seq: u8) -> Vec<u8> {
+   let mut packet = Vec::with_capacity(40);
+   packet.extend([0x80, 201, 0, 1]);
+   packet.extend(sender.to_be_bytes());
+   packet.extend([0x80 | PLI, PSFB, 0, 2]);
+   packet.extend(sender.to_be_bytes());
+   packet.extend(media.to_be_bytes());
+   packet.extend([0x80 | FIR, PSFB, 0, 4]);
+   packet.extend(sender.to_be_bytes());
+   packet.extend([0; 4]);
+   packet.extend(media.to_be_bytes());
+   packet.extend([fir_seq, 0, 0, 0]);
+   packet
+}
+
+fn seal(cipher: &Aes256Gcm, header: &[u8], payload: &[u8], counter: u32) -> Option<Vec<u8>> {
    let mut nonce = [0u8; 12];
    nonce[..4].copy_from_slice(&counter.to_be_bytes());
    let mut body = payload.to_vec();
    let tag = cipher
       .encrypt_in_place_detached(Nonce::from_slice(&nonce), header, &mut body)
       .ok()?;
-   let mut out = Vec::with_capacity(12 + body.len() + TAG_LEN + NONCE_TAIL);
+   let mut out = Vec::with_capacity(header.len() + body.len() + TAG_LEN + NONCE_TAIL);
    out.extend_from_slice(header);
    out.extend_from_slice(&body);
    out.extend_from_slice(&tag);
@@ -783,8 +1114,8 @@ fn seal(cipher: &Aes256Gcm, header: &[u8; 12], payload: &[u8], counter: u32) -> 
 }
 
 /// A full answer from the compact one Spacebar sends: its address, ICE
-/// credentials, fingerprint and candidates.
-fn answer_sdp(compact: &str, mid: &str, extmaps: &[String]) -> String {
+/// credentials, fingerprint and candidates, around the media we offered.
+fn answer_sdp(compact: &str, offer: &str, audio: Mid, video: Option<(Mid, VideoCodec)>) -> String {
    let lines: Vec<&str> = compact.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
    let find = |prefix: &str| lines.iter().copied().find(|line| line.starts_with(prefix));
    let port = find("m=audio ")
@@ -793,35 +1124,75 @@ fn answer_sdp(compact: &str, mid: &str, extmaps: &[String]) -> String {
    let ip = find("c=")
       .and_then(|line| line.split_once("IN IP4 "))
       .map_or("0.0.0.0", |(_, ip)| ip.trim());
+   let bundle = video.map_or_else(|| audio.to_string(), |(video, _)| format!("{audio} {video}"));
    let mut out = vec![
       "v=0".to_owned(),
       "o=- 0 0 IN IP4 127.0.0.1".to_owned(),
       "s=-".to_owned(),
       "t=0 0".to_owned(),
-      format!("a=group:BUNDLE {mid}"),
+      format!("a=group:BUNDLE {bundle}"),
       "a=msid-semantic: WMS".to_owned(),
-      format!("m=audio {port} UDP/TLS/RTP/SAVPF {OPUS}"),
-      format!("c=IN IP4 {ip}"),
-      format!("a=rtcp:{port} IN IP4 {ip}"),
    ];
-   for prefix in ["a=ice-ufrag:", "a=ice-pwd:", "a=fingerprint:"] {
-      if let Some(line) = find(prefix) {
-         out.push(line.to_owned());
+   let section = |out: &mut Vec<String>, kind: &str, formats: &str, mid: Mid| {
+      out.push(format!("m={kind} {port} UDP/TLS/RTP/SAVPF {formats}"));
+      out.push(format!("c=IN IP4 {ip}"));
+      out.push(format!("a=rtcp:{port} IN IP4 {ip}"));
+      for prefix in ["a=ice-ufrag:", "a=ice-pwd:", "a=fingerprint:"] {
+         if let Some(line) = find(prefix) {
+            out.push(line.to_owned());
+         }
       }
-   }
-   out.extend([
-      "a=setup:passive".to_owned(),
-      format!("a=mid:{mid}"),
-      "a=sendrecv".to_owned(),
-      "a=rtcp-mux".to_owned(),
-   ]);
-   out.extend(extmaps.iter().cloned());
+      out.extend([
+         "a=setup:passive".to_owned(),
+         format!("a=mid:{mid}"),
+         "a=sendrecv".to_owned(),
+         "a=rtcp-mux".to_owned(),
+      ]);
+      out.extend(offered_extmaps(offer, kind));
+   };
+   section(&mut out, "audio", &OPUS.to_string(), audio);
    out.push(format!("a=rtpmap:{OPUS} opus/48000/2"));
    out.push(format!("a=fmtp:{OPUS} minptime=10;useinbandfec=1"));
    out.extend(lines.iter().filter(|line| line.starts_with("a=candidate:")).map(|line| (*line).to_owned()));
    out.push("a=end-of-candidates".to_owned());
+   if let Some((mid, VideoCodec { pt, rtx })) = video {
+      let formats = rtx.map_or_else(|| pt.to_string(), |rtx| format!("{pt} {rtx}"));
+      section(&mut out, "video", &formats, mid);
+      out.extend([
+         format!("a=rtpmap:{pt} H264/90000"),
+         format!("a=rtcp-fb:{pt} nack"),
+         format!("a=rtcp-fb:{pt} nack pli"),
+         format!("a=rtcp-fb:{pt} ccm fir"),
+         format!("a=fmtp:{pt} level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_PROFILE:06x}"),
+      ]);
+      if let Some(rtx) = rtx {
+         out.push(format!("a=rtpmap:{rtx} rtx/90000"));
+         out.push(format!("a=fmtp:{rtx} apt={pt}"));
+      }
+   }
    out.push(String::new());
    out.join("\r\n")
+}
+
+/// The header extensions the voice server keeps from our offer of `kind`.
+fn offered_extmaps(offer: &str, kind: &str) -> Vec<String> {
+   let wanted: &[&str] = if kind == "audio" {
+      &["ssrc-audio-level", "transport-wide-cc"]
+   } else {
+      &["abs-send-time", "toffset", "playout-delay", "transport-wide-cc"]
+   };
+   let mut inside = false;
+   offer
+      .lines()
+      .filter(|line| {
+         if let Some(media) = line.strip_prefix("m=") {
+            inside = media.starts_with(kind);
+            return false;
+         }
+         inside && line.starts_with("a=extmap:") && wanted.iter().any(|uri| line.contains(uri))
+      })
+      .map(str::to_owned)
+      .collect()
 }
 
 #[cfg(test)]
@@ -841,6 +1212,9 @@ mod tests {
       );
       assert_eq!(bridged(relay, "ws://127.0.0.1:5000/r/voice.example.org"), None);
       assert_eq!(bridged(relay, "wss://bad host"), None);
+      assert_eq!(voice_url("192.168.0.4:3004"), "ws://192.168.0.4:3004/?v=9");
+      assert_eq!(voice_url("voice.example.org"), "wss://voice.example.org/?v=9");
+      assert_eq!(voice_url("8.8.8.8:443"), "wss://8.8.8.8:443/?v=9");
    }
 
    #[test]
@@ -852,16 +1226,65 @@ mod tests {
       header[4..8].copy_from_slice(&1234u32.to_be_bytes());
       let sealed = seal(&cipher, &header, b"opus", 9).expect("seal");
       assert_eq!(open(&cipher, &sealed), Some((b"opus".to_vec(), 1234, true)));
+      header[0] |= 0x20;
+      let padded = seal(&cipher, &header, b"opus\0\0\x03", 10).expect("seal");
+      assert_eq!(open(&cipher, &padded), Some((b"opus".to_vec(), 1234, true)));
+      let only_padding = seal(&cipher, &header, b"\0\x02", 11).expect("seal");
+      assert_eq!(open(&cipher, &only_padding), None);
    }
 
    #[test]
    fn reads_the_offered_ssrc() {
-      let sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 111
-a=ssrc:2591998996 cname:abc
-";
+      let sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=ssrc:2591998996 cname:abc\r\n";
       assert_eq!(offered_ssrc(sdp), Some(2_591_998_996));
-      assert_eq!(offered_ssrc("m=audio 9
-"), None);
+      assert_eq!(offered_ssrc("m=audio 9\r\n"), None);
+   }
+
+   #[test]
+   fn picks_phoenix_h264() {
+      let codecs = json!([
+         { "name": "opus", "payload_type": 120 },
+         { "name": "H264", "payload_type": 101, "rtx_payload_type": 102 },
+      ]);
+      let codec = VideoCodec::from_codecs(Some(&codecs)).expect("h264");
+      assert_eq!((codec.pt, codec.rtx), (101, Some(102)));
+      assert!(VideoCodec::from_codecs(Some(&json!([{ "name": "H264", "payload_type": 111 }]))).is_none());
+   }
+
+   #[test]
+   fn negotiates_video() {
+      let codec = VideoCodec { pt: 101, rtx: Some(102) };
+      let mut config = Rtc::builder()
+         .set_rtp_mode(true)
+         .clear_codecs()
+         .enable_opus(true, false)
+         .set_crypto_provider(Arc::new(str0m_rust_crypto::default_provider()));
+      config.codec_config().add_h264(Pt::from(101), Some(Pt::from(102)), true, H264_PROFILE);
+      let mut rtc = config.build(Instant::now());
+      let mut change = rtc.sdp_api();
+      let audio = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+      let video = change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None);
+      let (offer, pending) = change.apply().expect("offer");
+      let compact = "m=audio 3984 ICE/SDP\na=fingerprint:sha-256 \
+         AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA\n\
+         c=IN IP4 192.0.2.1\na=ice-ufrag:abcd\na=ice-pwd:abcdefghijklmnopqrstuv\n\
+         a=candidate:1 1 udp 2130706431 192.0.2.1 3984 typ host\n";
+      let sdp = answer_sdp(compact, &offer.to_sdp_string(), audio, Some((video, codec)));
+      let answer = SdpAnswer::from_sdp_string(&sdp).expect("answer parses");
+      rtc.sdp_api().accept_answer(pending, answer).expect("answer applies");
+      let mut direct = rtc.direct_api();
+      let stream = direct.stream_tx_by_mid(video, None).expect("video stream");
+      assert!(stream.rtx().is_some());
+   }
+
+   #[test]
+   fn finds_keyframe_requests() {
+      let mut compound = vec![0x81, 201, 0, 1, 0, 0, 0, 1];
+      compound.extend([0x81, PSFB, 0, 2, 0, 0, 0, 1, 0, 0, 0, 9]);
+      compound.extend([0x84, PSFB, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7, 1, 0, 0, 0]);
+      compound.extend([0x81, PSFB, 0, 9]);
+      assert_eq!(keyframe_requests(&compound), vec![9, 7]);
+      assert_eq!(keyframe_requests(&keyframe_request(1, 5, 3)), vec![5, 5]);
    }
 
    #[test]

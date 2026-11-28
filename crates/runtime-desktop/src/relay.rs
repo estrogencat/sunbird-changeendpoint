@@ -5,6 +5,7 @@
 //! presence payloads are trimmed to their schemas, and their gateway is read
 //! uncompressed so READY can be fixed up for Phoenix.
 
+mod leave;
 mod sanitise;
 mod upstream;
 mod voice;
@@ -172,23 +173,25 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
       },
    };
    let tweaks = servers::routes().tweaks();
+   let leave = gateway.spacebar.then(|| leave::Leave::new(socket.clone()));
    let send = |message: Message| {
-      socket.send(&if gateway.spacebar {
-         trimmed(message, gateway.activities, tweaks)
-      } else {
-         message
-      })
+      let Some(leave) = &leave else {
+         return socket.send(&message);
+      };
+      leave
+         .up(trimmed(message, gateway.activities, tweaks))
+         .map_or(Ok(()), |message| socket.send(&message))
    };
    for message in pending {
       send(message)?;
    }
-   let spacebar = gateway.spacebar;
    let down = {
       let socket = socket.clone();
       let writer = writer.clone();
+      let spacebar = leave.clone().map(|leave| (tweaks, leave));
       thread::Builder::new()
          .name("sunbird-relay-down".to_owned())
-         .spawn(move || pump_down(&socket, &writer, spacebar.then_some(tweaks)))?
+         .spawn(move || pump_down(&socket, &writer, spacebar.as_ref()))?
    };
    loop {
       match wire::read_message(&mut reader, &writer) {
@@ -215,7 +218,11 @@ fn relay(mut stream: TcpStream) -> io::Result<()> {
 /// Server to Phoenix, until the server closes. A close outside the 4000s
 /// becomes 4000 so Phoenix resumes instead of dropping the session. Spacebar
 /// servers come with their tweaks.
-fn pump_down(socket: &Socket, writer: &Writer, spacebar: Option<servers::Tweaks>) {
+fn pump_down(
+   socket: &Socket,
+   writer: &Writer,
+   spacebar: Option<&(servers::Tweaks, Arc<leave::Leave>)>,
+) {
    loop {
       match socket.receive() {
          Ok(Message::Close(code, reason)) => {
@@ -231,8 +238,9 @@ fn pump_down(socket: &Socket, writer: &Writer, spacebar: Option<servers::Tweaks>
          Ok(message) => {
             let message = match message {
                Message::Text(bytes) => {
-                  let fixed = spacebar.and_then(|tweaks| {
-                     voice_server(&bytes).or_else(|| sanitise::dispatch(&bytes, tweaks))
+                  let fixed = spacebar.and_then(|(tweaks, leave)| {
+                     leave.down(&bytes);
+                     voice_server(&bytes).or_else(|| sanitise::dispatch(&bytes, *tweaks))
                   });
                   Message::Text(fixed.unwrap_or(bytes))
                },
@@ -256,12 +264,12 @@ fn pump_down(socket: &Socket, writer: &Writer, spacebar: Option<servers::Tweaks>
       .shutdown(Shutdown::Both);
 }
 
-/// Sends Phoenix's voice connection through the relay, which speaks WebRTC
-/// to Spacebar's voice server for it.
+/// Sends Phoenix's voice and Go Live connections through the relay, which
+/// speaks WebRTC to Spacebar's voice server for it.
 fn voice_server(frame: &[u8]) -> Option<Vec<u8>> {
    let head = &frame[..frame.len().min(64)];
-   let name = b"\"t\":\"VOICE_SERVER_UPDATE\"";
-   if !head.windows(name.len()).any(|window| window == name) {
+   let names: [&[u8]; 2] = [b"\"t\":\"VOICE_SERVER_UPDATE\"", b"\"t\":\"STREAM_SERVER_UPDATE\""];
+   if !names.iter().any(|name| head.windows(name.len()).any(|window| window == *name)) {
       return None;
    }
    let relay = gateway()?;
