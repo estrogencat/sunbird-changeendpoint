@@ -5,6 +5,7 @@
 //! presence payloads are trimmed to their schemas, and their gateway is read
 //! uncompressed so READY can be fixed up for Phoenix.
 
+mod feedback;
 mod leave;
 mod sanitise;
 mod upstream;

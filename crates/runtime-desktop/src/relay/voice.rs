@@ -29,7 +29,7 @@ use str0m::{
    rtp::{RtpPacket, RtpWrite, SeqNo, Ssrc},
 };
 
-use super::{Writer, upstream::Socket, wire, wire::Message};
+use super::{Writer, feedback::Feedback, upstream::Socket, wire, wire::Message};
 
 const MODE: &str = "aead_aes256_gcm_rtpsize";
 /// The payload type Phoenix plays Opus from.
@@ -46,7 +46,22 @@ const KEYFRAME_GAP: Duration = Duration::from_millis(300);
 /// Some voice servers ask for a keyframe only once per viewer and never
 /// resend lost packets, and a screen share sends none on its own.
 const KEYFRAME_REFRESH: Duration = Duration::from_secs(3);
+const ONE_BYTE_EXTENSIONS: [u8; 2] = [0xBE, 0xDE];
+/// Where Phoenix puts its transport-wide sequence number on video packets
+/// (seen on build 356207, it never says so in signalling).
+const TRANSPORT_SEQ_EXTENSION: u8 = 5;
 const DISCOVERY_LEN: usize = 74;
+/// Phoenix measures its ping by sending this with a counter every 5 seconds
+/// and timing the echo, which waits out the server's round trip since the
+/// bridge itself is next door.
+const KEEPALIVE: [u8; 4] = [0x13, 0x37, 0xCA, 0xFE];
+const KEEPALIVE_LEN: usize = 8;
+const MAX_ECHOES: usize = 8;
+/// An ack slower than this means a stuck connection, not a ping to show.
+const MAX_RTT_MS: u64 = 10_000;
+/// Browsers keep sending Opus frames this small while silent (DTX), and
+/// Phoenix shows anyone it gets audio from as speaking.
+const SILENCE_LEN: usize = 3;
 const TAG_LEN: usize = 16;
 const NONCE_TAIL: usize = 4;
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
@@ -95,6 +110,8 @@ struct Shared {
    seq: AtomicU64,
    our_ssrc: AtomicU32,
    phoenix_port: AtomicU16,
+   /// Round trip to the voice server, from its heartbeat acks.
+   server_rtt_ms: AtomicU64,
    closed: AtomicBool,
    work: Sender<Work>,
 }
@@ -161,6 +178,7 @@ pub fn bridge(
       seq: AtomicU64::new(0),
       our_ssrc: AtomicU32::new(0),
       phoenix_port: AtomicU16::new(phoenix_udp.local_addr()?.port()),
+      server_rtt_ms: AtomicU64::new(0),
       closed: AtomicBool::new(false),
       work,
    });
@@ -336,7 +354,14 @@ fn from_server(shared: &Arc<Shared>) {
          4 => {
             let _ = shared.work.send(Work::Answer(frame.d));
          },
-         6 => {},
+         6 => {
+            if let Some(sent) = frame.d.as_u64() {
+               let rtt = now_ms().saturating_sub(sent);
+               if rtt < MAX_RTT_MS {
+                  shared.server_rtt_ms.store(rtt, Ordering::Relaxed);
+               }
+            }
+         },
          12 => {
             let _ = shared.work.send(Work::Remote(frame.d));
          },
@@ -354,6 +379,7 @@ fn from_server(shared: &Arc<Shared>) {
 fn beat(shared: &Shared, generation: &AtomicU64, mine: u64, interval: Duration) {
    let step = Duration::from_millis(250);
    loop {
+      shared.to_server(3, &json!(now_ms()));
       let mut waited = Duration::ZERO;
       while waited < interval {
          thread::sleep(step);
@@ -362,11 +388,14 @@ fn beat(shared: &Shared, generation: &AtomicU64, mine: u64, interval: Duration) 
             return;
          }
       }
-      let now = std::time::SystemTime::now()
-         .duration_since(std::time::UNIX_EPOCH)
-         .map_or(0, |since| since.as_millis());
-      shared.to_server(3, &json!(u64::try_from(now).unwrap_or(0)));
    }
+}
+
+fn now_ms() -> u64 {
+   let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map_or(0, |since| since.as_millis());
+   u64::try_from(now).unwrap_or(0)
 }
 
 /// Phoenix's H264 payload types, used on both sides so video needs no
@@ -433,6 +462,8 @@ struct Media {
    fir_seq: u8,
    announce_at: Vec<Instant>,
    next_timeout: Option<Instant>,
+   feedback: Feedback,
+   echoes: Vec<(Instant, Vec<u8>, SocketAddr)>,
 }
 
 impl Media {
@@ -461,6 +492,8 @@ impl Media {
          fir_seq: 0,
          announce_at: Vec::new(),
          next_timeout: None,
+         feedback: Feedback::new(Instant::now()),
+         echoes: Vec::new(),
       }
    }
 
@@ -473,6 +506,8 @@ impl Media {
             .copied()
             .chain(self.next_timeout)
             .chain(self.refresh_due())
+            .chain(self.feedback.due())
+            .chain(self.echoes.iter().map(|(at, ..)| *at))
             .min()
             .unwrap_or(now + IDLE);
          let wait = deadline.saturating_duration_since(now);
@@ -500,6 +535,12 @@ impl Media {
          let now = Instant::now();
          if self.refresh_due().is_some_and(|at| at <= now) {
             self.ask_phoenix_for_keyframe();
+         }
+         if self.feedback.due().is_some_and(|at| at <= now) {
+            self.send_feedback(now);
+         }
+         for (_, packet, to) in self.echoes.extract_if(.., |(at, ..)| *at <= now) {
+            let _ = self.phoenix_udp.send_to(&packet, to);
          }
          if self.next_timeout.is_some_and(|at| at <= now) {
             self.next_timeout = None;
@@ -741,6 +782,13 @@ impl Media {
          return;
       }
       self.phoenix_addr = Some(from);
+      if packet.len() == KEEPALIVE_LEN && packet.starts_with(&KEEPALIVE) {
+         if self.echoes.len() < MAX_ECHOES {
+            let rtt = Duration::from_millis(self.shared.server_rtt_ms.load(Ordering::Relaxed));
+            self.echoes.push((Instant::now() + rtt, packet.to_vec(), from));
+         }
+         return;
+      }
       if packet.len() < 2 || !self.ready {
          return;
       }
@@ -749,9 +797,21 @@ impl Media {
          self.phoenix_rtcp(packet);
          return;
       }
-      let Some((payload, timestamp, marker)) = open(&self.cipher, packet) else {
+      let Some(Opened {
+         payload,
+         timestamp,
+         marker,
+         transport_seq,
+      }) = open(&self.cipher, packet)
+      else {
          return;
       };
+      if let Some(seq) = transport_seq {
+         self.feedback.record(seq, Instant::now());
+      }
+      if payload.is_empty() {
+         return;
+      }
       let Some(webrtc) = self.webrtc.as_ref() else {
          return;
       };
@@ -837,6 +897,21 @@ impl Media {
       }
    }
 
+   fn send_feedback(&mut self, now: Instant) {
+      let sender = self.shared.our_ssrc.load(Ordering::Relaxed);
+      let Some(packet) = self.feedback.build(sender, self.phoenix_video, now) else {
+         return;
+      };
+      let Some(to) = self.phoenix_addr else {
+         return;
+      };
+      self.counter = self.counter.wrapping_add(1);
+      let (header, body) = packet.split_at(RTCP_HEADER);
+      if let Some(sealed) = seal(&self.cipher, header, body, self.counter) {
+         let _ = self.phoenix_udp.send_to(&sealed, to);
+      }
+   }
+
    fn outgoing_video(&mut self, d: Value) {
       let was_on = self.phoenix_video != 0;
       self.phoenix_video = ssrc_field(&d, "video_ssrc").unwrap_or(0);
@@ -911,6 +986,9 @@ impl Media {
       let pt = *packet.header.payload_type;
       let video = self.webrtc.as_ref().and_then(|webrtc| webrtc.video).map(|(_, codec)| codec.pt);
       let pt = if pt == OPUS {
+         if packet.payload.len() <= SILENCE_LEN {
+            return;
+         }
          PHOENIX_OPUS
       } else if Some(pt) == video {
          pt
@@ -1005,8 +1083,17 @@ fn header_len(packet: &[u8]) -> usize {
    12 + csrcs * 4 + extension
 }
 
-/// Phoenix's packet as an Opus payload, its RTP time and marker.
-fn open(cipher: &Aes256Gcm, packet: &[u8]) -> Option<(Vec<u8>, u32, bool)> {
+#[derive(Debug, PartialEq, Eq)]
+struct Opened {
+   payload: Vec<u8>,
+   timestamp: u32,
+   marker: bool,
+   transport_seq: Option<u16>,
+}
+
+/// Phoenix's packet with its header extensions and padding taken off. The
+/// payload is empty for bandwidth probes, which carry only padding.
+fn open(cipher: &Aes256Gcm, packet: &[u8]) -> Option<Opened> {
    if packet.len() < 12 + TAG_LEN + NONCE_TAIL {
       return None;
    }
@@ -1022,19 +1109,47 @@ fn open(cipher: &Aes256Gcm, packet: &[u8]) -> Option<(Vec<u8>, u32, bool)> {
    cipher
       .decrypt_in_place_detached(Nonce::from_slice(&nonce), &packet[..head], &mut plain, tag)
       .ok()?;
+   let mut transport_seq = None;
    if packet[0] & 0x10 != 0 {
       let words = u16::from_be_bytes([packet[head - 2], packet[head - 1]]);
-      plain.drain(..(usize::from(words) * 4).min(plain.len()));
+      let extensions: Vec<u8> = plain.drain(..(usize::from(words) * 4).min(plain.len())).collect();
+      if packet[head - 4..head - 2] == ONE_BYTE_EXTENSIONS {
+         transport_seq = find_extension(&extensions, TRANSPORT_SEQ_EXTENSION)
+            .and_then(|value| value.first_chunk::<2>())
+            .map(|value| u16::from_be_bytes(*value));
+      }
    }
    if packet[0] & 0x20 != 0 {
       let padding = usize::from(*plain.last()?);
       plain.truncate(plain.len().checked_sub(padding)?);
    }
-   if plain.is_empty() {
-      return None;
-   }
    let timestamp = u32::from_be_bytes(*packet.get(4..8)?.first_chunk::<4>()?);
-   Some((plain, timestamp, packet[1] & 0x80 != 0))
+   Some(Opened {
+      payload: plain,
+      timestamp,
+      marker: packet[1] & 0x80 != 0,
+      transport_seq,
+   })
+}
+
+/// The value of one-byte header extension `id` (RFC 8285).
+fn find_extension(mut extensions: &[u8], id: u8) -> Option<&[u8]> {
+   while let [first, rest @ ..] = extensions {
+      if *first == 0 {
+         extensions = rest;
+         continue;
+      }
+      let (found, len) = (first >> 4, usize::from(first & 0x0F) + 1);
+      if found == 15 {
+         return None;
+      }
+      let value = rest.get(..len)?;
+      if found == id {
+         return Some(value);
+      }
+      extensions = &rest[len..];
+   }
+   None
 }
 
 /// Phoenix's RTCP packet, decrypted. Only its first 8 bytes travel in the
@@ -1224,13 +1339,24 @@ mod tests {
       header[0] = 0x80;
       header[1] = 0x80 | PHOENIX_OPUS;
       header[4..8].copy_from_slice(&1234u32.to_be_bytes());
+      let opened = |payload: &[u8], transport_seq| Opened {
+         payload: payload.to_vec(),
+         timestamp: 1234,
+         marker: true,
+         transport_seq,
+      };
       let sealed = seal(&cipher, &header, b"opus", 9).expect("seal");
-      assert_eq!(open(&cipher, &sealed), Some((b"opus".to_vec(), 1234, true)));
+      assert_eq!(open(&cipher, &sealed), Some(opened(b"opus", None)));
       header[0] |= 0x20;
       let padded = seal(&cipher, &header, b"opus\0\0\x03", 10).expect("seal");
-      assert_eq!(open(&cipher, &padded), Some((b"opus".to_vec(), 1234, true)));
+      assert_eq!(open(&cipher, &padded), Some(opened(b"opus", None)));
       let only_padding = seal(&cipher, &header, b"\0\x02", 11).expect("seal");
-      assert_eq!(open(&cipher, &only_padding), None);
+      assert_eq!(open(&cipher, &only_padding), Some(opened(b"", None)));
+      let mut extended = header.to_vec();
+      extended[0] = 0x90;
+      extended.extend([0xBE, 0xDE, 0, 1]);
+      let sealed = seal(&cipher, &extended, b"\x51\x02\x28\0h264", 12).expect("seal");
+      assert_eq!(open(&cipher, &sealed), Some(opened(b"h264", Some(0x0228))));
    }
 
    #[test]
