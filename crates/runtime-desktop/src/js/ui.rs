@@ -28,8 +28,10 @@ use phoenix_runtime::{
          in_background,
       },
       checked_icon,
+      granted,
       restart_budget,
    },
+   permissions::url_host,
    store::{
       self,
       Cell,
@@ -121,6 +123,8 @@ pub struct DesktopAction<'js> {
    pub priority: i32,
    pub visible:  Option<Function<'js>>,
    pub on_press: Function<'js>,
+   /// The action whose submenu this one sits in.
+   pub parent:   Option<u64>,
 }
 
 impl DesktopAction<'_> {
@@ -132,6 +136,7 @@ impl DesktopAction<'_> {
          danger:      self.danger,
          priority:    self.priority,
          has_visible: self.visible.is_some(),
+         parent:      self.parent,
       }
    }
 }
@@ -610,7 +615,7 @@ fn register_action<'js>(ctx: &Ctx<'js>, action: DesktopAction<'js>) -> rquickjs:
 fn remove_action(ctx: &Ctx<'_>, id: u64) {
    if let Some(registry) = ctx.userdata::<Desktop<'_>>() {
       let mut list = registry.actions.borrow_mut();
-      list.retain(|entry| entry.id != id);
+      list.retain(|entry| entry.id != id && entry.parent != Some(id));
       context_menu::sync_actions(list.iter().map(DesktopAction::meta).collect());
    }
 }
@@ -625,8 +630,41 @@ fn add_message_action<'js>(
    let danger = options.get::<_, Option<bool>>("danger")?.unwrap_or(false);
    let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
    let visible = options.get::<_, Option<Function<'js>>>("visible")?;
-   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let children = options.get::<_, Option<Vec<Object<'js>>>>("children")?;
+   let on_press = match (
+      options.get::<_, Option<Function<'js>>>("onPress")?,
+      &children,
+   ) {
+      (Some(on_press), _) => on_press,
+      (None, Some(_)) => Function::new(ctx.clone(), || {})?,
+      (None, None) => {
+         return Err(Exception::throw_type(
+            ctx,
+            "addMessageAction needs onPress or children",
+         ));
+      },
+   };
    let id = NEXT_ACTION.fetch_add(1, Ordering::Relaxed);
+   // Read every child before registering anything, so a bad one leaves no
+   // half-built submenu behind.
+   let children = children
+      .into_iter()
+      .flatten()
+      .enumerate()
+      .map(|(order, child)| {
+         Ok(DesktopAction {
+            id:       NEXT_ACTION.fetch_add(1, Ordering::Relaxed),
+            plugin:   plugin.to_owned(),
+            label:    child.get("label")?,
+            icon:     checked_icon(ctx, plugin, child.get("icon")?)?,
+            danger:   child.get::<_, Option<bool>>("danger")?.unwrap_or(false),
+            priority: i32::try_from(order).unwrap_or(i32::MAX),
+            visible:  None,
+            on_press: child.get("onPress")?,
+            parent:   Some(id),
+         })
+      })
+      .collect::<rquickjs::Result<Vec<_>>>()?;
    register_action(ctx, DesktopAction {
       id,
       plugin: plugin.to_owned(),
@@ -636,7 +674,11 @@ fn add_message_action<'js>(
       priority,
       visible,
       on_press,
+      parent: None,
    })?;
+   for child in children {
+      register_action(ctx, child)?;
+   }
    let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| remove_action(&ctx, id))?;
    remove.set("update", Function::new(ctx.clone(), || {})?)?;
    Ok(remove)
@@ -822,6 +864,7 @@ fn add_profile_tab<'js>(
       priority,
       visible: None,
       on_press,
+      parent: None,
    })?;
 
    let closer = Rc::clone(&tab);
@@ -1290,6 +1333,110 @@ pub fn press_header_button(engine: &Engine, id: u64) {
    });
 }
 
+/// `phoenix.ui.addComposerButton`: a button ahead of the chat bar's own.
+/// `update` changes its label or tint.
+fn add_composer_button<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   use composer::buttons::{
+      self,
+      Button,
+   };
+
+   static NEXT_BUTTON: AtomicU64 = AtomicU64::new(1);
+
+   let label = options.get::<_, String>("label")?;
+   let on = options.get::<_, Option<u32>>("tint")?.is_some();
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let id = NEXT_BUTTON.fetch_add(1, Ordering::Relaxed);
+   registry
+      .composer_buttons
+      .borrow_mut()
+      .push((id, plugin.to_owned(), on_press));
+   drop(registry);
+   let state = Rc::new(RefCell::new((label.clone(), on)));
+   buttons::set(Button { id, label, on });
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      registry
+         .composer_buttons
+         .borrow_mut()
+         .retain(|(held, ..)| *held != id);
+      buttons::remove(&[id]);
+   })?;
+   remove.set(
+      "update",
+      Function::new(
+         ctx.clone(),
+         move |patch: Object<'js>| -> rquickjs::Result<()> {
+            let mut state = state.borrow_mut();
+            if let Some(label) = patch.get::<_, Option<String>>("label")? {
+               state.0 = label;
+            }
+            if patch.contains_key("tint")? {
+               state.1 = patch.get::<_, Option<u32>>("tint")?.is_some();
+            }
+            buttons::set(Button {
+               id,
+               label: state.0.clone(),
+               on: state.1,
+            });
+            Ok(())
+         },
+      )?,
+   )?;
+   Ok(remove)
+}
+
+/// Drops the composer buttons `plugin` added.
+pub fn unload_composer_buttons(registry: &Desktop<'_>, plugin: &str) {
+   let mut gone = Vec::new();
+   registry
+      .composer_buttons
+      .borrow_mut()
+      .retain(|&(id, ref owner, _)| {
+         let held = owner == plugin;
+         if held {
+            gone.push(id);
+         }
+         !held
+      });
+   composer::buttons::remove(&gone);
+}
+
+/// Runs the `onPress` of composer button `id`.
+pub fn press_composer_button(engine: &Engine, id: u64) {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return;
+      };
+      let found = registry
+         .composer_buttons
+         .borrow()
+         .iter()
+         .find(|(held, ..)| *held == id)
+         .map(|(_, plugin, press)| (plugin.clone(), press.clone()));
+      drop(registry);
+      let Some((plugin, press)) = found else {
+         return;
+      };
+      let Ok(arg) = build_message_context(&ctx, 0, 0, false) else {
+         return;
+      };
+      if let Err(err) = press.call::<_, Value<'_>>((arg,)).catch(&ctx) {
+         log::error!("[{plugin}] addComposerButton onPress: {err}");
+      }
+   });
+}
+
 /// `phoenix.ui.addShortcut`: `run` for a letter or digit pressed with Ctrl or
 /// Alt while Discord is focused, which Discord then never sees.
 fn add_shortcut<'js>(
@@ -1327,9 +1474,6 @@ fn add_shortcut<'js>(
    let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
       return noop_handle(ctx);
    };
-   if !phoenix_ui_desktop::SHORTCUTS {
-      return noop_handle(ctx);
-   }
    let id = NEXT_SHORTCUT.fetch_add(1, Ordering::Relaxed);
    registry
       .shortcuts
@@ -1581,6 +1725,23 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
             .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
       })?,
    )?;
+   let link_owner = plugin.to_owned();
+   ui.set(
+      "openUrl",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, url: String| {
+         if !granted(&ctx, &link_owner).is_some_and(|permissions| permissions.link(&url)) {
+            return Err(Exception::throw_message(
+               &ctx,
+               &format!(
+                  "{}: links off Discord need http on the plugin's // @permissions line",
+                  url_host(&url).as_deref().unwrap_or("openUrl")
+               ),
+            ));
+         }
+         phoenix_ui_desktop::open_url(&url)
+            .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
+      })?,
+   )?;
    let notify_owner = plugin.to_owned();
    ui.set(
       "notify",
@@ -1690,8 +1851,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          add_header_button(&ctx, &header_owner, &options)
       })?,
    )?;
-   for slot_fn in [
+   let composer_owner = plugin.to_owned();
+   ui.set(
       "addComposerButton",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_composer_button(&ctx, &composer_owner, &options)
+      })?,
+   )?;
+   for slot_fn in [
       "addProfileSection",
       "patchProps",
       "onNode",

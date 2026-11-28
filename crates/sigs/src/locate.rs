@@ -4,9 +4,14 @@
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod call_idle;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod channel;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod composer;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod counts;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod message;
+pub mod menu;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod ready;
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
@@ -76,6 +81,17 @@ pub const LOCATORS: &[Locator] = &[
       name:     "gpui builders",
       families: DESKTOP,
       run:      |ix| gpui::gpui(ix).map(|found| format!("{found:x?}")),
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "composer buttons",
+      families: DESKTOP,
+      run:      |ix| composer::composer_buttons(ix).map(|func| format!("{func:#x}")),
+   },
+   Locator {
+      name:     "menu submenu",
+      families: DESKTOP,
+      run:      |ix| menu::submenu(ix).map(|layout| format!("{layout:x?}")),
    },
    Locator {
       name:     "staff flag",
@@ -153,12 +169,31 @@ pub const LOCATORS: &[Locator] = &[
             "{rows:x?}, hooks {}, {}, {}",
             hookable(ix, rows.sidebar)?,
             hookable(ix, rows.selected).or_else(|err| {
-               rows
-                  .selected_via
-                  .map(|slot| format!("through {slot:#x}"))
-                  .ok_or(err)
+               match (rows.selected_via, ix.isa) {
+                  (Some(slot), _) => Ok(format!("through {slot:#x}")),
+                  (None, crate::index::Isa::Aarch64) => {
+                     Ok(format!("call {:#x} rewritten", rows.selected_call))
+                  },
+                  (None, _) => Err(err),
+               }
             })?,
             hookable(ix, rows.push)?
+         ))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "settings title",
+      families: DESKTOP,
+      run:      |ix| {
+         let section = settings::settings_section(ix)?;
+         let title = settings::settings_title(ix, section.page_offset)?;
+         Ok(format!(
+            "name {:#x}, translate {:#x}, header {}, call {:#x}",
+            title.name,
+            title.translate,
+            hookable(ix, title.header)?,
+            title.call
          ))
       },
    },
@@ -290,6 +325,40 @@ pub const LOCATORS: &[Locator] = &[
    },
    #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
    Locator {
+      name:     "channel sidebar",
+      families: DESKTOP,
+      run:      |ix| {
+         let found = channel::channel_sidebar(ix)?;
+         Ok(format!(
+            "width {}, column {} (call {:#x}), publish {}, covered {}, rail {:#x}",
+            hookable(ix, found.width)?,
+            hookable(ix, found.column)?,
+            found.column_site,
+            hookable(ix, found.publish)?,
+            hookable(ix, found.covered)?,
+            found.rail
+         ))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "channel toolbar",
+      families: DESKTOP,
+      run:      |ix| {
+         let found = channel::channel_toolbar(ix)?;
+         Ok(format!(
+            "button {}, append {}, id {:#x}, sizes {:#x}/{:#x}, click +{:#x}",
+            hookable(ix, found.button)?,
+            hookable(ix, found.append)?,
+            found.members_id,
+            found.button_size,
+            found.toolbar_size,
+            found.on_click
+         ))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
       name:     "ready text",
       families: DESKTOP,
       run:      |ix| {
@@ -313,7 +382,22 @@ pub const LOCATORS: &[Locator] = &[
          ))
       },
    },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "resolve font",
+      families: DESKTOP,
+      run:      |ix| resolve_font(ix).and_then(|func| hookable(ix, func.start)),
+   },
 ];
+
+/// GPUI's `TextSystem::resolve_font(&self, font: &Font) -> FontId`, the one
+/// caller of the cold path that panics with `"failed to resolve font"`. Every
+/// font passes through it before GPUI's caches.
+pub fn resolve_font<'ix>(ix: &'ix Index<'ix>) -> Found<Func<'ix>> {
+   ix.literal(b"failed to resolve font")
+      .callers()
+      .one("resolve_font")
+}
 
 /// The `ClientAccessGate` read the runtime makes answer "no gate". The
 /// blocked page calls the `signed_in && access(..) != 2` stub, whose first
@@ -393,7 +477,7 @@ fn ready_parse<'ix>(ix: &'ix Index<'ix>) -> Found<Func<'ix>> {
 /// `func` with the whole instructions an x86-64 entry hook displaces there.
 /// arm64 hooks always displace four.
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
-fn hookable(ix: &Index<'_>, func: usize) -> Found<String> {
+pub fn hookable(ix: &Index<'_>, func: usize) -> Found<String> {
    match ix.isa {
       crate::index::Isa::X86_64 { .. } => {
          crate::desktop::entry_moved(ix.image, func)
@@ -409,13 +493,21 @@ fn hookable(ix: &Index<'_>, func: usize) -> Found<String> {
 pub fn entry_hookable(ix: &Index<'_>, func: usize) -> Found<()> {
    /// The instructions an arm64 entry hook displaces.
    const DISPLACED: usize = 4;
+   /// sunhook's jump when no island is in reach, as on macOS.
+   const JUMP: usize = 20;
    /// `x16` and `x17`.
    const SCRATCH: u32 = 3 << 16;
    if ix.isa != crate::index::Isa::Aarch64 {
       return Ok(());
    }
-   let sets = ix
-      .func(func)?
+   let opened = ix.func(func)?;
+   if opened.end - opened.start < JUMP {
+      return Err(format!(
+         "{func:#x} is {} bytes, shorter than sunhook's {JUMP}-byte jump",
+         opened.end - opened.start
+      ));
+   }
+   let sets = opened
       .head(DISPLACED)
       .iter()
       .fold(0, |seen, step| seen | step.writes & SCRATCH);

@@ -195,6 +195,7 @@ pub fn press(press: Press) {
             title: "Add a Server".to_owned(),
             initial: String::new(),
             kind: FieldKind::Server,
+            then: None,
          });
       },
       Press::Edit { key, field } => {
@@ -218,6 +219,7 @@ pub fn press(press: Press) {
             title: format!("{} {title}", label(&key, server)),
             initial,
             kind: FieldKind::Server,
+            then: None,
          });
       },
    }
