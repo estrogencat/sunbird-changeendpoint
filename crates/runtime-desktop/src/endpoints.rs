@@ -131,14 +131,9 @@ pub fn media_url(url: &str) -> Option<String> {
    {
       return None;
    }
-   let installed = INSTALLED.get()?;
-   let (cdn, media) = if servers::routes().active() {
-      let server = signed_in_owner(url)
-         .map_or_else(servers::media_server, servers::media_server_of)?;
-      (server.cdn, server.media)
-   } else {
-      (installed.target.cdn.clone(), installed.target.media.clone())
-   };
+   INSTALLED.get()?;
+   let server = signed_in_owner(url).map_or_else(servers::media_server, servers::media_server_of)?;
+   let (cdn, media) = (server.cdn, server.media);
    let cdn = cdn.as_deref();
    if let Some(decoration) = decoration_url(url, cdn?) {
       return Some(decoration);
@@ -308,14 +303,7 @@ pub fn install(image: &Image<'static>) {
          media: legacy.media.clone(),
       });
    }
-   let target = if servers::routes().active() {
-      relayed(legacy)
-   } else {
-      let Some(legacy) = legacy else {
-         return;
-      };
-      legacy
-   };
+   let target = relayed(legacy);
    if Abi::of(image) != Abi::Win64 {
       log::warn!("endpoints: only Windows builds are supported, staying on Discord");
       return;

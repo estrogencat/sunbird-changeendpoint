@@ -389,7 +389,6 @@ enum Action {
       key:    String,
    },
    InstallCatalog(String),
-   ServersToggle,
    ServerActivity(String),
    ServerTweak(servers_tab::Tweak),
    Servers(servers_tab::Press),
@@ -432,7 +431,6 @@ unsafe fn switch_callback(
       };
       match action {
          Action::ToggleStaff => phoenix_runtime::set_staff_enabled(on),
-         Action::ServersToggle => servers_tab::toggle(on),
          Action::ServerActivity(key) => servers_tab::activity(key, on),
          Action::ServerTweak(tweak) => servers_tab::tweak(tweak, on),
          Action::ToggleAutoStart | Action::ToggleAutoUpdate => {

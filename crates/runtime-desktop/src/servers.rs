@@ -37,8 +37,6 @@ pub struct Server {
 #[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
 pub struct Config {
    #[serde(default)]
-   pub enabled: bool,
-   #[serde(default)]
    pub custom: BTreeMap<String, Server>,
    #[serde(default)]
    pub accounts: BTreeMap<String, String>,
@@ -114,11 +112,68 @@ fn builtin() -> BTreeMap<String, Server> {
             "https://api.softgaypaws.com",
          ),
       ),
+      (
+         "harmony".to_owned(),
+         server(
+            "Harmony",
+            "https://api.harmony.melodychat.org/api/v9",
+            "wss://gateway.harmony.melodychat.org",
+            "https://cdn.harmony.melodychat.org",
+            "https://api.harmony.melodychat.org",
+         ),
+      ),
+      (
+         "itchat".to_owned(),
+         server(
+            "ITChat",
+            "https://muc.it-voip.4siwi.net:8097/api/v9",
+            "wss://proxy.it-voip.4siwi.net:8098",
+            "https://share.it-voip.4siwi.net:8099",
+            "https://muc.it-voip.4siwi.net:8097",
+         ),
+      ),
    ])
 }
 
 pub fn is_builtin(key: &str) -> bool {
    builtin().contains_key(key)
+}
+
+/// Built-in servers known to take activities. Stricter ones like Harmony close
+/// the gateway over them.
+const ACTIVITY_SERVERS: [&str; 2] = ["spacebar", "hazletbar"];
+
+pub fn activity_default(key: &str) -> bool {
+   ACTIVITY_SERVERS.contains(&key)
+}
+
+/// Moves accounts and settings from a server added by address to the built-in
+/// one with the same API, so it isn't listed twice.
+fn fold_into_builtins(config: &mut Config) {
+   let builtin = builtin();
+   let doubles: Vec<(String, String)> = config
+      .custom
+      .iter()
+      .filter_map(|(key, server)| {
+         let api = server.api.trim_end_matches('/');
+         let (builtin_key, _) = builtin.iter().find(|(_, known)| known.api == api)?;
+         Some((key.clone(), builtin_key.clone()))
+      })
+      .collect();
+   for (custom, builtin_key) in doubles {
+      config.custom.remove(&custom);
+      for server in config.accounts.values_mut() {
+         if *server == custom {
+            server.clone_from(&builtin_key);
+         }
+      }
+      if config.login.as_ref() == Some(&custom) {
+         config.login = Some(builtin_key.clone());
+      }
+      if let Some(on) = config.activities.remove(&custom) {
+         config.activities.insert(builtin_key, on);
+      }
+   }
 }
 
 #[derive(Default)]
@@ -128,7 +183,6 @@ pub struct Routes {
    linked: Vec<(u64, String)>,
    login: Option<String>,
    login_discord: bool,
-   enabled: bool,
    activities: BTreeMap<String, bool>,
    tweaks: Tweaks,
 }
@@ -136,10 +190,6 @@ pub struct Routes {
 impl Routes {
    pub const fn tweaks(&self) -> Tweaks {
       self.tweaks
-   }
-
-   pub const fn active(&self) -> bool {
-      self.enabled
    }
 
    pub fn servers(&self) -> impl Iterator<Item = (&str, &Server)> {
@@ -190,13 +240,13 @@ impl Routes {
    }
 
    /// Whether the server gets activities. Servers added by address start
-   /// without, since stricter ones like Harmony close the gateway over them.
+   /// without.
    pub fn shows_activity(&self, key: &str) -> bool {
       self
          .activities
          .get(key)
          .copied()
-         .unwrap_or_else(|| is_builtin(key))
+         .unwrap_or_else(|| activity_default(key))
    }
 
    pub fn of_user(&self, id: u64) -> Option<&Server> {
@@ -276,7 +326,6 @@ fn carried_over() -> Config {
       .unwrap_or_default();
    let builtin = builtin();
    Config {
-      enabled: !stored.servers.is_empty(),
       custom: stored
          .servers
          .into_iter()
@@ -290,7 +339,7 @@ fn carried_over() -> Config {
 }
 
 pub fn config() -> Config {
-   fs::read(config_file()).map_or_else(
+   let mut config = fs::read(config_file()).map_or_else(
       |_| carried_over(),
       |bytes| {
          serde_json::from_slice(&bytes).unwrap_or_else(|err| {
@@ -298,7 +347,9 @@ pub fn config() -> Config {
             Config::default()
          })
       },
-   )
+   );
+   fold_into_builtins(&mut config);
+   config
 }
 
 static WRITING: Mutex<()> = Mutex::new(());
@@ -361,7 +412,6 @@ pub fn routes() -> Arc<Routes> {
       linked,
       login_discord: config.login.as_deref() == Some("discord"),
       login: config.login.filter(|key| servers.contains_key(key)),
-      enabled: config.enabled,
       activities: config.activities,
       tweaks: config.tweaks,
       servers,
@@ -387,7 +437,7 @@ pub fn record_login(token: &str, server: &str) {
 /// requests that carry a token.
 pub fn login_target(method: &str, url: &str, authorization: Option<&str>) -> Option<String> {
    let routes = routes();
-   if !routes.active() || authorization.is_some() || !method.eq_ignore_ascii_case("POST") {
+   if authorization.is_some() || !method.eq_ignore_ascii_case("POST") {
       return None;
    }
    let rest = api_rest(url, &routes)?;
@@ -583,9 +633,6 @@ fn loads_history(method: &str, rest: &str) -> bool {
 
 pub fn route(method: &str, url: &str, authorization: Option<&str>) -> Route {
    let routes = routes();
-   if !routes.active() {
-      return Route::Keep;
-   }
    let Some(rest) = api_rest(url, &routes) else {
       return Route::Keep;
    };

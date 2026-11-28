@@ -133,14 +133,9 @@ fn report(result: std::io::Result<()>) {
    }
 }
 
-pub fn toggle(on: bool) {
-   report(servers::update(|config| config.enabled = on));
-   phoenix_ui_desktop::toast("Restart Discord to apply");
-}
-
 pub fn activity(key: String, on: bool) {
    report(servers::update(|config| {
-      if on == servers::is_builtin(&key) {
+      if on == servers::activity_default(&key) {
          config.activities.remove(&key);
       } else {
          config.activities.insert(key, on);
@@ -326,19 +321,8 @@ fn status(b: &Builder, routes: &servers::Routes) -> RawDiv {
          "Open a channel to see which account is on screen".to_owned(),
       ),
    };
-   let mut card = b.card(10.0, 16.0, 8.0, 0.20);
-   card = b.push_div(card, b.text_block(&title, &subtitle));
-   card = b.push_div(card, b.divider());
-   b.push_div(
-      card,
-      b.switch_row(
-         "sunbird-servers-enabled",
-         "Multi-server routing",
-         Some("Sends each account to its own server, and Discord accounts to Discord. Applies after restarting Discord."),
-         routes.active(),
-         Action::ServersToggle,
-      ),
-   )
+   let card = b.card(10.0, 16.0, 8.0, 0.20);
+   b.push_div(card, b.text_block(&title, &subtitle))
 }
 
 fn logins(b: &Builder, root: RawDiv, routes: &servers::Routes) -> RawDiv {

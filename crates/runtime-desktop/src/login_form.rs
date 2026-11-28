@@ -67,9 +67,6 @@ unsafe extern "C" fn detour(
    }
    let _ = std::panic::catch_unwind(|| {
       let routes = servers::routes();
-      if !routes.active() {
-         return;
-      }
       let (choices, chosen) = routes.login_choices();
       gpui::wrap_with_login_servers(out, "Server", &choices, &chosen);
    });
