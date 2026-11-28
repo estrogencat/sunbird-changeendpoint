@@ -522,10 +522,7 @@ impl Media {
          })
          .map(str::to_owned)
          .collect();
-      let ours = rtc
-         .direct_api()
-         .stream_tx_by_mid(mid, None)
-         .map_or(0, |stream| *stream.ssrc());
+      let ours = offered_ssrc(&sdp).unwrap_or(0);
       self.shared.our_ssrc.store(ours, Ordering::Relaxed);
       spawn("sunbird-voice-rtc", {
          let shared = self.shared.clone();
@@ -647,9 +644,11 @@ impl Media {
       let seq = SeqNo::from(self.out_seq);
       self.out_seq += 1;
       let now = Instant::now();
+      let shared = self.shared.clone();
       self.mutate(|rtc| {
          let mut direct = rtc.direct_api();
          let stream = direct.stream_tx_by_mid(mid, None).ok_or("no stream to send on")?;
+         shared.our_ssrc.store(*stream.ssrc(), Ordering::Relaxed);
          stream.write_rtp(RtpWrite::new(Pt::from(OPUS), seq, timestamp, now, payload).marker(marker));
          Ok(())
       });
@@ -700,6 +699,15 @@ impl Media {
          &json!({ "audio_ssrc": audio, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] }),
       );
    }
+}
+
+/// The SSRC our offer announces, which str0m only sets up a stream for once
+/// the answer is in.
+fn offered_ssrc(sdp: &str) -> Option<u32> {
+   sdp.lines()
+      .find_map(|line| line.strip_prefix("a=ssrc:"))
+      .and_then(|rest| rest.split(' ').next())
+      .and_then(|ssrc| ssrc.trim().parse().ok())
 }
 
 /// The address this machine reaches `host` from.
@@ -847,6 +855,16 @@ mod tests {
    }
 
    #[test]
+   fn reads_the_offered_ssrc() {
+      let sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 111
+a=ssrc:2591998996 cname:abc
+";
+      assert_eq!(offered_ssrc(sdp), Some(2_591_998_996));
+      assert_eq!(offered_ssrc("m=audio 9
+"), None);
+   }
+
+   #[test]
    fn tells_rtp_from_rtcp() {
       let mut rtp = [0u8; 12];
       rtp[0] = 0x80;
@@ -858,3 +876,4 @@ mod tests {
       assert_eq!(rtp_ssrc(&[0, 1, 0, 0]), None);
    }
 }
+
